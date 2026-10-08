@@ -50,7 +50,7 @@ Any OpenAI client can use the router: set `OPENAI_BASE_URL=http://127.0.0.1:4141
   - a file tree and viewer, jailed to the folder and gitignore-aware;
   - a git panel with diff, discard and commit;
   - a real shell on a pty, using xterm.js.
-- **Terminal commands:** `/model`, `/models`, `/new`, `/resume`, `/web` (prints the browser link for this session), `/usage`, `/quit`.
+- **Terminal commands:** `/model`, `/models`, `/new`, `/resume`, `/web` (prints the browser link for this session), `/egress`, `/usage`, `/quit`. Type `/` for an autocomplete menu: Tab completes, ↑/↓ select, Enter runs, Esc clears (or stops a running turn). `/model` and `/resume` also complete their arguments. A message that starts with a path, like `/etc/hosts is broken`, is sent as text.
 
 The browser home page `/` lists your workspaces, and `/?router` is the multi-model chat. hib refuses `~` and `/` as workspaces, and `hib workspace forget` removes a folder.
 

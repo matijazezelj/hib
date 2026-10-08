@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { Box, Static, Text, render, useApp, useInput } from "ink";
 import type { HibClient } from "../client";
 import { ensureDaemon, registerWorkspace, workspaceUrl } from "../boot";
+import { SlashMenu } from "./SlashMenu";
+import { isCommand, onMenuKey, suggest, type Command } from "./complete";
 
 interface Line {
   key: number;
@@ -63,6 +65,24 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
   const follow = useRef<AbortController | null>(null);
   const liveRef = useRef("");
   const seenCalls = useRef(new Set<string>());
+  const [sel, setSel] = useState(0);
+  const modelIds = useRef<string[]>([]);
+  const sessionIds = useRef<string[]>([]);
+  const commands: Command[] = [
+    { name: "help", desc: "keys and commands" },
+    { name: "model", args: "<id>", desc: "switch model for the next message", values: () => modelIds.current },
+    { name: "models", desc: "list models you can switch to" },
+    { name: "new", desc: "start a new session" },
+    { name: "resume", args: "[id]", desc: "resume a session in this folder", values: () => sessionIds.current },
+    { name: "stop", desc: "stop the running turn (Esc)" },
+    { name: "web", desc: "browser link for this session" },
+    { name: "egress", desc: "what left the machine, and to whom" },
+    { name: "usage", desc: "quota per account" },
+    { name: "approve", desc: "send the redacted text the guard is holding" },
+    { name: "reject", desc: "cancel what the guard is holding" },
+    { name: "quit", desc: "exit (the daemon and sessions keep running)" },
+  ];
+  const menu = suggest(input, commands);
   const q = `root=${encodeURIComponent(root)}`;
 
   const push = (...ls: (Line | Omit<Line, "key">)[]) => setLines((d) => [...d, ...ls.map((l) => ({ key: seq++, ...l }))]);
@@ -170,6 +190,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
 
   async function openPicker() {
     const list = await client.get(`/ws/sessions?${q}`);
+    sessionIds.current = list.map((s: any) => s.id);
     if (!list.length) return push({ text: "no sessions in this folder yet", dim: true });
     setPicker(list);
     setPickIdx(0);
@@ -177,7 +198,10 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
 
   useEffect(() => {
     push({ text: `hib · ${root}`, color: "cyan" }, { text: "describe a task; /help for commands", dim: true });
+    client.get("/hib/info").then((i) => (modelIds.current = (i.models as string[]).filter((m) => /^(claude|codex)@/.test(m)))).catch(() => {});
+    client.get(`/ws/sessions?${q}`).then((l) => (sessionIds.current = l.map((s: any) => s.id))).catch(() => {});
     client.get(`/ws/tree?${q}`).then((t) => {
+      if (t.policy) modelIds.current = modelIds.current.filter((m) => m.startsWith(t.policy.account + "/"));
       if (!t.policy) return;
       setPolicy(t.policy);
       push({ text: `sensitive workspace: only ${t.policy.account} sees this folder; every read asks; secrets are blocked`, color: "yellow" });
@@ -268,7 +292,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
 
   async function submit(text: string) {
     if (!text.trim()) return;
-    if (text.startsWith("/")) return void (await command(text.trim()));
+    if (isCommand(text)) return void (await command(text.trim()));
     if (busy) return push({ text: "a turn is running; wait, or Esc to stop it", color: "yellow" });
     try {
       const r = await client.post<{ sessionId: string }>(`/ws/turn?${q}`, { sessionId: sidRef.current, model, text });
@@ -296,18 +320,31 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
       setTimeout(() => process.exit(0), 50);
       return;
     }
-    if (key.escape) return void interrupt();
+    const items = suggest(inputRef.current, commands);
+    if (key.escape) return busy ? void interrupt() : setInput(""); // stop a running turn, else clear the line
     if (pending.length && !inputRef.current && ["y", "a", "n"].includes(ch)) return void answer(ch === "y" ? "allow" : ch === "a" ? "always" : "deny");
-    if (key.backspace || key.delete) return setInput((s) => s.slice(0, -1));
+    if (items.length && (key.tab || key.upArrow || key.downArrow)) {
+      const r = onMenuKey(key.tab ? "tab" : key.upArrow ? "up" : "down", inputRef.current, items, sel);
+      if (r.input !== undefined) setInput(r.input);
+      if (r.selected !== undefined) setSel(r.selected);
+      return;
+    }
+    if (key.backspace || key.delete) return setInput((s) => s.slice(0, -1)), setSel(0);
     const chunk = key.return ? "\r" : ch;
     if (!chunk || key.ctrl || key.meta) return;
     // Fast typing and pastes arrive as one chunk, so newlines are handled inside chunks too.
     const body = chunk.replace(/\r\n?/g, "\n");
     if (body.endsWith("\n") && !body.slice(0, -1).includes("\n")) {
       const t = inputRef.current + body.slice(0, -1);
+      const r = onMenuKey("enter", t, suggest(t, commands), sel);
+      setSel(0);
+      if (!r.submit) return setInput(r.input ?? t); // completed a command that still needs an argument
       setInput("");
-      submit(t);
-    } else setInput((s) => s + body);
+      submit(r.input ?? t);
+    } else {
+      setInput((s) => s + body);
+      setSel(0);
+    }
   });
 
   const rule = (k: string) => k.replace(/^(Bash|command):exact:.*/, "this exact command").replace(/^(Bash|command):/, "").replace(/^edit$/, "edits in this folder");
@@ -355,6 +392,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         <Text>{input}</Text>
         <Text inverse> </Text>
       </Box>
+      <SlashMenu items={menu} selected={sel} />
     </>
   );
 }

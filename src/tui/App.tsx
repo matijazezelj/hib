@@ -3,6 +3,8 @@ import { Box, Static, Text, render, useApp, useInput } from "ink";
 import type { HibClient } from "../client";
 import type { HibEvent } from "../engine";
 import { connect } from "../boot";
+import { SlashMenu } from "./SlashMenu";
+import { isCommand, onMenuKey, suggest, type Command } from "./complete";
 
 interface Line {
   key: number;
@@ -33,6 +35,28 @@ function App({ client, initialResume, initialModel }: { client: HibClient; initi
     setInputState(inputRef.current);
   };
   const skills = useRef<Set<string>>(new Set());
+  const skillInfo = useRef<{ name: string; description?: string }[]>([]);
+  const modelIds = useRef<string[]>([]);
+  const convIds = useRef<string[]>([]);
+  const [sel, setSel] = useState(0);
+  const commands = (): Command[] => [
+    { name: "help", desc: "keys and commands" },
+    { name: "model", args: "<id>", desc: "switch model (keeps the conversation)", values: () => modelIds.current },
+    { name: "models", desc: "list models" },
+    { name: "mode", args: "chat | agent [dir]", desc: "tools off, or agent in a folder", values: () => ["chat", "agent"] },
+    { name: "new", desc: "new conversation" },
+    { name: "resume", args: "[id]", desc: "resume a conversation", values: () => convIds.current },
+    { name: "arena", desc: "run the next message head-to-head" },
+    { name: "pick", args: "a | b", desc: "choose the better arena answer", values: () => ["a", "b"] },
+    { name: "+", desc: "rate the last answer up" },
+    { name: "-", desc: "rate the last answer down" },
+    { name: "approve", desc: "send what the guard is holding" },
+    { name: "edit", args: "<text>", desc: "send an edited version instead" },
+    { name: "reject", desc: "cancel what the guard is holding" },
+    { name: "usage", desc: "quota per account" },
+    { name: "quit", desc: "exit" },
+    ...skillInfo.current.map((s) => ({ name: s.name, args: "[args]", desc: `skill: ${s.description ?? ""}` })),
+  ];
   const [busy, setBusy] = useState(false);
   const [model, setModel] = useState(initialModel ?? "hib/auto");
   const [mode, setMode] = useState<{ mode: "chat" | "agent"; cwd?: string }>({ mode: "chat" });
@@ -52,7 +76,12 @@ function App({ client, initialResume, initialModel }: { client: HibClient; initi
     if (initialResume === true) openPicker();
     else if (initialResume) resume(initialResume);
     else push("note", "hib — type a message, /help for commands");
-    client.get("/hib/info").then((i) => (skills.current = new Set(i.skills.map((s: any) => s.name)))).catch(() => {});
+    client.get("/hib/info").then((i) => {
+      skills.current = new Set(i.skills.map((s: any) => s.name));
+      skillInfo.current = i.skills;
+      modelIds.current = i.models;
+    }).catch(() => {});
+    client.get("/hib/conversations").then((l) => (convIds.current = l.map((c: any) => c.id))).catch(() => {});
     const t = setInterval(async () => {
       const list = await client.get("/hib/approvals").catch(() => []);
       setApproval(list[0] ?? null);
@@ -150,7 +179,7 @@ function App({ client, initialResume, initialModel }: { client: HibClient; initi
 
   async function submit(text: string) {
     if (!text.trim()) return;
-    if (text.startsWith("/") && (await command(text.trim()))) return;
+    if (isCommand(text) && (await command(text.trim()))) return;
     push("user", text);
     setBusy(true);
     const ac = new AbortController();
@@ -235,16 +264,30 @@ function App({ client, initialResume, initialModel }: { client: HibClient; initi
       return;
     }
     if (busy && !approval) return;
+    const items = suggest(inputRef.current, commands());
+    if (key.escape) return setInput("");
+    if (items.length && (key.tab || key.upArrow || key.downArrow)) {
+      const r = onMenuKey(key.tab ? "tab" : key.upArrow ? "up" : "down", inputRef.current, items, sel);
+      if (r.input !== undefined) setInput(r.input);
+      if (r.selected !== undefined) setSel(r.selected);
+      return;
+    }
     // Fast typing and pastes arrive as one chunk ("sage\r"), so newlines are handled inside chunks too.
     const chunk = key.return ? "\r" : ch;
-    if (key.backspace || key.delete) return setInput((s) => s.slice(0, -1));
+    if (key.backspace || key.delete) return setInput((s) => s.slice(0, -1)), setSel(0);
     if (!chunk || key.ctrl || key.meta) return;
     const body = chunk.replace(/\r\n?/g, "\n");
     if (body.endsWith("\n") && !body.slice(0, -1).includes("\n")) {
       const t = inputRef.current + body.slice(0, -1);
+      const r = onMenuKey("enter", t, suggest(t, commands()), sel);
+      setSel(0);
+      if (!r.submit) return setInput(r.input ?? t);
       setInput("");
-      submit(t);
-    } else setInput((s) => s + body);
+      submit(r.input ?? t);
+    } else {
+      setInput((s) => s + body);
+      setSel(0);
+    }
   });
 
   const color = (k: Line["kind"]) => (k === "user" ? "cyan" : k === "error" ? "red" : k === "meta" || k === "note" ? "gray" : undefined);
@@ -286,6 +329,7 @@ function App({ client, initialResume, initialModel }: { client: HibClient; initi
         <Text>{input}</Text>
         <Text inverse> </Text>
       </Box>
+      <SlashMenu items={suggest(input, commands())} selected={sel} />
     </>
   );
 }
