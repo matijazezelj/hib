@@ -27,6 +27,7 @@ export type WsEvent =
   | { type: "turn_start"; text: string; model?: string }
   | { type: "permission_answer"; id: string; choice: string }
   | { type: "sent"; account: string; model: string; text: string; handoff: boolean; chars: number }
+  | { type: "pseudonymised"; file: string; columns: string[]; callId?: string }
   | AgentEvent
   | { type: "done" }
   | { type: "turn_end" }; // always last; clients stop following a turn here
@@ -520,7 +521,9 @@ export class WorkspaceSessions {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       const copy = join(dir, basename(src));
       writeFileSync(copy, pseudonymize(table, cols, l.vault), { mode: 0o600 });
-      this.record(l.id, { type: "pseudonymised", file: real[key], columns: cols });
+      const ev = { type: "pseudonymised" as const, file: real[key], columns: cols, callId: call.id };
+      this.record(l.id, ev);
+      this.emit(l.id, ev); // live viewers mark the tool card
       return { behavior: "allow", updatedInput: { ...real, [key]: copy } };
     } catch (e: any) {
       return { behavior: "deny", message: `hib couldn't make a pseudonymised copy of ${basename(src)} (${e?.message ?? e}), so the read was blocked.` };

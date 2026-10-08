@@ -131,11 +131,12 @@ export class Engine {
     ]);
   }
 
-  egressList(opts: { limit?: number; cwd?: string } = {}) {
-    const rows = this.db
-      .query(`SELECT id, ts, run_id, part, cwd, model, account, guard, chars, substr(text, CASE WHEN instr(text, '<user>') > 0 THEN instr(text, '<user>') ELSE 1 END, 400) AS head FROM egress ${opts.cwd ? "WHERE cwd = ?" : ""} ORDER BY id DESC LIMIT ?`)
-      .all(...(opts.cwd ? [opts.cwd, opts.limit ?? 20] : [opts.limit ?? 20])) as any[];
-    return rows;
+  egressList(opts: { limit?: number; cwd?: string; run?: string } = {}) {
+    const where = opts.run ? "WHERE run_id = ?" : opts.cwd ? "WHERE cwd = ?" : "";
+    const args = opts.run ? [opts.run] : opts.cwd ? [opts.cwd] : [];
+    return this.db
+      .query(`SELECT id, ts, run_id, part, cwd, model, account, guard, chars, substr(text, CASE WHEN instr(text, '<user>') > 0 THEN instr(text, '<user>') ELSE 1 END, 400) AS head FROM egress ${where} ORDER BY id DESC LIMIT ?`)
+      .all(...args, opts.limit ?? 20) as any[];
   }
 
   egressGet(id: number | "last") {

@@ -5,15 +5,25 @@ import "@xterm/xterm/css/xterm.css";
 import { HibClient } from "../src/client";
 import { Markdown } from "./markdown";
 import { ANALYZABLE, AnalyzePanel } from "./analyze";
+import { Icon } from "./icons";
+import { UsagePanel, ago } from "./app";
 
 const api = new HibClient();
 
 type Item =
   | { kind: "user"; text: string; model?: string }
   | { kind: "assistant"; text: string }
-  | { kind: "tool"; call: any; result?: { ok: boolean; output?: string }; permission?: { id: string; ruleKey: string; answered?: string } }
+  | { kind: "tool"; call: any; result?: { ok: boolean; output?: string }; permission?: { id: string; ruleKey: string; answered?: string }; pseudo?: string[] }
+  | { kind: "egress"; account?: string; handoff?: boolean; findings?: Record<string, number>; action?: string; summary?: string }
   | { kind: "note"; text: string; tone?: "warn" | "bad" | "ok" }
+  | { kind: "usage"; usage: any[] }
   | { kind: "approval"; id: string; redacted: string; reasons: string[]; original?: string };
+
+const WS_SUGGESTIONS = [
+  { title: "Explain this project", text: "Give me a short tour of this folder: what it does, how it's laid out, and where to start reading." },
+  { title: "Find bugs", text: "Look for likely bugs or risky code in this folder and list them with file:line, most serious first." },
+  { title: "Summarise data", text: "Which data files are here, and what does each one contain? Columns and row counts only." },
+];
 
 /** Events stored server-side (and streamed live) folded into timeline items. */
 function fold(items: Item[], e: any): Item[] {
@@ -41,12 +51,27 @@ function fold(items: Item[], e: any): Item[] {
     }
     case "permission_answer":
       return items.map((x) => (x.kind === "tool" && x.permission && x.permission.id === e.id ? { ...x, permission: { ...x.permission, answered: e.choice } } : x));
-    case "sent":
-      return [...items, { kind: "note", text: `→ sent to ${e.account}${e.handoff ? " (with handoff transcript)" : ""}` }];
+    case "sent": {
+      // The guard row (live) comes first, possibly followed by an approval card; the send fills in where it went.
+      for (let i = items.length - 1; i >= 0 && items[i]!.kind !== "user"; i--) {
+        const x = items[i]!;
+        if (x.kind === "egress" && !x.account) return items.map((y, j) => (j === i ? { ...x, account: e.account, handoff: e.handoff } : y));
+      }
+      return [...items, { kind: "egress", account: e.account, handoff: e.handoff }];
+    }
+    case "guard_decision": {
+      const i = items.map((x) => x.kind).lastIndexOf("egress");
+      return i < 0 ? items : items.map((x, j) => (j === i ? { ...(x as any), summary: e.summary } : x));
+    }
+    case "pseudonymised": {
+      const i = items.findIndex((x) => x.kind === "tool" && x.call.id === e.callId);
+      const at = i >= 0 ? i : items.map((x) => (x.kind === "tool" && x.call.kind === "read" ? "r" : "")).lastIndexOf("r");
+      return at < 0 ? items : items.map((x, j) => (j === at ? { ...(x as any), pseudo: e.columns } : x));
+    }
     case "handoff":
       return [...items, { kind: "note", text: `handed over from ${e.from} to ${e.to} (new native session, transcript passed along)`, tone: "warn" }];
     case "guard":
-      return Object.keys(e.findings).length ? [...items, { kind: "note", text: `guard ${e.action}: ${Object.entries(e.findings).map(([k, v]) => `${k}×${v}`).join(" ")}`, tone: e.action === "redact" ? undefined : "warn" }] : items;
+      return [...items, { kind: "egress", findings: e.findings, action: e.action }];
     case "approval":
       return [...items, { kind: "approval", id: e.id, redacted: e.redacted, reasons: e.reasons }];
     case "rate_limited":
@@ -57,7 +82,7 @@ function fold(items: Item[], e: any): Item[] {
   return items;
 }
 
-const denied = (output?: string) => !!output && /^(declined|denied)$|denied this action/i.test(output.trim());
+const denied = (output?: string) => !!output && /^(declined|denied)$|^denied:|denied this action/i.test(output.trim());
 
 // ---------- diff rendering ----------
 
@@ -106,8 +131,9 @@ function Tree({ node, depth, open, toggle, onFile, changed, active }: { node: No
       {kids.map((k) => (
         <div key={k.path}>
           <div className={`tree-row ${active === k.path ? "active" : ""}`} style={{ paddingLeft: 8 + depth * 12 }} onClick={() => (k.children ? toggle(k.path) : onFile(k.path))}>
-            <span className="tree-icon">{k.children ? (open.has(k.path) ? "▾" : "▸") : ""}</span>
-            <span className={changed.has(k.path) ? "changed" : ""}>{k.name}</span>
+            <span className="tree-icon">{k.children && <Icon name={open.has(k.path) ? "chevron-down" : "chevron-right"} size={12} />}</span>
+            <Icon name={k.children ? "folder" : ANALYZABLE.test(k.name) ? "table" : "file"} size={14} className={k.children ? "ic-folder" : "ic-file"} />
+            <span className={`tree-name ${changed.has(k.path) ? "changed" : ""}`}>{k.name}</span>
             {changed.has(k.path) && <span className="badge">{changed.get(k.path)}</span>}
           </div>
           {k.children && open.has(k.path) && <Tree node={k} depth={depth + 1} open={open} toggle={toggle} onFile={onFile} changed={changed} active={active} />}
@@ -266,9 +292,11 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
   }
 
   async function send() {
-    const text = draft.trim();
+    let text = draft.trim();
     if (!text || busy) return;
     setDraft("");
+    if (text.startsWith("//")) text = text.slice(1);
+    else if (text.startsWith("/")) return command(text);
     try {
       const r = await api.post(`/ws/turn?${q}`, { sessionId: sidRef.current, model, text });
       if (r.sessionId !== sidRef.current) {
@@ -278,6 +306,30 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     } catch (err: any) {
       setItems((x) => fold(x, { type: "error", message: String(err.message ?? err) }));
     }
+  }
+
+  /** Slash commands run here and never reach the agent. */
+  async function command(text: string) {
+    const [cmd, ...rest] = text.split(/\s+/);
+    const arg = rest.join(" ");
+    const note = (t: string, tone?: "warn" | "bad" | "ok") => setItems((x) => [...x, { kind: "note", text: t, tone }]);
+    if (cmd === "/new") return newSession();
+    if (cmd === "/usage") {
+      try {
+        const usage = await api.get("/hib/usage");
+        return setItems((x) => [...x, { kind: "usage", usage }]);
+      } catch (e: any) {
+        return note(String(e.message ?? e), "bad");
+      }
+    }
+    if (cmd === "/model") {
+      if (!arg) return note(`model: ${model} · available: ${agentModels.join(", ")}`);
+      const m = agentModels.find((x) => x === arg || x.endsWith("/" + arg) || x.includes(arg));
+      if (!m) return note(`unknown model "${arg}" · available: ${agentModels.join(", ")}`, "bad");
+      setModel(m);
+      return note(`next turn uses ${m}`, "ok");
+    }
+    note(`${cmd === "/help" ? "" : `${cmd} isn't a command here. `}Commands: /usage, /model [id], /new. Start with // to send a message that begins with a slash.`, cmd === "/help" ? undefined : "warn");
   }
 
   async function answer(id: string, choice: "allow" | "always" | "deny") {
@@ -306,20 +358,21 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
   return (
     <div className={`ws ${viewer ? "with-viewer" : ""} ${term ? "with-term" : ""}`}>
       <header className="ws-head">
-        <b>hib</b>
-        <a className="muted" href="/" title={root}>{root.split("/").slice(-2).join("/")}</a>
-        {gitState?.branch && <span className="chip">{gitState.branch.split("...")[0]}</span>}
+        <a className="brand" href="/" title="All workspaces"><span className="brand-mark"><Icon name="shield" size={13} /></span> hib</a>
+        <span className="crumb-sep">/</span>
+        <span className="crumb" title={root}><Icon name="folder" size={14} /> {root.split("/").slice(-2).join("/")}</span>
+        {gitState?.branch && <span className="chip mono"><Icon name="route" size={11} /> {gitState.branch.split("...")[0]}</span>}
         {policy && (
-          <span className="chip warn" title="Only this account sees this folder. No handoff, failover, advisor, arena or browser terminal; secrets are blocked; every read asks.">
-            sensitive → {policy.account}
+          <span className="sensitive-pill" title="Only this account sees this folder. No handoff, failover, advisor, arena or browser terminal; secrets are blocked; every read asks; data files reach the agent pseudonymised.">
+            <Icon name="lock" size={12} /> Sensitive · {policy.account}
           </span>
         )}
         <span style={{ flex: 1 }} />
-        <select value={model} onChange={(e) => setModel(e.target.value)} title="Switching model mid-session hands the session over">
-          <option value="hib/auto">{policy ? `auto (pinned to ${policy.account})` : "auto (code route)"}</option>
-          {agentModels.map((m) => <option key={m}>{m}</option>)}
-        </select>
-        {!policy && <button onClick={() => setTerm((t) => !t)}>{term ? "Hide terminal" : "Terminal"}</button>}
+        {!policy && (
+          <button className={`ghost ${term ? "on" : ""}`} onClick={() => setTerm((t) => !t)} title="Terminal in this folder">
+            <Icon name="code" size={14} /> Terminal
+          </button>
+        )}
       </header>
 
       <aside className="ws-side">
@@ -375,11 +428,12 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
         )}
         {tab === "sessions" && (
           <div>
-            <button className="primary" style={{ width: "100%", marginBottom: 8 }} onClick={newSession}>New session</button>
+            <button className="primary new-btn" onClick={newSession}><Icon name="plus" size={14} /> New session</button>
+            {sessions.length === 0 && <div className="empty" style={{ padding: "6px 9px" }}>No sessions yet.</div>}
             {sessions.map((s) => (
-              <div key={s.id} className={`conv ${s.id === sessionId ? "active" : ""}`} onClick={() => attach(s.id)}>
-                {s.running ? "● " : ""}{s.title}
-                <small>{new Date(s.updated).toLocaleString()} · {s.model}</small>
+              <div key={s.id} className={`conv ${s.id === sessionId ? "active" : ""}`} onClick={() => attach(s.id)} title={s.title}>
+                <div className="conv-title">{s.running && <span className="live-dot" />}{s.title}</div>
+                <small><span>{ago(s.updated)}</span><span>· {s.model.replace(/@default\//, "/")}</span></small>
               </div>
             ))}
           </div>
@@ -388,12 +442,25 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
 
       <main className="ws-main">
         <div className="timeline" ref={logRef}>
-          {items.length === 0 && (
-            <div className="note">
-              Ask the agent to work on this folder. Edits and commands wait for your OK here. Secrets in your prompt are caught by the guard;
-              switch model at any time and the session is handed over.
+          {items.length === 0 && approvals.length === 0 ? (
+            <div className="empty-state">
+              <div className="brand-mark"><Icon name="folder" size={22} /></div>
+              <h1>{root.split("/").pop()}</h1>
+              <p>
+                The agent works in this folder. Edits and commands wait for your OK, secrets in your messages are swapped for placeholders before they leave, and
+                every send shows up here.{policy ? " Data files reach the agent pseudonymised." : ""}
+              </p>
+              <div className="suggestions">
+                {WS_SUGGESTIONS.map((x) => (
+                  <div key={x.title} className="suggestion" onClick={() => setDraft(x.text)}>
+                    <b>{x.title}</b>
+                    <span>{x.text}</span>
+                  </div>
+                ))}
+              </div>
             </div>
-          )}
+          ) : (
+          <div className="thread-inner ws-thread">
           {approvals.map((a) => (
             <div key={a.id} className="perm">
               <div><b>Guard:</b> {a.reasons.join("; ")}</div>
@@ -405,9 +472,21 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
             </div>
           ))}
           {items.map((it, i) => {
-            if (it.kind === "user") return <div key={i} className="msg user">{it.text}</div>;
-            if (it.kind === "assistant") return <div key={i} className="msg assistant"><Markdown text={it.text} /></div>;
+            if (it.kind === "user") return <div key={i} className="turn-user">{it.text}</div>;
+            if (it.kind === "assistant") return <div key={i} className="turn-ai"><div className="md"><Markdown text={it.text} /></div></div>;
+            if (it.kind === "usage") return <div key={i} className="usage-inline"><UsagePanel usage={it.usage} /></div>;
             if (it.kind === "note") return <div key={i} className={`note ${it.tone ?? ""}`}>{it.text}</div>;
+            if (it.kind === "egress") {
+              const f = Object.entries(it.findings ?? {});
+              return (
+                <div key={i} className="egress-row">
+                  <Icon name="shield-check" size={13} />
+                  <span>Sent to <b>{it.account ?? "…"}</b></span>
+                  {it.handoff && <span className="chip warn">with handoff transcript</span>}
+                  {f.length > 0 ? f.map(([k, v]) => <span key={k} className="chip guard mono">{k} ×{v}</span>) : it.summary ? <span className="muted">{it.summary}</span> : <span className="muted">nothing to redact</span>}
+                </div>
+              );
+            }
             if (it.kind === "approval") return null;
             const c = it.call;
             const pending = it.permission && !it.permission.answered && !it.result;
@@ -419,6 +498,12 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
                   {it.result && <span className={it.result.ok ? "ok" : "bad"}>{it.result.ok ? "✓" : denied(it.result.output) ? "denied" : "✗"}</span>}
                   {it.permission?.answered && !it.result && <span className="muted">{it.permission.answered}</span>}
                 </div>
+                {(it.pseudo || it.result?.output?.startsWith("denied: ")) && (
+                  <div className="tool-flags">
+                    {it.pseudo && <span className="chip guard"><Icon name="shield-check" size={11} /> agent got a pseudonymised copy · {it.pseudo.join(", ") || "no identifying columns"}</span>}
+                    {it.result?.output?.startsWith("denied: ") && <span className="chip bad"><Icon name="lock" size={11} /> blocked by hib: {it.result.output.slice(8)}</span>}
+                  </div>
+                )}
                 {c.diff && <DiffView diff={c.diff} />}
                 {c.command && c.kind === "command" && pending && <pre className="cmd">{c.command}</pre>}
                 {pending && (
@@ -434,25 +519,41 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
               </div>
             );
           })}
-          {busy && <div className="note">working…</div>}
-        </div>
-        <div className="compose">
-          <textarea
-            value={draft}
-            placeholder={sessionId ? "Continue the session (Enter to send)" : "What should the agent do in this folder?"}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                send();
-              }
-            }}
-          />
-          {busy ? (
-            <button onClick={() => api.post(`/ws/interrupt?${q}`, { sessionId: sidRef.current })}>Stop</button>
-          ) : (
-            <button className="primary" onClick={send}>Send</button>
+          {busy && <span className="thinking"><i /><i /><i /></span>}
+          </div>
           )}
+        </div>
+        <div className="composer-wrap">
+          <div className="composer">
+            <textarea
+              value={draft}
+              rows={1}
+              placeholder={sessionId ? "Continue the session…" : "What should the agent do in this folder?"}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  send();
+                }
+              }}
+            />
+            <div className="composer-bar">
+              <select value={model} onChange={(e) => setModel(e.target.value)} title="Switching model mid-session hands the session over">
+                <option value="hib/auto">{policy ? `Auto · ${policy.account}` : "Auto"}</option>
+                {agentModels.map((m) => <option key={m} value={m}>{m.replace(/@default\//, "/")}</option>)}
+              </select>
+              <span className="spacer" />
+              {busy ? (
+                <button className="send" onClick={() => api.post(`/ws/interrupt?${q}`, { sessionId: sidRef.current })} title="Stop"><Icon name="stop" size={14} /></button>
+              ) : (
+                <button className="primary send" onClick={send} disabled={!draft.trim()} title="Send (Enter)"><Icon name="arrow-up" size={16} /></button>
+              )}
+            </div>
+          </div>
+          <div className="composer-hint">
+            <span><Icon name="shield-check" size={11} /> guarded before sending</span>
+            <span><span className="kbd">Enter</span> send · <span className="kbd">/help</span> commands</span>
+          </div>
         </div>
       </main>
 
@@ -464,12 +565,12 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
       {viewer && !viewer.analyze && (
         <section className="ws-viewer">
           <div className="viewer-head">
-            <b>{viewer.path}</b>
+            <Icon name="file" size={14} /> <b>{viewer.path}</b>
             <span style={{ flex: 1 }} />
             {changed.has(viewer.path) && !viewer.diff && <button className="mini" onClick={() => openDiff(viewer.path)}>diff</button>}
             {viewer.diff && <button className="mini" onClick={() => openFile(viewer.path)}>file</button>}
-            {ANALYZABLE.test(viewer.path) && <button className="mini primary" onClick={() => setViewer({ ...viewer, analyze: true })} title="The model writes code from the schema only; it runs here">Analyze</button>}
-            <button className="mini" onClick={() => setViewer(null)}>✕</button>
+            {ANALYZABLE.test(viewer.path) && <button className="mini primary" onClick={() => setViewer({ ...viewer, analyze: true })} title="The model writes code from the schema only; it runs here"><Icon name="table" size={12} /> Analyze</button>}
+            <button className="ghost icon-btn" onClick={() => setViewer(null)} title="Close"><Icon name="x" size={14} /></button>
           </div>
           {viewer.note && <div className="note">{viewer.note}</div>}
           {viewer.diff !== undefined ? (
