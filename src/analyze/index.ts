@@ -2,7 +2,12 @@ import { dirname, resolve } from "node:path";
 import type { Engine } from "../engine";
 import type { Message } from "../providers/types";
 import { runAnalysis, type RunResult } from "./sandbox";
-import { loadTable, profile, type Profile, type Table } from "./table";
+import { loadTables, profile, type Profile, type Table } from "./table";
+import { GEO_DOC, GEO_HELPER, geoFile, geoInstalled } from "./geo";
+import { Vault } from "../guard/vault";
+import { categoryFor } from "./pseudo";
+import { tokenNote } from "../guard";
+import { readFileSync } from "node:fs";
 
 /**
  * "Send code, not data": the model sees a profile of the table (names, types, counts, synthetic rows),
@@ -26,6 +31,7 @@ export interface Job {
   note?: string;
   usedModel?: string;
   last?: RunResult & { ms: number };
+  vault?: Vault; // tokens for identifying values echoed in the result, restored in the interpretation
   created: number;
 }
 
@@ -54,6 +60,11 @@ export class Analyzer {
 
   constructor(private engine: Engine) {}
 
+  /** The system prompt, mentioning the offline geo helper only when it's installed. */
+  private system() {
+    return geoInstalled(this.engine.cfg.home) ? `${SYSTEM}\n\n${GEO_DOC}` : SYSTEM;
+  }
+
   private async ask(messages: Message[], model: string | undefined, cwd: string): Promise<{ text: string; model?: string }> {
     let text = "";
     let used: string | undefined;
@@ -75,16 +86,17 @@ export class Analyzer {
   }
 
   profileOf(path: string, share: string[] = []): Profile {
-    return profile(loadTable(path), path, share);
+    return profile(loadTables([path]), path, share);
   }
 
   /** Builds the profile locally and asks the model for code. Nothing from the table but the profile is sent. */
-  async plan(input: { path: string; question: string; model?: string; share?: string[] }) {
-    const path = resolve(input.path);
-    const table = loadTable(path);
-    const prof = profile(table, path, input.share ?? []);
+  async plan(input: { path: string; paths?: string[]; question: string; model?: string; share?: string[] }) {
+    const paths = (input.paths?.length ? input.paths : [input.path]).map((p) => resolve(p));
+    const path = paths[0]!;
+    const table = loadTables(paths);
+    const prof = profile(table, paths.length > 1 ? `${paths.length} files (${paths.map((p) => p.split("/").pop()).join(", ")})` : path, input.share ?? []);
     const prompt = `${profileText(prof)}\n\nQuestion: ${input.question}`;
-    const r = await this.ask([{ role: "system", content: SYSTEM }, { role: "user", content: prompt }], input.model, dirname(path));
+    const r = await this.ask([{ role: "system", content: this.system() }, { role: "user", content: prompt }], input.model, dirname(path));
     const { code, note } = extractCode(r.text);
     const id = `an_${crypto.randomUUID().slice(0, 12)}`;
     for (const [k, j] of this.jobs) if (Date.now() - j.created > 3600_000) this.jobs.delete(k);
@@ -96,7 +108,12 @@ export class Analyzer {
     const j = this.get(id);
     if (!j.code) throw new Error("no code to run");
     const t0 = Date.now();
-    j.last = { ...(await runAnalysis(j.code, j.table)), ms: Date.now() - t0 };
+    // The gazetteer (~1 MB) goes into the sandbox only when the code uses it.
+    const home = this.engine.cfg.home;
+    const geo = /\bgeo\./.test(j.code) && geoInstalled(home) ? { data: readFileSync(geoFile(home), "utf8"), helper: GEO_HELPER } : undefined;
+    j.last = { ...(await runAnalysis(j.code, j.table, 30_000, geo)), ms: Date.now() - t0 };
+    j.vault = undefined; // a new result gets a fresh preview
+    if (!j.last.ok && /geo is not defined/.test(j.last.error ?? "")) j.last.error += " (run `hib geo setup` to install the offline gazetteer)";
     return j.last;
   }
 
@@ -105,26 +122,40 @@ export class Analyzer {
     const j = this.get(id);
     if (!j.code || !j.last?.error) throw new Error("nothing to fix");
     const prompt = `${profileText(j.profile)}\n\nQuestion: ${j.question}\n\nYour previous code:\n\`\`\`js\n${j.code}\n\`\`\`\nIt failed with: ${j.last.error}\nWrite a corrected version.`;
-    const r = await this.ask([{ role: "system", content: SYSTEM }, { role: "user", content: prompt }], j.model ?? j.usedModel, dirname(j.path));
+    const r = await this.ask([{ role: "system", content: this.system() }, { role: "user", content: prompt }], j.model ?? j.usedModel, dirname(j.path));
     const { code, note } = extractCode(r.text);
     if (code) [j.code, j.note] = [code, note];
     return { id, sent: prompt, code: j.code, note: j.note, model: r.model };
   }
 
+  /**
+   * Values from identifying columns that appear in the result, longest first: the model wrote the code, so its
+   * output may echo IPs, user agents or names back. They are tokenized before interpretation and restored after.
+   */
+  private identifyingValues(j: Job): [string, string][] {
+    const out = JSON.stringify(j.last?.result ?? null);
+    const pairs = new Map<string, string>();
+    for (const c of j.profile.columns.filter((c) => c.identifying))
+      for (const r of j.table.rows) {
+        const v = r[c.name];
+        if (typeof v === "string" && v.length >= 3 && out.includes(JSON.stringify(v).slice(1, -1))) pairs.set(v, c.name);
+      }
+    return [...pairs].sort((a, b) => b[0].length - a[0].length);
+  }
+
+  /** Exactly what interpretation sends: question, code and result, with identifying values as stable tokens. */
   explainPreview(id: string): string {
     const j = this.get(id);
     if (!j.last?.ok) throw new Error("run the analysis successfully first");
-    return `Question: ${j.question}\n\nAnalysis code:\n\`\`\`js\n${j.code}\n\`\`\`\n\nResult:\n${resultText(j.last.result)}`;
+    j.vault ??= new Vault();
+    let result = resultText(j.last.result);
+    for (const [value, col] of this.identifyingValues(j)) result = result.split(JSON.stringify(value).slice(1, -1)).join(`[${j.vault.token(categoryFor(col), value)}]`);
+    return `Question: ${j.question}\n\nAnalysis code:\n\`\`\`js\n${j.code}\n\`\`\`\n\nResult:\n${result}`;
   }
 
-  /** Identifying columns whose real values appear in the result: the model wrote the code, so check before sending it back. */
+  /** Identifying columns whose values appear in the result (they are sent as tokens, never as values). */
   leaks(id: string): string[] {
-    const j = this.get(id);
-    const out = JSON.stringify(j.last?.result ?? null);
-    return j.profile.columns
-      .filter((c) => c.identifying)
-      .map((c) => c.name)
-      .filter((name) => j.table.rows.some((r) => typeof r[name] === "string" && (r[name] as string).length >= 3 && out.includes(JSON.stringify(r[name]).slice(1, -1))));
+    return [...new Set(this.identifyingValues(this.get(id)).map(([, col]) => col))];
   }
 
   /** Sends the question, code and result (not the table) for interpretation. The guard still runs on it. */
@@ -133,12 +164,12 @@ export class Analyzer {
     const content = this.explainPreview(id);
     const r = await this.ask(
       [
-        { role: "system", content: "Interpret this analysis result for the user in plain language. Be concise, point out anything notable, and say if the result can't answer the question." },
+        { role: "system", content: `Interpret this analysis result for the user in plain language. Be concise, point out anything notable, and say if the result can't answer the question.\n\n${tokenNote(j.vault!.tag)}` },
         { role: "user", content },
       ],
       j.model ?? j.usedModel,
       dirname(j.path),
     );
-    return { answer: r.text, model: r.model, sent: content };
+    return { answer: j.vault!.restore(r.text), model: r.model, sent: content };
   }
 }

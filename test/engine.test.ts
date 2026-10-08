@@ -355,6 +355,15 @@ describe("tables and the sensitive pin", () => {
     expect(JSON.stringify(sent)).not.toContain("jsmith");
     expect((await a.run(plan.id)).ok).toBe(true);
     expect(a.leaks(plan.id)).toEqual(["username"]);
+    // interpretation sends the value as a token and restores it in the answer
+    const preview = a.explainPreview(plan.id);
+    expect(preview).not.toContain("jsmith");
+    expect(preview).toMatch(/\[HIB\w+-USERNAME-1\]/);
+    alpha.current = (req) => [{ type: "text", delta: `the only user is ${/\[HIB\w+-USERNAME-1\]/.exec(JSON.stringify(req.messages))![0]}` }];
+    const before = sent.length;
+    const ex = await a.explain(plan.id);
+    expect(JSON.stringify(sent.slice(before))).not.toContain("jsmith");
+    expect(ex.answer).toBe("the only user is jsmith");
   });
 });
 
@@ -402,4 +411,21 @@ test("egress log: every model call is recorded with exactly what was sent (redac
   expect(full.guard).toContain("EMAIL×1");
   expect(engine.egressList({ cwd: "/tmp/somewhere" }).length).toBe(3);
   expect((engine.egressGet("last") as any).part).toBe("revision");
+});
+
+test("--keep columns go out exactly as they are, even with name detection on; other columns stay protected", async () => {
+  const { loadTable } = await import("../src/analyze/table");
+  const { fakeInfer } = await import("./helpers/fake-ner");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const p = join(mkdtempSync(join(tmpdir(), "hib-keep-")), "logins.csv");
+  writeFileSync(p, "user,time,city,notes\njsmith,2026-10-08T22:00:00Z,Zagreb,met Marija Horvat in Zagreb\n");
+  engine.cfg.guard.ner = true;
+  engine.nerInfer = fakeInfer;
+  await run({ messages: [{ role: "user", content: "impossible travel?" }], model: "alpha/fast", attachments: [{ name: "logins.csv", path: p, table: loadTable(p), keep: ["city"] }] });
+  const wire = JSON.stringify(sent);
+  expect(wire).toContain("2026-10-08T22:00:00Z,Zagreb,"); // kept city column, readable
+  expect(wire).not.toContain("jsmith");
+  expect(wire).not.toContain("Marija Horvat");
+  expect(wire).not.toContain("in Zagreb"); // the same city inside free text is still tokenized
+  engine.cfg.guard.ner = false;
 });

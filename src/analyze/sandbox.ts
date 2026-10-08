@@ -33,14 +33,14 @@ function seatbelt(): string {
 }
 
 /** Runs model-written code against the table locally, isolated from the network and your files. */
-export async function runAnalysis(code: string, table: Table, timeoutMs = 20_000): Promise<RunResult> {
+export async function runAnalysis(code: string, table: Table, timeoutMs = 20_000, geo?: { data: string; helper: string }): Promise<RunResult> {
   const mac = process.platform === "darwin" && !!Bun.which("sandbox-exec");
   const cmd = [process.execPath, RUNNER];
   const argv = mac ? ["sandbox-exec", "-p", seatbelt(), ...cmd] : cmd;
   const p = Bun.spawn(argv, {
     cwd: "/",
     env: { PATH: "/usr/bin:/bin", HOME: "/nonexistent", TMPDIR: "/nonexistent" },
-    stdin: new Blob([JSON.stringify({ code, data: JSON.stringify(table.rows), timeoutMs })]),
+    stdin: new Blob([JSON.stringify({ code, data: JSON.stringify(table.rows), timeoutMs, geo: geo?.data, geoHelper: geo?.helper })]),
     stdout: "pipe",
     stderr: "pipe",
   });

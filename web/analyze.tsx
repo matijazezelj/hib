@@ -6,7 +6,22 @@ const api = new HibClient();
 
 export const ANALYZABLE = /\.(csv|tsv|json|jsonl|ndjson)$/i;
 
-function ResultView({ result }: { result: unknown }) {
+function ResultView({ result }: { result: unknown }): any {
+  // Summaries with nested lists: key/value lines, then a titled table per list.
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    const entries = Object.entries(result as Record<string, unknown>);
+    const scalars = entries.filter(([, v]) => v === null || typeof v !== "object");
+    return (
+      <div>
+        {scalars.length > 0 && (
+          <div className="md"><table><tbody>{scalars.map(([k, v]) => <tr key={k}><th>{k}</th><td>{String(v)}</td></tr>)}</tbody></table></div>
+        )}
+        {entries.filter(([, v]) => v !== null && typeof v === "object").map(([k, v]) => (
+          <div key={k}><div className="muted" style={{ marginTop: 6 }}><b>{k}</b>{Array.isArray(v) ? ` (${v.length})` : ""}</div><ResultView result={v} /></div>
+        ))}
+      </div>
+    );
+  }
   if (Array.isArray(result) && result.length && result.every((r) => r && typeof r === "object" && !Array.isArray(r))) {
     const cols = [...new Set(result.flatMap((r: any) => Object.keys(r)))];
     return (
@@ -155,7 +170,7 @@ export function AnalyzePanel({ root, path, models, onClose }: { root: string; pa
         {preview && !answer && (
           <div className="perm">
             <div>This exact text goes to {plan.model} (through the guard). The table stays here.</div>
-            {leaks.length > 0 && <div className="note warn">⚠ The result contains real values from identifying columns: {leaks.join(", ")}.</div>}
+            {leaks.length > 0 && <div className="note">Values from identifying columns ({leaks.join(", ")}) go out as tokens and come back restored.</div>}
             <pre className="out">{preview}</pre>
             <div className="perm-actions" style={{ padding: 0 }}>
               <button className="primary" disabled={!!busy} onClick={explain}>Send</button>

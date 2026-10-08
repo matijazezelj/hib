@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { loadTable, TABLE_FILE } from "../analyze/table";
 import { columnsToHide, pseudonymize } from "../analyze/pseudo";
+import { DATA_RULE_NOTE, rawDataCommand } from "./datarules";
+import { readdirSync, statSync } from "node:fs";
 
 export type DriverFactory = (provider: string) => AgentDriver | null;
 
@@ -51,11 +53,23 @@ interface Live {
   askReads: boolean;
 }
 
-/** In a sensitive workspace, Claude reading or grepping a table file is pointed at a pseudonymised copy instead. */
-function tabularTarget(call: ToolCall, input: unknown): "file_path" | "path" | null {
+/** A data file: CSV/TSV always; JSON only when it loads as a table (an array of records), not config like package.json. */
+function isDataFile(path: string): boolean {
+  if (!TABLE_FILE.test(path)) return false;
+  if (!/\.(json|jsonl|ndjson)$/i.test(path)) return true;
+  try {
+    return loadTable(path).rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** In a sensitive workspace, Claude reading or grepping a data file is pointed at a pseudonymised copy instead. */
+function tabularTarget(call: ToolCall, input: unknown, root: string): "file_path" | "path" | null {
   const i = input as any;
-  if (call.name === "Read" && typeof i?.file_path === "string" && TABLE_FILE.test(i.file_path)) return "file_path";
-  if (call.name === "Grep" && typeof i?.path === "string" && TABLE_FILE.test(i.path)) return "path";
+  const abs = (p: string) => (isAbsolute(p) ? p : resolvePath(root, p));
+  if (call.name === "Read" && typeof i?.file_path === "string" && isDataFile(abs(i.file_path))) return "file_path";
+  if (call.name === "Grep" && typeof i?.path === "string" && isDataFile(abs(i.path))) return "path";
   return null;
 }
 
@@ -208,7 +222,9 @@ export class WorkspaceSessions {
     const driver = this.drivers(c.provider);
     if (!driver) throw new Error(`provider ${c.provider} has no agent driver`);
     const askReads = !!this.engine.workspaces.policy(root);
-    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system, askReads });
+    // Sensitive folders: the agent learns the data rule up front, so it reaches for Read instead of `head`/`cat`.
+    const sys = askReads ? [system, DATA_RULE_NOTE].filter(Boolean).join("\n\n") : system;
+    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads });
     const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads };
     this.live.set(id, l);
     return l;
@@ -341,6 +357,26 @@ export class WorkspaceSessions {
     const runId = `r_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const started = Date.now();
     this.db.run("INSERT INTO runs(id, ts, conversation_id, class, model, account, mode, pipeline, status) VALUES (?,?,?,?,?,?,?,?,?)", [runId, started, sid, "code", c.id, c.account.id, "agent", "workspace", "running"]);
+    // Data files in the folder (by name), so `cat clients.json` is caught even though .json isn't always data.
+    let dataCache: Set<string> | undefined;
+    const dataFiles = () => {
+      if (dataCache) return dataCache;
+      dataCache = new Set();
+      const walk = (dir: string, depth: number) => {
+        if (depth > 3) return;
+        for (const n of readdirSync(dir)) {
+          if (n.startsWith(".") || n === "node_modules") continue;
+          const p = join(dir, n);
+          const st = statSync(p, { throwIfNoEntry: false });
+          if (st?.isDirectory()) walk(p, depth + 1);
+          else if (st && isDataFile(p)) dataCache!.add(n);
+        }
+      };
+      try {
+        walk(root, 0);
+      } catch {}
+      return dataCache;
+    };
     const restorer = new StreamRestorer(vault);
     let answer = "";
     let failure: string | undefined;
@@ -375,8 +411,23 @@ export class WorkspaceSessions {
           }
           case "permission": {
             const call = restoreCall(e.call, vault);
-            if (policy && tabularTarget(call, e.input)) call.title += " (the agent gets a pseudonymised copy)";
-            else if (policy && call.name === "Grep") call.title += " (may return raw rows from table files)";
+            if (policy && call.kind === "command" && call.command) {
+              // Raw reads of data through the shell are refused outright; the agent is told to use Read instead.
+              const why = rawDataCommand(call.command, root, dataFiles());
+              if (why) {
+                const message = `Blocked by hib: this folder is sensitive and ${why}. Read data files with the Read tool instead (you get a pseudonymised copy).`;
+                l.driver.answer(e.id, { behavior: "deny", message });
+                const ev = { type: "tool_result" as const, id: call.id, ok: false, output: `denied: ${why}` };
+                this.record(sid, { type: "data_block", command: call.command, why });
+                this.record(sid, { type: "tool_call", call });
+                this.record(sid, ev);
+                yield { type: "tool_call", call };
+                yield ev;
+                break;
+              }
+            }
+            if (policy && tabularTarget(call, e.input, root)) call.title += " (the agent gets a pseudonymised copy)";
+            else if (policy && call.name === "Grep") call.title += " (may return raw rows from data files)";
             if (this.autoAllowed(l, e.ruleKey, call)) {
               l.driver.answer(e.id, this.allowDecision(l, call, e.input));
               break;
@@ -459,7 +510,7 @@ export class WorkspaceSessions {
   private allowDecision(l: Live, call: ToolCall, input: unknown): Decision {
     if (input === undefined) return { behavior: "allow" };
     const real = restoreDeep(input, l.vault) as any;
-    const key = this.engine.workspaces.policy(l.root) ? tabularTarget(call, real) : null;
+    const key = this.engine.workspaces.policy(l.root) ? tabularTarget(call, real, l.root) : null;
     if (!key) return { behavior: "allow", updatedInput: real };
     const src = isAbsolute(real[key]) ? real[key] : resolvePath(l.root, real[key]);
     try {

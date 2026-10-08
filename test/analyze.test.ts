@@ -127,3 +127,62 @@ test("only table files are loaded, so a random file's first line is never sent a
   expect(() => loadTable(file("notes.txt", "secret plans\nmore"))).toThrow("not a CSV");
   expect(() => loadTable(file("id_rsa", "-----BEGIN"))).toThrow("not a CSV");
 });
+
+describe("offline geo helper", async () => {
+  const { buildGeo, GEO_HELPER } = await import("../src/analyze/geo");
+  // GeoNames format: geonameid, name, asciiname, alternatenames, lat, lon, fclass, fcode, cc, cc2, a1, a2, a3, a4, population, …
+  const row = (name: string, lat: number, lon: number, cc: string, pop: number) => [1, name, name.normalize("NFD").replace(/[̀-ͯ]/g, ""), "", lat, lon, "P", "PPLC", cc, "", "", "", "", "", pop, "", "", "", ""].join("\t");
+  const cities = [row("Zagreb", 45.815, 15.9819, "HR", 790017), row("Split", 43.5089, 16.4392, "HR", 160577), row("Tokyo", 35.6895, 139.6917, "JP", 8336599), row("Osaka", 34.6937, 135.5022, "JP", 2592413)].join("\n");
+  const countries = "#ISO\tISO3\tISO-Numeric\tfips\tCountry\tCapital\tArea\tPopulation\tContinent\nHR\tHRV\t191\tHR\tCroatia\tZagreb\t56542\t4071000\tEU\nJP\tJPN\t392\tJA\tJapan\tTokyo\t377835\t127288000\tAS\n";
+  const geo = buildGeo(cities, countries);
+
+  test("parses cities and countries", () => {
+    expect(geo.cities.length).toBe(4);
+    expect(geo.countries.map((c) => c.name)).toEqual(["Croatia", "Japan"]);
+  });
+
+  test("impossible travel is computable locally from country/city columns", async () => {
+    const t = loadTable(file("logins.csv", "user,time,country,city\njsmith,2026-10-08T22:00:00Z,Croatia,Zagreb\njsmith,2026-10-08T23:00:00Z,JP,Tōkyō\nmkovac,2026-10-08T08:00:00Z,HR,Zagreb\nmkovac,2026-10-08T12:00:00Z,Croatia,Split\n"));
+    const code = `function analyze(rows) {
+      const by = {}; for (const r of rows) (by[r.user] ??= []).push(r);
+      const out = [];
+      for (const [user, list] of Object.entries(by)) {
+        list.sort((a, b) => Date.parse(a.time) - Date.parse(b.time));
+        for (let i = 1; i < list.length; i++) {
+          const a = geo.locate(list[i - 1].city, list[i - 1].country), b = geo.locate(list[i].city, list[i].country);
+          const speed = geo.kmh(a, b, list[i - 1].time, list[i].time);
+          if (speed > 900) out.push({ user, from: list[i - 1].city, to: list[i].city, km: Math.round(geo.km(a, b)), kmh: Math.round(speed) });
+        }
+      }
+      return out;
+    }`;
+    const r = await runAnalysis(code, t, 20_000, { data: JSON.stringify(geo), helper: GEO_HELPER });
+    expect(r.ok).toBe(true);
+    expect(r.result).toHaveLength(1);
+    expect((r.result as any)[0]).toMatchObject({ user: "jsmith", from: "Zagreb", to: "Tōkyō" });
+    expect((r.result as any)[0].km).toBeGreaterThan(9000);
+  });
+
+  test("lookups: ISO2, ISO3, names, accents, unknowns", async () => {
+    const t = loadTable(file("x.csv", "a\n1\n"));
+    const r = await runAnalysis(`function analyze() { return [geo.country("HRV")?.name, geo.country("japan")?.iso2, geo.city("tokyo")?.country, geo.locate("Nowhere", "JP")?.name, geo.locate("Nowhere", "Atlantis")]; }`, t, 20_000, { data: JSON.stringify(geo), helper: GEO_HELPER });
+    expect(r.result).toEqual(["Croatia", "JP", "JP", "Japan", null]);
+  });
+});
+
+test("boolean flags are never identifying, even when the name matches (known_abuser)", () => {
+  const t = loadTable(file("f.csv", "user,known_abuser,is_vpn\njsmith,true,false\n"));
+  expect(profile(t, "f.csv").columns.filter((c) => c.identifying).map((c) => c.name)).toEqual(["user"]);
+});
+
+test("several files combine into one table with a source_file column", async () => {
+  const { loadTables } = await import("../src/analyze/table");
+  const a = file("investigation-1.csv", "time,ip\n2026-01-01T00:00:00Z,1.2.3.4\n");
+  const b = file("investigation-2.csv", "time,ip,city\n2026-01-01T01:00:00Z,5.6.7.8,Tokyo\n");
+  const t = loadTables([a, b]);
+  expect(t.columns).toEqual(["source_file", "time", "ip", "city"]);
+  expect(t.rows).toEqual([
+    { source_file: "investigation-1.csv", time: "2026-01-01T00:00:00Z", ip: "1.2.3.4", city: null },
+    { source_file: "investigation-2.csv", time: "2026-01-01T01:00:00Z", ip: "5.6.7.8", city: "Tokyo" },
+  ]);
+});

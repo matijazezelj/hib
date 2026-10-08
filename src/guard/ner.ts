@@ -56,8 +56,19 @@ export function proseSegments(text: string): Segment[] {
 
 /** All-lowercase prose ("can you ask luka novak…"): the cased model needs a title-cased copy to see names. */
 export function isLowerProse(text: string): boolean {
-  const letters = text.replace(/[^\p{L}]/gu, "");
-  return letters.length > 20 && letters.replace(/[^\p{Lu}]/gu, "").length / letters.length < 0.03;
+  const letters = text.replace(/\[HIB[0-9a-f]{4}-[A-Z0-9-]+-\d+\]/g, " ").replace(/[^\p{L}]/gu, "");
+  return letters.length >= 10 && letters.replace(/[^\p{Lu}]/gu, "").length / letters.length < 0.03;
+}
+
+/**
+ * Lowercase stretches inside a segment, judged per field/clause: a CSV row can carry "SMB" in one column and
+ * "met luka novak in pula" in its notes; the notes still need the title-cased pass.
+ */
+export function lowercasePieces(seg: Segment): Segment[] {
+  const out: Segment[] = [];
+  // Any clause with a few lowercase words: "met luka vuković at the Graz conference" has a capital, and a name.
+  for (const m of seg.text.matchAll(/[^",;|\t()]+/g)) if ((m[0].match(/(?<![\p{L}\p{N}])\p{Ll}{2,}/gu) ?? []).length >= 2) out.push({ start: seg.start + m.index!, text: m[0] });
+  return out;
 }
 
 export interface RawToken {
@@ -104,22 +115,29 @@ export async function nerFindings(text: string, infer: Infer, opts: NerOptions =
   if (text.length > MAX_CHARS) throw new Error(`text too large for name detection (${text.length} > ${MAX_CHARS} chars)`);
   const ignore = new Set([...TECH, ...(opts.ignore ?? []).map((s) => s.toLowerCase())]);
   const found: Finding[] = [];
+  const isWord = (c: string | undefined) => !!c && /[\p{L}\p{N}]/u.test(c);
   const add = (start: number, end: number, category: string) => {
+    // Whole words only: the model sometimes tags a fragment ("SM" of "SMB"), which would leave "[ORG-1]B".
+    while (start > 0 && isWord(text[start - 1]) && isWord(text[start])) start--;
+    while (end < text.length && isWord(text[end]) && isWord(text[end - 1])) end++;
     const value = text.slice(start, end);
-    if (value.length < 2 || ignore.has(value.toLowerCase())) return;
+    if (value.length < 2 || ignore.has(value.toLowerCase()) || /^\[?HIB[0-9a-f]{4}-/.test(value)) return;
     found.push({ start, end, value, category, kind: "pii" });
   };
   for (const seg of proseSegments(text)) {
-    const passes: [string, number, boolean][] = [[seg.text, opts.minScore ?? 0.6, false]];
-    if (isLowerProse(seg.text)) passes.push([seg.text.replace(/\b\p{Ll}/gu, (c) => c.toUpperCase()), 0.9, true]);
-    for (const [input, min, caseless] of passes) {
+    // Pass 1: the text as written. Pass 2: lowercase stretches title-cased, since the cased model needs capitals.
+    const passes: [Segment, string, number, boolean][] = [[seg, seg.text, opts.minScore ?? 0.6, false]];
+    for (const piece of lowercasePieces(seg)) passes.push([piece, piece.text.replace(/(?<![\p{L}\p{N}])\p{Ll}/gu, (c) => c.toUpperCase()), 0.9, true]);
+    for (const [where, input, min, caseless] of passes) {
       let cursor = 0;
       for (const e of mergeTokens(await infer(input))) {
         if (e.score < min || !LABEL[e.label]) continue;
-        const at = locate(seg.text, e.text, cursor, caseless);
+        const at = locate(where.text, e.text, cursor, caseless);
         if (!at) continue;
         cursor = at[1];
-        add(seg.start + at[0], seg.start + at[1], LABEL[e.label]!);
+        // The title-cased pass exists for names typed in lowercase; anything capitalised was pass 1's call.
+        if (caseless && /\p{Lu}/u.test(where.text.slice(at[0], at[1]))) continue;
+        add(where.start + at[0], where.start + at[1], LABEL[e.label]!);
       }
     }
     for (const m of seg.text.matchAll(ORG_SUFFIX)) add(seg.start + m.index!, seg.start + m.index! + m[0].length, "ORG");
@@ -134,9 +152,18 @@ export async function nerFindings(text: string, infer: Infer, opts: NerOptions =
     const re = new RegExp(`(?<![\\p{L}\\p{N}])${esc(value)}(?![\\p{L}\\p{N}])`, "gu");
     for (const seg of segs) for (const m of seg.text.matchAll(re)) add(seg.start + m.index!, seg.start + m.index! + m[0].length, category);
   }
-  // One finding per span; longest first so "Acme d.o.o." wins over "Acme" (the guard resolves remaining overlaps).
-  const unique = [...new Map(found.map((f) => [`${f.start}:${f.end}`, f])).values()];
-  return unique.sort((a, b) => b.end - b.start - (a.end - a.start));
+  // One finding per span; adjacent same-kind findings separated only by spaces merge ("Ericsson" "Nikola Tesla"
+  // -> one ORG); longest first so "Acme d.o.o." wins over "Acme" (the guard resolves remaining overlaps).
+  const unique = [...new Map(found.map((f) => [`${f.start}:${f.end}`, f])).values()].sort((a, b) => a.start - b.start || b.end - a.end);
+  const merged: Finding[] = [];
+  for (const f of unique) {
+    const last = merged[merged.length - 1];
+    if (last && last.category === f.category && f.start >= last.end && /^ +$/.test(text.slice(last.end, f.start))) {
+      last.end = f.end;
+      last.value = text.slice(last.start, last.end);
+    } else merged.push({ ...f });
+  }
+  return merged.sort((a, b) => b.end - b.start - (a.end - a.start));
 }
 
 /** Loads the pinned model on first use. Never downloads unless `allowDownload` (hib guard ner setup). */

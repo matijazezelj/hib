@@ -68,6 +68,9 @@ A sensitive folder is seen by exactly one vendor account. The policy is stored i
 - **Nothing that copies data elsewhere:** no handoff, failover, advisor, arena, or classifier call.
 - **Reads need approval.** Every file read, search, Bash command and subagent asks first, so you see each file before its contents go out. "Always" for a read covers only that directory.
 - **Secrets are blocked** in prompts outright, not just tokenized.
+- **Data stays pseudonymised.** Data files (CSV/TSV, table-shaped JSON) reach the agent only through the Read tool, which hands it a pseudonymised copy.
+  - Shell commands that read them raw are denied automatically, with a message pointing the agent to Read. That covers `head`/`cat`/`awk` on a data file, inline `python -c`/`node -e`/heredocs, and scripts run from outside the folder.
+  - The agent is told this rule up front. Listing and counting (`ls`, `wc`, `find`) still work.
 - **Repo config is ignored.** Claude sessions load only your user settings, never the repo's `.claude/` settings or hooks, and no MCP servers. A cloned repo can't add allow rules or run hooks.
 - **No browser terminal** (the server refuses it).
 - **Egress log.** Each turn records the redacted prompt and the account it went to, plus every tool call. View it in the *Egress* tab, with `/egress` in the terminal, or with `hib workspace egress`.
@@ -99,6 +102,16 @@ hib ask -f users.csv "which 3 people in Engineering earn the most?"
 - Numbers and categories stay readable.
 - The answer comes back with real values restored.
 - `--hide col` and `--keep col` adjust which columns are tokenized.
+
+**Geography without sending identities.** For questions like impossible travel:
+- `hib geo setup` installs an offline gazetteer: GeoNames cities over 15k people, plus countries (CC-BY 4.0, about 3 MB).
+- `hib analyze` code can then call `geo.locate(city, country)`, `geo.km(a, b)` and `geo.kmh(a, b, timeA, timeB)` inside the sandbox. The model writes the distance and speed logic, and it runs on the real data locally.
+- With `hib ask -f`, `--keep country,city` sends those columns readable, untouched by any detector including name detection, while users, IPs and user agents stay tokens.
+
+```sh
+hib analyze logins.csv "impossible travel: consecutive logins per user implying more than 900 km/h"
+hib ask -f logins.csv --keep country,city,continent "find impossible travel and anything suspicious about it"
+```
 
 In a **sensitive workspace**, when you approve Claude reading a `.csv` or `.tsv`, it gets a pseudonymised copy instead of the real file. The egress log records which columns were tokenized.
 

@@ -14,7 +14,7 @@ import { CLASSIFY_PROMPT, classify, parseClassifierReply } from "./router/classi
 import { Router, resolveCandidate, type Candidate } from "./router/route";
 import { Usage } from "./usage";
 import { onPinnedAccount, pinnedModel, Workspaces } from "./workspace/registry";
-import { columnsToHide, pseudonymize } from "./analyze/pseudo";
+import { columnsToHide, pseudonymizeWithSpans } from "./analyze/pseudo";
 import { dirname } from "node:path";
 import type { Table } from "./analyze/table";
 
@@ -270,13 +270,28 @@ export class Engine {
     // Attached tables go out pseudonymised by column, with tokens from this conversation's vault so answers restore.
     const attached = (input.attachments ?? []).map((a) => {
       const cols = columnsToHide(a.table, a.hide, a.keep);
-      const csv = pseudonymize(a.table, cols, vault);
-      return { note: `[attached ${a.name}: ${a.table.rows.length} rows; pseudonymised: ${cols.join(", ") || "none"}]`, text: `<table name="${a.name}" rows="${a.table.rows.length}">\n${csv}</table>` };
+      const { csv, kept } = pseudonymizeWithSpans(a.table, cols, vault, a.keep ?? []);
+      const head = `<table name="${a.name}" rows="${a.table.rows.length}">\n`;
+      const keptNote = a.keep?.length ? `; kept readable: ${a.keep.join(", ")}` : "";
+      return { note: `[attached ${a.name}: ${a.table.rows.length} rows; pseudonymised: ${cols.join(", ") || "none"}${keptNote}]`, text: `${head}${csv}</table>`, kept: kept.map(([s, e]) => [s + head.length, e + head.length] as [number, number]) };
     });
     if (attached.reduce((n, x) => n + x.text.length, 0) > 400_000)
       return yield { type: "error", message: "attached table is too large to send; use `hib analyze`, which sends only the schema" };
+    // Kept columns are exempt from every detector: record their spans in the final message text.
+    const exempt = new Map<string, [number, number][]>();
     const outgoingInput = attached.length
-      ? input.messages.map((m, i) => (i === lastIn && m.role === "user" ? { ...m, content: `${m.content}\n\n${attached.map((x) => x.text).join("\n\n")}` } : m))
+      ? input.messages.map((m, i) => {
+          if (i !== lastIn || m.role !== "user") return m;
+          let content = m.content;
+          const spans: [number, number][] = [];
+          for (const x of attached) {
+            content += "\n\n";
+            spans.push(...x.kept.map(([s, e]) => [s + content.length, e + content.length] as [number, number]));
+            content += x.text;
+          }
+          exempt.set(content, spans);
+          return { ...m, content };
+        })
       : input.messages;
     const messages = [...history, ...outgoingInput];
 
@@ -311,7 +326,7 @@ export class Engine {
     // guard
     // Names, places and companies (local NER) are tokenized too, unless the route only covers secrets.
     const ner = plan.route.level === "minimal" ? undefined : await this.ner(messages.map((m) => m.content));
-    const insp = inspect(messages, plan.route, this.cfg, { cwd: input.cwd, vault, ner });
+    const insp = inspect(messages, plan.route, this.cfg, { cwd: input.cwd, vault, ner, exempt });
     yield { type: "guard", findings: insp.findings, action: insp.blocked ? "block" : insp.decision.action, reasons: insp.blocked ? [insp.blocked] : insp.decision.reasons };
     if (insp.blocked) return yield { type: "error", message: `blocked: ${insp.blocked}` };
     let outbound = insp.messages;

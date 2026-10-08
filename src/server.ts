@@ -231,7 +231,8 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
       "/hib/analyze/plan": {
         POST: guarded(async (req) => {
           const b: any = await req.json();
-          return json(await analyzer.plan({ path: analysisPath(b), question: String(b.question ?? ""), model: b.model || undefined, share: b.share ?? [] }));
+          const paths = Array.isArray(b.paths) && b.paths.length ? b.paths.map((p: string) => analysisPath({ ...b, path: p })) : [analysisPath(b)];
+          return json(await analyzer.plan({ path: paths[0], paths, question: String(b.question ?? ""), model: b.model || undefined, share: b.share ?? [] }));
         }),
       },
       "/hib/analyze/run": { POST: guarded(async (req) => json(await analyzer.run(((await req.json()) as any).id))) },

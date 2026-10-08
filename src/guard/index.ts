@@ -60,7 +60,7 @@ export async function runNer(texts: string[], cfg: Config, infer: Infer | undefi
   }
 }
 
-export function inspect(messages: Message[], route: Route, cfg: Config, opts: { cwd?: string; vault?: Vault; level?: Level; skipScan?: boolean; ner?: NerResult } = {}): Inspection {
+export function inspect(messages: Message[], route: Route, cfg: Config, opts: { cwd?: string; vault?: Vault; level?: Level; skipScan?: boolean; ner?: NerResult; exempt?: Map<string, [number, number][]> } = {}): Inspection {
   const vault = opts.vault ?? new Vault();
   const terms = cfg.guard.terms;
   // In agent mode the CLI sees real paths through its own tools, so tokenizing them only breaks file access.
@@ -69,7 +69,7 @@ export function inspect(messages: Message[], route: Route, cfg: Config, opts: { 
   const level = opts.level ?? route.level;
   const all: Finding[] = [];
   const out: Message[] = messages.map((m) => {
-    const { text, findings } = vault.obfuscate(m.content, { level, terms, identities, patterns: cfg.guard.patterns, keepPaths: agent, extra: opts.ner?.byText.get(m.content) });
+    const { text, findings } = vault.obfuscate(m.content, { level, terms, identities, patterns: cfg.guard.patterns, keepPaths: agent, extra: opts.ner?.byText.get(m.content), exempt: opts.exempt?.get(m.content) });
     all.push(...findings);
     return { ...m, content: text };
   });

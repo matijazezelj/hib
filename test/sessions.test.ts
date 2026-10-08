@@ -349,3 +349,34 @@ describe("sensitive table reads", () => {
     expect(drivers[0]!.decisions.get("r1")).toMatchObject({ behavior: "deny", message: expect.stringContaining("couldn't make a pseudonymised copy") });
   });
 });
+
+describe("sensitive workspaces: shell reads of data", () => {
+  test("a shell command reading a data file is denied without asking, and logged", async () => {
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(join(root, "logins.csv"), "user,ip\njsmith,1.2.3.4\n");
+    engine.workspaces.register(root);
+    engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@work" });
+    const prompted: string[] = [];
+    script.current = async (_t, d, q) => {
+      q.push({ type: "permission", id: "b1", ruleKey: "Bash:head", call: { id: "c1", name: "Bash", kind: "command", title: "$ head logins.csv", command: "head -c 3000 logins.csv" }, input: { command: "head -c 3000 logins.csv" } });
+      await d.ask("b1");
+    };
+    const r = await turn("look at the data", undefined, (e) => (prompted.push(e.id), "allow"), "hib/auto");
+    expect(prompted).toEqual([]); // never offered to the user
+    expect(drivers[0]!.decisions.get("b1")).toMatchObject({ behavior: "deny", message: expect.stringContaining("Read tool") });
+    expect(drivers[0]!.started[0]!.system).toContain("Read data files (CSV, TSV, JSON…) only with the Read tool");
+    expect(sessions.egress(r.sid)[0]!.actions).toEqual([{ kind: "command", title: "$ head logins.csv", status: "denied" }]);
+  });
+  test("non-table JSON (package.json) is read normally, not 'pseudonymised'", async () => {
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(join(root, "package.json"), '{"name":"x"}');
+    engine.workspaces.register(root);
+    engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@work" });
+    script.current = async (_t, d, q) => {
+      q.push({ type: "permission", id: "r1", ruleKey: "read:.", call: { id: "c1", name: "Read", kind: "read", title: "Read package.json" }, input: { file_path: join(root, "package.json") } });
+      await d.ask("r1");
+    };
+    await turn("read package.json", undefined, () => "allow", "hib/auto");
+    expect(drivers[0]!.decisions.get("r1")).toEqual({ behavior: "allow", updatedInput: { file_path: join(root, "package.json") } });
+  });
+});

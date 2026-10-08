@@ -167,6 +167,7 @@ export interface DetectOptions {
   patterns?: { category: string; regex: string; flags?: string }[]; // from guard plugins; applied at every level
   keepPaths?: boolean; // agent mode: the CLI must open real paths, and its tool output reveals them anyway
   extra?: Finding[]; // precomputed findings for this exact text (local NER)
+  exempt?: [number, number][]; // spans to leave exactly as they are (e.g. table columns the user chose to keep)
 }
 
 /** Non-overlapping findings, earlier detectors (secrets, then terms) winning ties. */
@@ -197,6 +198,7 @@ export function detect(text: string, opts: DetectOptions): Finding[] {
   const taken: Finding[] = [];
   for (const f of raw) {
     if (tokens.some(([s, e]) => f.start < e && s < f.end)) continue;
+    if (opts.exempt?.some(([s, e]) => f.start < e && s < f.end)) continue;
     if (taken.some((t) => f.start < t.end && t.start < f.end)) continue;
     taken.push(f);
   }

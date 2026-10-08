@@ -26,6 +26,15 @@ export interface Profile {
 }
 
 const MAX_BYTES = 50 * 1024 * 1024;
+/** Several files as one table: columns are unioned and `source_file` says where each row came from. */
+export function loadTables(paths: string[]): Table {
+  if (paths.length === 1) return loadTable(paths[0]!);
+  const tables = paths.map((p) => ({ name: basename(p), t: loadTable(p) }));
+  const columns = ["source_file", ...new Set(tables.flatMap((x) => x.t.columns))];
+  const rows = tables.flatMap((x) => x.t.rows.map((r) => Object.fromEntries(columns.map((c) => [c, c === "source_file" ? x.name : (r[c] ?? null)]))));
+  return { columns, rows };
+}
+
 export const TABLE_FILE = /\.(csv|tsv|json|jsonl|ndjson)$/i;
 
 /** RFC 4180-style CSV: quoted fields, doubled quotes, newlines inside quotes. */
@@ -125,6 +134,7 @@ export function columnType(rows: Record<string, Cell>[], col: string): ColType {
 
 /** Identifying columns: by name, or because their values look like emails, IPs or phone numbers. */
 export function isIdentifying(name: string, rows: Record<string, Cell>[]): boolean {
+  if (columnType(rows, name) === "boolean") return false; // a yes/no flag ("known_abuser") identifies no one
   if (IDENTIFYING_NAME.test(name)) return true;
   if (columnType(rows, name) !== "string") return false; // numbers and ISO dates aren't emails, IPs or phones
   const sample = rows.slice(0, 200).map((r) => r[name]).filter((x): x is string => typeof x === "string");

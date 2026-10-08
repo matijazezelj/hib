@@ -18,6 +18,7 @@ const HELP = `hib — harness in a box
   hib workspace normal [dir]  lift that
   hib workspace egress [session]    what left the machine in a session (default: latest here)
   hib guard ner setup|status|off    local name/place/company detection (one-time ~180 MB model download)
+  hib geo setup                     offline gazetteer for hib analyze (GeoNames cities/countries, ~3 MB download)
   hib egress [last|id] [--here]     what router requests (ask, chat, analyze, API) sent, and to whom
   hib ask "prompt" [-m model] one-shot answer on stdout
   hib ask -f data.csv "question" [--hide col,col] [--keep col,col]
@@ -51,6 +52,7 @@ const { values, positionals } = parseArgs({
     hide: { type: "string" },
     keep: { type: "string" },
     yes: { type: "boolean", short: "y" },
+    "show-sent": { type: "boolean" },
     help: { type: "boolean", short: "h" },
   },
 });
@@ -214,12 +216,28 @@ async function main() {
       return pluginCmd(rest);
     case "egress":
       return egressCmd(rest[0]);
+    case "geo": {
+      if (rest[0] !== "setup") throw new Error("usage: hib geo setup");
+      const { setupGeo } = await import("./analyze/geo");
+      console.log("downloading GeoNames cities (pop. > 15k) and country info…");
+      const g = await setupGeo(hibHome());
+      console.log(`installed: ${g.cities.length} cities, ${g.countries.length} countries. hib analyze can now use geo.locate / geo.km / geo.kmh.`);
+      return;
+    }
     case "guard":
       if (rest[0] !== "ner") throw new Error("usage: hib guard ner setup|status|off");
       return nerCmd(rest[1] ?? "status");
     case "analyze":
     case "analyse":
-      return analyzeCmd(rest[0], rest.slice(1).join(" "));
+    {
+      // Leading arguments that are table files (a shell glob like investigation-*.csv expands to several) are
+      // the input; everything after is the question.
+      const { existsSync } = await import("node:fs");
+      const { TABLE_FILE } = await import("./analyze/table");
+      const files: string[] = [];
+      while (files.length < rest.length && TABLE_FILE.test(rest[files.length]!) && existsSync(rest[files.length]!)) files.push(rest[files.length]!);
+      return analyzeCmd(files, rest.slice(files.length).join(" "));
+    }
     case undefined:
       return agent();
     default:
@@ -299,17 +317,39 @@ async function egressCmd(which?: string) {
   console.log(dim(`\nfull text of one: hib egress <id>   ·   latest: hib egress last`));
 }
 
+/** y/N question. A fresh readline per question: returning out of `for await (… of console)` closes stdin for good. */
 async function confirm(q: string): Promise<boolean> {
   if (values.yes) return true;
   if (!process.stdin.isTTY) return false;
-  process.stdout.write(`${q} [y/N] `);
-  for await (const line of console) return /^y(es)?$/i.test(line.trim());
-  return false;
+  const { createInterface } = await import("node:readline");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await new Promise<string>((resolve) => {
+      rl.question(`${q} [y/N] `, resolve);
+      rl.once("close", () => resolve(""));
+    });
+    return /^y(es)?$/i.test(answer.trim());
+  } finally {
+    rl.close();
+  }
 }
 
-/** Arrays of flat objects print as an aligned table; anything else as JSON. */
-function printResult(result: unknown) {
-  if (Array.isArray(result) && result.length && result.every((r) => r && typeof r === "object" && !Array.isArray(r))) {
+const isRowList = (v: unknown): v is Record<string, unknown>[] => Array.isArray(v) && v.length > 0 && v.every((r) => r && typeof r === "object" && !Array.isArray(r));
+
+/** Readable output: tables for lists of rows, "key  value" lines for summaries, sections for nested objects. */
+function printResult(result: unknown, depth = 0) {
+  if (result && typeof result === "object" && !Array.isArray(result) && !isRowList(result)) {
+    const entries = Object.entries(result as Record<string, unknown>);
+    const scalars = entries.filter(([, v]) => v === null || typeof v !== "object");
+    const w = Math.max(0, ...scalars.map(([k]) => k.length));
+    for (const [k, v] of scalars) console.log(`${"  ".repeat(depth)}${k.padEnd(w)}  ${v}`);
+    for (const [k, v] of entries.filter(([, v]) => v !== null && typeof v === "object")) {
+      console.log(`\n${"  ".repeat(depth)}\x1b[1m${k}\x1b[0m${Array.isArray(v) ? ` (${v.length})` : ""}`);
+      printResult(v, depth + 1);
+    }
+    return;
+  }
+  if (isRowList(result)) {
     const cols = [...new Set(result.flatMap((r) => Object.keys(r)))];
     const cell = (v: unknown) => (v === null || v === undefined ? "" : typeof v === "number" ? (Number.isInteger(v) ? String(v) : v.toFixed(2)) : typeof v === "object" ? JSON.stringify(v) : String(v));
     const rows = result.slice(0, 100).map((r: any) => cols.map((c) => cell(r[c])));
@@ -322,17 +362,21 @@ function printResult(result: unknown) {
   } else console.log(JSON.stringify(result, null, 2));
 }
 
-async function analyzeCmd(file: string | undefined, question: string) {
-  if (!file || !question) throw new Error('usage: hib analyze <file.csv|tsv|json|jsonl> "question" [-m model] [--share col,col] [-y]');
+async function analyzeCmd(files: string[], question: string) {
+  if (!files.length || !question) throw new Error('usage: hib analyze <file.csv|tsv|json|jsonl>… "question" [-m model] [--share col,col] [-y]');
   const { resolve } = await import("node:path");
   const { ensureDaemon } = await import("./boot");
   const { client } = await ensureDaemon();
-  const path = resolve(file);
+  const path = resolve(files[0]!);
+  const paths = files.map((f) => resolve(f));
+  if (paths.length > 1) console.log(`\x1b[2mcombining ${paths.length} files into one table (column source_file): ${files.join(", ")}\x1b[0m`);
   const share = values.share ? String(values.share).split(",").map((s) => s.trim()) : [];
+  if (values.keep || values.hide)
+    console.log(`\x1b[2mnote: analyze never sends rows, so --keep/--hide don't apply. Use --share col to give the model a column's distinct values, or hib ask -f to send rows.\x1b[0m`);
   const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 
   console.log(dim("profiling locally and asking for analysis code…"));
-  let plan = await client.post("/hib/analyze/plan", { path, question, model: values.model, share });
+  let plan = await client.post("/hib/analyze/plan", { path, paths, question, model: values.model, share });
   const withheld = plan.profile.columns.filter((c: any) => c.identifying).map((c: any) => c.name);
   const shared = plan.profile.columns.filter((c: any) => c.values).map((c: any) => c.name);
   console.log(`\nSent to ${plan.model ?? "model"}: the schema of ${plan.profile.rows} rows × ${plan.profile.columns.length} columns and 3 synthetic rows. No real values${shared.length ? ` except the distinct values of: ${shared.join(", ")}` : ""}.`);
@@ -355,8 +399,9 @@ async function analyzeCmd(file: string | undefined, question: string) {
 
   const pv = await client.post("/hib/analyze/explain", { id: plan.id, preview: true });
   const preview = pv.sent as string;
-  if (pv.leaks?.length) console.log(`\x1b[33m\n⚠ the result contains real values from identifying columns: ${pv.leaks.join(", ")}\x1b[0m`);
-  console.log(dim(`\nTo interpret this, hib would send the question, the code and the result above (${preview.length} characters, through the guard). The table itself stays here.`));
+  if (pv.leaks?.length) console.log(`\n\x1b[33mThe result contains values from identifying columns (${pv.leaks.join(", ")}); they go out as tokens and come back restored.\x1b[0m`);
+  console.log(dim(`\nTo interpret this, hib would send the question, the code and the result (${preview.length} characters, through the guard). The table itself stays here. Exact text: rerun with --show-sent.`));
+  if (values["show-sent"]) console.log(`\n${preview}\n`);
   if (!(await confirm("Send the result for interpretation?"))) return;
   const ex = await client.post("/hib/analyze/explain", { id: plan.id });
   console.log(`\n${ex.answer}`);

@@ -65,3 +65,30 @@ describe("data rows", () => {
     expect(values.filter((v) => v === "Marija Horvat").length).toBe(2);
   });
 });
+
+describe("data rows (regressions from a real CSV)", () => {
+  const row = `[HIB4be5-CLIENT-ID-9],[HIB4be5-FULL-NAME-9],[HIB4be5-ORG-4],SMB,616000,false,"met luka novak at the [HIB4be5-PLACE-1] conference, follow up in march"`;
+  test("lowercase notes inside a mixed-case row still get the title-cased pass", async () => {
+    const values = (await nerFindings(row, fakeInfer)).map((f) => f.value);
+    expect(values).toContain("luka novak");
+  });
+  test("a model fragment expands to the whole word (no '[ORG-1]B')", async () => {
+    const f = await nerFindings("segment SMXB is new", async () => [{ entity: "B-ORG", word: "SM", score: 0.99 }]);
+    expect(f.map((x) => x.value)).toEqual(["SMXB"]);
+  });
+  test("adjacent pieces of one company merge into one finding", async () => {
+    const f = await nerFindings("works at Ericsson Nikola Tesla now", async () => [
+      { entity: "B-ORG", word: "Ericsson", score: 0.99 }, { entity: "B-ORG", word: "Nikola", score: 0.99 }, { entity: "I-ORG", word: "Tesla", score: 0.99 },
+    ]);
+    expect(f.map((x) => x.value)).toEqual(["Ericsson Nikola Tesla"]);
+  });
+});
+
+test("a lowercase name next to a capitalised city in the same clause is still found", async () => {
+  const text = `false,"met luka novak at the Zagreb conference, follow up in march"`;
+  const values = (await nerFindings(text, fakeInfer)).map((f) => f.value);
+  expect(values).toContain("luka novak");
+  expect(values).toContain("Zagreb");
+  // the title-cased pass never adds capitalised words of its own
+  expect(values).not.toContain("Met");
+});
