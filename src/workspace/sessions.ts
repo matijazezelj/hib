@@ -26,6 +26,7 @@ export type WsEvent =
   | { type: "approval"; id: string; redacted: string; reasons: string[] }
   | { type: "turn_start"; text: string; model?: string }
   | { type: "permission_answer"; id: string; choice: string }
+  | { type: "mode"; auto: boolean }
   | { type: "sent"; account: string; model: string; text: string; handoff: boolean; chars: number }
   | { type: "pseudonymised"; file: string; columns: string[]; callId?: string }
   | AgentEvent
@@ -80,6 +81,13 @@ function protectedPath(root: string, p: string): boolean {
   return PROTECTED.has(rel.split("/")[0] ?? "");
 }
 
+/**
+ * Auto mode still asks for commands that reach off this machine or can't be undone locally:
+ * network tools, publishing, pushing, privilege escalation, recursive deletes and history rewrites.
+ */
+const ASK_EVEN_IN_AUTO =
+  /(^|[\s;&|(`$])(sudo|su|doas|curl|wget|ssh|scp|sftp|rsync|nc|ncat|netcat|telnet|ftp|socat)\b|\bgit\s+(push|reset\s+--hard|clean|filter-branch|remote\s+(add|set-url))\b|\b(npm|bun|pnpm|yarn|cargo|twine|gem)\s+publish\b|\bgh\s+(pr|release|repo|api|gist|issue)\b|\brm\s+(-\w+\s+)*-\w*[rR]|\/dev\/(tcp|udp)\//;
+
 const newId = () => `w_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
 const HANDOFF_LIMIT = 60_000;
 
@@ -98,6 +106,7 @@ function restoreCall(c: ToolCall, vault: Vault): ToolCall {
 export class WorkspaceSessions {
   private live = new Map<string, Live>();
   private busy = new Set<string>();
+  private auto = new Set<string>(); // sessions in auto mode; in memory only, so a restarted daemon is back to manual
   private hubs = new Map<string, Hub>();
   private listeners = new Set<() => void>();
 
@@ -147,6 +156,7 @@ export class WorkspaceSessions {
       live: h?.running ? h.buf.map((x) => x.e) : [],
       seq: h?.seq ?? 0,
       running: !!h?.running,
+      auto: this.auto.has(id),
       row: this.db.query("SELECT id, title, workspace, agent_model AS model FROM conversations WHERE id = ?").get(id) ?? null,
     };
   }
@@ -160,7 +170,7 @@ export class WorkspaceSessions {
   }
 
   /** Starts a turn in the background; clients follow it through subscribe(). Closing a client never stops it. */
-  startTurn(input: { sessionId?: string; root: string; model?: string; text: string }): { sessionId: string } | { error: string } {
+  startTurn(input: { sessionId?: string; root: string; model?: string; text: string; auto?: boolean }): { sessionId: string } | { error: string } {
     const sid = input.sessionId ?? newId();
     if (this.busy.has(sid)) return { error: "this session is already running a turn" };
     this.busy.add(sid);
@@ -171,6 +181,7 @@ export class WorkspaceSessions {
     h.buf = [];
     h.dbMark = ((this.db.query("SELECT MAX(id) AS m FROM ws_events WHERE session_id = ?").get(sid) as any)?.m ?? 0) as number;
     this.emit(sid, { type: "turn_start", text: input.text, model: input.model });
+    if (input.auto !== undefined && input.auto !== this.auto.has(sid)) this.setAuto(sid, input.auto);
     (async () => {
       try {
         for await (const e of this.runTurn({ ...input, sessionId: sid, isNew: !input.sessionId }, ac.signal)) this.emit(sid, e);
@@ -232,7 +243,7 @@ export class WorkspaceSessions {
   }
 
   /** Starts a turn and yields its events until it ends (used by tests and simple clients). */
-  async *send(input: { sessionId?: string; root: string; model?: string; text: string }, _signal?: AbortSignal): AsyncGenerator<WsEvent> {
+  async *send(input: { sessionId?: string; root: string; model?: string; text: string; auto?: boolean }, _signal?: AbortSignal): AsyncGenerator<WsEvent> {
     const started = this.startTurn(input);
     if ("error" in started) return yield { type: "error", message: started.error };
     const q: WsEvent[] = [];
@@ -429,7 +440,7 @@ export class WorkspaceSessions {
             }
             if (policy && tabularTarget(call, e.input, root)) call.title += " (the agent gets a pseudonymised copy)";
             else if (policy && call.name === "Grep") call.title += " (may return raw rows from data files)";
-            if (this.autoAllowed(l, e.ruleKey, call)) {
+            if (this.autoAllowed(l, e.ruleKey, call) || (this.auto.has(sid) && this.autoModeCovers(l, call))) {
               l.driver.answer(e.id, this.allowDecision(l, call, e.input));
               break;
             }
@@ -539,6 +550,29 @@ export class WorkspaceSessions {
     if (call.kind !== "edit") return true;
     const paths = call.paths ?? (call.path ? [call.path] : []);
     return paths.length > 0 && paths.every((p) => insideRoot(l.root, p) && !protectedPath(l.root, p));
+  }
+
+  /**
+   * Auto mode: edits inside the folder and commands run without asking, except edits to tool config and
+   * ASK_EVEN_IN_AUTO commands. In sensitive folders reads, searches and fetches keep asking.
+   */
+  private autoModeCovers(l: Live, call: ToolCall): boolean {
+    if (call.kind === "edit") {
+      const paths = call.paths ?? (call.path ? [call.path] : []);
+      return paths.length > 0 && paths.every((p) => insideRoot(l.root, p) && !protectedPath(l.root, p));
+    }
+    if (call.kind === "command") return !!call.command && !ASK_EVEN_IN_AUTO.test(call.command);
+    if (call.kind === "read" || call.kind === "search" || call.kind === "web") return !l.askReads;
+    return false;
+  }
+
+  /** Switches a session between asking for every action (manual, the default) and auto mode; pending prompts it covers are approved. */
+  setAuto(sessionId: string, on: boolean) {
+    if (on) this.auto.add(sessionId);
+    else this.auto.delete(sessionId);
+    this.emit(sessionId, { type: "mode", auto: on });
+    const l = this.live.get(sessionId);
+    if (on && l) for (const [id, p] of l.pending) if (this.autoModeCovers(l, p.call)) this.answer(sessionId, id, "allow");
   }
 
   /** Allow once, allow this kind of call for the rest of the session, or deny. */

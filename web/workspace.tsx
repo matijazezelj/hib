@@ -19,6 +19,8 @@ type Item =
   | { kind: "usage"; usage: any[] }
   | { kind: "approval"; id: string; redacted: string; reasons: string[]; original?: string };
 
+const AUTO_NOTE = "auto: edits in this folder and commands run without asking; network, push, publish, sudo and rm -r still ask";
+
 const WS_SUGGESTIONS = [
   { title: "Explain this project", text: "Give me a short tour of this folder: what it does, how it's laid out, and where to start reading." },
   { title: "Find bugs", text: "Look for likely bugs or risky code in this folder and list them with file:line, most serious first." },
@@ -68,6 +70,8 @@ function fold(items: Item[], e: any): Item[] {
       const at = i >= 0 ? i : items.map((x) => (x.kind === "tool" && x.call.kind === "read" ? "r" : "")).lastIndexOf("r");
       return at < 0 ? items : items.map((x, j) => (j === at ? { ...(x as any), pseudo: e.columns } : x));
     }
+    case "mode":
+      return [...items, { kind: "note", text: e.auto ? AUTO_NOTE : "manual: every edit and command asks first", tone: e.auto ? "warn" : undefined }];
     case "handoff":
       return [...items, { kind: "note", text: `handed over from ${e.from} to ${e.to} (new native session, transcript passed along)`, tone: "warn" }];
     case "guard":
@@ -191,6 +195,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
   const [model, setModel] = useState("hib/auto");
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
+  const [auto, setAutoState] = useState(false);
   const [term, setTerm] = useState(false);
   const [commitMsg, setCommitMsg] = useState("");
   const [approvals, setApprovals] = useState<any[]>([]);
@@ -254,6 +259,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     }
     if (snap.row?.model) setModel(snap.row.model);
     setBusy(snap.running);
+    setAutoState(!!snap.auto);
     api.get(`/ws/egress/${id}?${q}`).then(setEgress).catch(() => setEgress([]));
     let after = quiet ? 0 : snap.seq;
     (async () => {
@@ -267,6 +273,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
               refresh();
               continue;
             }
+            if (e.type === "mode") setAutoState(e.auto);
             if (e.type === "ws_session") {
               setModel(e.model);
               continue;
@@ -289,6 +296,13 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     setUrlSession();
     setItems([]);
     setBusy(false);
+    setAutoState(false);
+  }
+
+  async function setAuto(on: boolean) {
+    setAutoState(on);
+    if (sidRef.current) await api.post(`/ws/mode?${q}`, { sessionId: sidRef.current, auto: on }).catch(() => setAutoState(!on));
+    else setItems((x) => fold(x, { type: "mode", auto: on }));
   }
 
   async function send() {
@@ -298,7 +312,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     if (text.startsWith("//")) text = text.slice(1);
     else if (text.startsWith("/")) return command(text);
     try {
-      const r = await api.post(`/ws/turn?${q}`, { sessionId: sidRef.current, model, text });
+      const r = await api.post(`/ws/turn?${q}`, { sessionId: sidRef.current, model, text, auto });
       if (r.sessionId !== sidRef.current) {
         setItems([]);
         await attach(r.sessionId, true);
@@ -314,6 +328,8 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     const arg = rest.join(" ");
     const note = (t: string, tone?: "warn" | "bad" | "ok") => setItems((x) => [...x, { kind: "note", text: t, tone }]);
     if (cmd === "/new") return newSession();
+    if (cmd === "/auto") return setAuto(arg ? arg !== "off" : !auto);
+    if (cmd === "/manual") return setAuto(false);
     if (cmd === "/usage") {
       try {
         const usage = await api.get("/hib/usage");
@@ -329,7 +345,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
       setModel(m);
       return note(`next turn uses ${m}`, "ok");
     }
-    note(`${cmd === "/help" ? "" : `${cmd} isn't a command here. `}Commands: /usage, /model [id], /new. Start with // to send a message that begins with a slash.`, cmd === "/help" ? undefined : "warn");
+    note(`${cmd === "/help" ? "" : `${cmd} isn't a command here. `}Commands: /auto, /manual, /usage, /model [id], /new. Start with // to send a message that begins with a slash.`, cmd === "/help" ? undefined : "warn");
   }
 
   async function answer(id: string, choice: "allow" | "always" | "deny") {
@@ -542,6 +558,9 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
                 <option value="hib/auto">{policy ? `Auto · ${policy.account}` : "Auto"}</option>
                 {agentModels.map((m) => <option key={m} value={m}>{m.replace(/@default\//, "/")}</option>)}
               </select>
+              <button className={`chip ${auto ? "warn" : ""}`} onClick={() => setAuto(!auto)} title={auto ? AUTO_NOTE : "Every edit and command waits for your OK. Click for auto mode."}>
+                <Icon name={auto ? "play" : "lock"} size={12} /> {auto ? "Auto" : "Ask first"}
+              </button>
               <span className="spacer" />
               {busy ? (
                 <button className="send" onClick={() => api.post(`/ws/interrupt?${q}`, { sessionId: sidRef.current })} title="Stop"><Icon name="stop" size={14} /></button>

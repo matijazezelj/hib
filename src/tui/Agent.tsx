@@ -3,6 +3,7 @@ import { Box, Static, Text, render, useApp, useInput } from "ink";
 import type { HibClient } from "../client";
 import { ensureDaemon, registerWorkspace, workspaceUrl } from "../boot";
 import { SlashMenu } from "./SlashMenu";
+import { bold } from "./bold";
 import { isCommand, onMenuKey, suggest, type Command } from "./complete";
 
 interface Line {
@@ -22,6 +23,7 @@ interface Pending {
 const HELP = [
   "y / a / n         answer a permission prompt: allow once, always (this session), deny",
   "Esc               stop the running turn",
+  "/auto  /manual    auto: edits in this folder and commands run without asking (network, push, publish, sudo, rm -r still ask); manual is the default",
   "/model <id>       switch model (same CLI keeps its native session, otherwise hands over)",
   "/models  /new  /resume  /web (open this session in the browser)  /egress (what left, and to whom)  /usage  /quit",
 ].join("\n");
@@ -57,6 +59,8 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
   const sidRef = useRef<string | undefined>(undefined);
   const [model, setModel] = useState(initialModel ?? "hib/auto");
   const [busy, setBusy] = useState(false);
+  const [auto, setAuto] = useState(false);
+  const autoRef = useRef(false);
   const [pending, setPending] = useState<Pending[]>([]);
   const [approval, setApproval] = useState<any | null>(null);
   const [picker, setPicker] = useState<any[] | null>(null);
@@ -74,6 +78,8 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
     { name: "models", desc: "list models you can switch to" },
     { name: "new", desc: "start a new session" },
     { name: "resume", args: "[id]", desc: "resume a session in this folder", values: () => sessionIds.current },
+    { name: "auto", desc: "run edits and commands without asking (risky ones still ask)" },
+    { name: "manual", desc: "ask before every edit and command (default)" },
     { name: "stop", desc: "stop the running turn (Esc)" },
     { name: "web", desc: "browser link for this session" },
     { name: "egress", desc: "what left the machine, and to whom" },
@@ -87,7 +93,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
 
   const push = (...ls: (Line | Omit<Line, "key">)[]) => setLines((d) => [...d, ...ls.map((l) => ({ key: seq++, ...l }))]);
   const flushLive = () => {
-    if (liveRef.current.trim()) push({ text: liveRef.current.trim() });
+    if (liveRef.current.trim()) push({ text: bold(liveRef.current.trim()) });
     liveRef.current = "";
     setLive("");
   };
@@ -103,7 +109,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         push({ text: `› ${e.text}`, color: "cyan" });
         break;
       case "assistant":
-        push({ text: e.text });
+        push({ text: bold(e.text) });
         break;
       case "text":
         liveRef.current += e.delta;
@@ -111,6 +117,11 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         break;
       case "ws_session":
         setModel(e.model);
+        break;
+      case "mode":
+        autoRef.current = e.auto;
+        setAuto(e.auto);
+        push({ text: e.auto ? "auto mode: edits and commands run without asking (network, push, publish, sudo, rm -r still ask)" : "manual mode: every edit and command asks", color: e.auto ? "yellow" : undefined, dim: !e.auto });
         break;
       case "tool_call":
         if (seenCalls.current.has(e.call.id)) break; // same call re-announced with more detail
@@ -172,6 +183,8 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
     }
     if (snap.row?.model) setModel(snap.row.model);
     setBusy(snap.running);
+    autoRef.current = !!snap.auto;
+    setAuto(!!snap.auto);
     let after = quiet ? 0 : snap.seq;
     (async () => {
       while (!ac.signal.aborted) {
@@ -251,10 +264,19 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
       case "models":
         push({ text: (await client.get("/hib/info")).models.filter((m: string) => /^(claude|codex)@/.test(m) && (!policy || m.startsWith(policy.account + "/"))).join("\n"), dim: true });
         return true;
+      case "auto":
+      case "manual": {
+        const on = c === "auto";
+        if (sidRef.current) await client.post(`/ws/mode?${q}`, { sessionId: sidRef.current, auto: on }).catch((e) => push({ text: e.message, color: "red" }));
+        else apply({ type: "mode", auto: on });
+        return true;
+      }
       case "new":
         follow.current?.abort();
         sidRef.current = undefined;
         setSid(undefined);
+        autoRef.current = false;
+        setAuto(false);
         push({ text: "new session (starts with your next message)", dim: true });
         return true;
       case "resume":
@@ -295,7 +317,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
     if (isCommand(text)) return void (await command(text.trim()));
     if (busy) return push({ text: "a turn is running; wait, or Esc to stop it", color: "yellow" });
     try {
-      const r = await client.post<{ sessionId: string }>(`/ws/turn?${q}`, { sessionId: sidRef.current, model, text });
+      const r = await client.post<{ sessionId: string }>(`/ws/turn?${q}`, { sessionId: sidRef.current, model, text, auto: autoRef.current });
       if (r.sessionId !== sidRef.current) await attach(r.sessionId, true);
     } catch (e: any) {
       push({ text: e.message, color: "red" });
@@ -358,7 +380,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
           </Text>
         )}
       </Static>
-      {live && <Text>{live}</Text>}
+      {live && <Text>{bold(live)}</Text>}
       {picker && (
         <Box flexDirection="column" borderStyle="round" paddingX={1}>
           <Text bold>Resume a session in this folder (↑/↓, enter, esc)</Text>
@@ -385,7 +407,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         </Box>
       )}
       <Text dimColor>
-        [{model}{sid ? ` · ${sid}` : ""}{policy ? ` · sensitive → ${policy.account}` : ""}] {busy ? "working… (esc to stop)" : ""}
+        [{model}{sid ? ` · ${sid}` : ""}{policy ? ` · sensitive → ${policy.account}` : ""}{auto ? " · auto" : ""}] {busy ? "working… (esc to stop)" : ""}
       </Text>
       <Box>
         <Text color="cyan">› </Text>

@@ -149,7 +149,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
         POST: ws(async (root, req) => {
           const b: any = await req.json();
           if (b.sessionId && !sessionIn(root, b.sessionId)) return json({ error: { message: "session not in this workspace" } }, 404);
-          const r = sessions.startTurn({ sessionId: b.sessionId || undefined, root, model: b.model || undefined, text: String(b.text ?? "") });
+          const r = sessions.startTurn({ sessionId: b.sessionId || undefined, root, model: b.model || undefined, text: String(b.text ?? ""), auto: typeof b.auto === "boolean" ? b.auto : undefined });
           return "error" in r ? json({ error: { message: r.error } }, 409) : json(r);
         }),
       },
@@ -191,6 +191,14 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           const b: any = await req.json();
           if (!sessionIn(root, b.sessionId)) return json({ error: { message: "not found" } }, 404);
           return json({ ok: sessions.answer(b.sessionId, b.id, b.choice, b.message) });
+        }),
+      },
+      "/ws/mode": {
+        POST: ws(async (root, req) => {
+          const b: any = await req.json();
+          if (!sessionIn(root, b.sessionId)) return json({ error: { message: "not found" } }, 404);
+          sessions.setAuto(b.sessionId, !!b.auto);
+          return json({ ok: true, auto: !!b.auto });
         }),
       },
       "/ws/interrupt": {

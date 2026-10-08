@@ -4,6 +4,7 @@ import type { HibClient } from "../client";
 import type { HibEvent } from "../engine";
 import { connect } from "../boot";
 import { SlashMenu } from "./SlashMenu";
+import { bold } from "./bold";
 import { isCommand, onMenuKey, suggest, type Command } from "./complete";
 
 interface Line {
@@ -297,11 +298,11 @@ function App({ client, initialResume, initialModel }: { client: HibClient; initi
       <Static items={done}>
         {(l) => (
           <Box key={l.key} marginBottom={l.kind === "assistant" ? 1 : 0}>
-            <Text color={color(l.kind)}>{l.kind === "user" ? "› " : ""}{l.text}</Text>
+            <Text color={color(l.kind)}>{l.kind === "user" ? "› " : ""}{l.kind === "assistant" ? bold(l.text) : l.text}</Text>
           </Box>
         )}
       </Static>
-      {live && <Text>{live}</Text>}
+      {live && <Text>{bold(live)}</Text>}
       {picker && (
         <Box flexDirection="column" borderStyle="round" paddingX={1}>
           <Text bold>Resume conversation (↑/↓, enter, esc)</Text>

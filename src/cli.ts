@@ -2,6 +2,7 @@
 import { parseArgs } from "node:util";
 import { hibHome } from "./config";
 import * as plugins from "./plugins";
+import { bold, BoldStream } from "./tui/bold";
 
 const HELP = `hib — harness in a box
 
@@ -165,6 +166,8 @@ async function main() {
       const { client } = await connect();
       let failed = false;
       let revising = false;
+      const tty = !!process.stdout.isTTY;
+      const bolder = new BoldStream();
       const { resolve } = await import("node:path");
       const list = (v: unknown) => (v ? String(v).split(",").map((s) => s.trim()) : []);
       const attachments = values.file ? [{ path: resolve(String(values.file)), hide: list(values.hide), keep: list(values.keep) }] : undefined;
@@ -189,14 +192,14 @@ async function main() {
             revising = true;
             process.stdout.write("\n\n--- revised after review ---\n\n");
           }
-          process.stdout.write(e.delta);
+          process.stdout.write(tty ? bolder.feed(e.delta) : e.delta);
         }
         if (e.type === "error") {
           console.error(`\nerror: ${e.message}`);
           failed = true;
         }
       }
-      process.stdout.write("\n");
+      process.stdout.write((tty ? bolder.flush() : "") + "\n");
       process.exitCode = failed ? 1 : 0;
       return;
     }
@@ -404,7 +407,7 @@ async function analyzeCmd(files: string[], question: string) {
   if (values["show-sent"]) console.log(`\n${preview}\n`);
   if (!(await confirm("Send the result for interpretation?"))) return;
   const ex = await client.post("/hib/analyze/explain", { id: plan.id });
-  console.log(`\n${ex.answer}`);
+  console.log(`\n${process.stdout.isTTY ? bold(ex.answer) : ex.answer}`);
 }
 
 async function pluginCmd([sub, arg]: string[]) {
