@@ -1,0 +1,31 @@
+{
+  "name": "hib",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "hib": "src/cli.ts"
+  },
+  "scripts": {
+    "serve": "bun src/cli.ts serve",
+    "tui": "bun src/cli.ts tui",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0"
+  },
+  "peerDependencies": {
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "0.10",
+    "@xterm/xterm": "5",
+    "ink": "6",
+    "react": "19",
+    "react-dom": "19",
+    "react-markdown": "9",
+    "remark-gfm": "4"
+  }
+}

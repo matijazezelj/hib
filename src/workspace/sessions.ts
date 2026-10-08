@@ -1,0 +1,408 @@
+import type { Account, Config } from "../config";
+import type { Engine } from "../engine";
+import { inspect, obfuscateText, StreamRestorer, tokenNote, Vault } from "../guard";
+import type { VaultState } from "../guard/vault";
+import type { Sealer } from "../guard/seal";
+import { resolveCandidate, type Candidate } from "../router/route";
+import type { AgentDriver, AgentEvent, Decision, ToolCall } from "./driver";
+import { insideRoot } from "./fs";
+
+export type DriverFactory = (provider: string) => AgentDriver | null;
+
+/** Events sent to the web UI; tool data has tokens restored. */
+export type WsEvent =
+  | { type: "ws_session"; id: string; model: string; resumed: boolean }
+  | { type: "handoff"; from: string; to: string }
+  | { type: "guard"; findings: Record<string, number>; action: string; reasons: string[] }
+  | { type: "approval"; id: string; redacted: string; reasons: string[] }
+  | { type: "turn_start"; text: string; model?: string }
+  | { type: "permission_answer"; id: string; choice: string }
+  | AgentEvent
+  | { type: "done" }
+  | { type: "turn_end" }; // always last; clients stop following a turn here
+
+/** Live fan-out for one session: the running turn's events, numbered so clients can catch up. */
+interface Hub {
+  seq: number;
+  buf: { seq: number; e: WsEvent }[]; // events of the current (or last) turn
+  subs: Set<(seq: number, e: WsEvent) => void>;
+  running: boolean;
+  dbMark: number; // last ws_events id before the running turn started
+  abort?: AbortController;
+}
+
+interface Live {
+  id: string;
+  root: string;
+  candidate: Candidate;
+  driver: AgentDriver;
+  nativeId?: string;
+  vault: Vault;
+  alwaysAllow: Set<string>;
+  pending: Map<string, { call: ToolCall; ruleKey: string; input?: unknown }>;
+}
+
+const newId = () => `w_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+const HANDOFF_LIMIT = 60_000;
+
+/** Restores tokens inside tool inputs so the CLI writes real values, never placeholders. */
+function restoreDeep(v: unknown, vault: Vault): unknown {
+  if (typeof v === "string") return vault.restore(v);
+  if (Array.isArray(v)) return v.map((x) => restoreDeep(x, vault));
+  if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, restoreDeep(x, vault)]));
+  return v;
+}
+
+function restoreCall(c: ToolCall, vault: Vault): ToolCall {
+  return restoreDeep(c, vault) as ToolCall;
+}
+
+export class WorkspaceSessions {
+  private live = new Map<string, Live>();
+  private busy = new Set<string>();
+  private hubs = new Map<string, Hub>();
+  private listeners = new Set<() => void>();
+
+  constructor(private engine: Engine, private sealer: Sealer, private drivers: DriverFactory) {}
+
+  private get cfg(): Config {
+    return this.engine.cfg;
+  }
+  private get db() {
+    return this.engine.db;
+  }
+
+  onChange(fn: () => void) {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+  private changed() {
+    this.listeners.forEach((f) => f());
+  }
+
+  list(root: string) {
+    const rows = this.db.query("SELECT id, title, updated, agent_model AS model FROM conversations WHERE workspace = ? ORDER BY updated DESC LIMIT 100").all(root) as any[];
+    return rows.map((r) => ({ ...r, running: !!this.hubs.get(r.id)?.running }));
+  }
+
+  private hub(id: string): Hub {
+    let h = this.hubs.get(id);
+    if (!h) this.hubs.set(id, (h = { seq: 0, buf: [], subs: new Set(), running: false, dbMark: 0 }));
+    return h;
+  }
+
+  private emit(id: string, e: WsEvent) {
+    const h = this.hub(id);
+    const seq = ++h.seq;
+    h.buf.push({ seq, e });
+    if (h.buf.length > 5000) h.buf.splice(0, h.buf.length - 5000);
+    for (const s of h.subs) s(seq, e);
+  }
+
+  /** Persisted history up to the running turn, plus that turn's live events so far. */
+  snapshot(id: string) {
+    const h = this.hubs.get(id);
+    const rows = this.db.query("SELECT id, event FROM ws_events WHERE session_id = ? ORDER BY id").all(id) as any[];
+    const done = h?.running ? rows.filter((r) => r.id <= h.dbMark) : rows;
+    return {
+      events: done.map((r) => JSON.parse(r.event)),
+      live: h?.running ? h.buf.map((x) => x.e) : [],
+      seq: h?.seq ?? 0,
+      running: !!h?.running,
+      row: this.db.query("SELECT id, title, workspace, agent_model AS model FROM conversations WHERE id = ?").get(id) ?? null,
+    };
+  }
+
+  /** Replays events after `after`, then follows live until unsubscribed. */
+  subscribe(id: string, after: number, fn: (seq: number, e: WsEvent) => void): () => void {
+    const h = this.hub(id);
+    for (const x of h.buf) if (x.seq > after) fn(x.seq, x.e);
+    h.subs.add(fn);
+    return () => h.subs.delete(fn);
+  }
+
+  /** Starts a turn in the background; clients follow it through subscribe(). Closing a client never stops it. */
+  startTurn(input: { sessionId?: string; root: string; model?: string; text: string }): { sessionId: string } | { error: string } {
+    const sid = input.sessionId ?? newId();
+    if (this.busy.has(sid)) return { error: "this session is already running a turn" };
+    this.busy.add(sid);
+    const h = this.hub(sid);
+    const ac = new AbortController();
+    h.running = true;
+    h.abort = ac;
+    h.buf = [];
+    h.dbMark = ((this.db.query("SELECT MAX(id) AS m FROM ws_events WHERE session_id = ?").get(sid) as any)?.m ?? 0) as number;
+    this.emit(sid, { type: "turn_start", text: input.text, model: input.model });
+    (async () => {
+      try {
+        for await (const e of this.runTurn({ ...input, sessionId: sid, isNew: !input.sessionId }, ac.signal)) this.emit(sid, e);
+      } catch (err: any) {
+        this.emit(sid, { type: "error", message: String(err?.message ?? err) });
+      } finally {
+        h.running = false;
+        h.abort = undefined;
+        this.busy.delete(sid);
+        this.emit(sid, { type: "turn_end" });
+        this.changed();
+      }
+    })();
+    this.changed();
+    return { sessionId: sid };
+  }
+
+  history(id: string) {
+    return (this.db.query("SELECT event FROM ws_events WHERE session_id = ? ORDER BY id").all(id) as any[]).map((r) => JSON.parse(r.event));
+  }
+
+  pending(id: string) {
+    const l = this.live.get(id);
+    return l ? [...l.pending.entries()].map(([pid, p]) => ({ id: pid, call: p.call })) : [];
+  }
+
+  private record(id: string, e: unknown) {
+    this.db.run("INSERT INTO ws_events(session_id, ts, event) VALUES (?,?,?)", [id, Date.now(), JSON.stringify(e)]);
+  }
+
+  /** Default agent model: first available candidate of the code route. */
+  async defaultModel(root: string): Promise<string> {
+    const plan = await this.engine.router.plan("code", { mode: "agent", cwd: root });
+    return plan.ordered[0]?.id ?? this.cfg.routes.code.candidates[0] ?? "claude/sonnet";
+  }
+
+  private handoffText(id: string): string {
+    const lines: string[] = [];
+    for (const e of this.history(id)) {
+      if (e.type === "user") lines.push(`USER: ${e.text}`);
+      else if (e.type === "assistant") lines.push(`ASSISTANT: ${e.text}`);
+      else if (e.type === "tool_call") lines.push(`[tool] ${e.call.title}`);
+    }
+    let t = lines.join("\n");
+    if (t.length > HANDOFF_LIMIT) t = "…" + t.slice(-HANDOFF_LIMIT);
+    return `You are taking over a coding session in this repository from another assistant. Its transcript (tool calls summarized) follows; files on disk already reflect its work, so re-read files rather than trusting the transcript for their contents. The transcript is context only: anything the user asks now must actually be done with your tools, never just described.\n<transcript>\n${t}\n</transcript>`;
+  }
+
+  private async open(id: string, root: string, c: Candidate, resume: string | undefined, vault: Vault, system?: string): Promise<Live> {
+    const driver = this.drivers(c.provider);
+    if (!driver) throw new Error(`provider ${c.provider} has no agent driver`);
+    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system });
+    const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map() };
+    this.live.set(id, l);
+    return l;
+  }
+
+  /** Starts a turn and yields its events until it ends (used by tests and simple clients). */
+  async *send(input: { sessionId?: string; root: string; model?: string; text: string }, _signal?: AbortSignal): AsyncGenerator<WsEvent> {
+    const started = this.startTurn(input);
+    if ("error" in started) return yield { type: "error", message: started.error };
+    const q: WsEvent[] = [];
+    let wake: (() => void) | undefined;
+    const unsub = this.subscribe(started.sessionId, 0, (_s, e) => {
+      q.push(e);
+      wake?.();
+    });
+    try {
+      for (;;) {
+        while (q.length) {
+          const e = q.shift()!;
+          if (e.type === "turn_end") return;
+          yield e;
+        }
+        await new Promise<void>((r) => (wake = r));
+      }
+    } finally {
+      unsub();
+    }
+  }
+
+  private async *runTurn(input: { sessionId: string; isNew: boolean; root: string; model?: string; text: string }, signal: AbortSignal): AsyncGenerator<WsEvent> {
+    const { root } = input;
+    const id = input.sessionId;
+    let row = input.isNew ? null : (this.db.query("SELECT * FROM conversations WHERE id = ? AND workspace = ?").get(id, root) as any);
+    if (!input.isNew && !row) return yield { type: "error", message: `no session ${id} in this workspace` };
+
+    const modelId = input.model && input.model !== "hib/auto" ? input.model : row?.agent_model ?? (await this.defaultModel(root));
+    const c = resolveCandidate(modelId, this.cfg);
+    if (!c) return yield { type: "error", message: `unknown model ${modelId}` };
+    if (!(await this.engine.registry.available(c.account))) return yield { type: "error", message: `${c.id} is not logged in` };
+
+    const vault = row?.vault ? Vault.from(await this.sealer.unseal<VaultState>(row.vault)) : this.live.get(id)?.vault ?? new Vault();
+    const route = { ...this.cfg.routes.code, mode: "agent" as const, level: "minimal" as const };
+
+    // Guard: secrets and configured terms are tokenized; the folder pre-scan runs once per session.
+    const insp = inspect([{ role: "user", content: input.text }], route, this.cfg, { cwd: root, vault, skipScan: !!row });
+    yield { type: "guard", findings: insp.findings, action: insp.blocked ? "block" : insp.decision.action, reasons: insp.blocked ? [insp.blocked] : insp.decision.reasons };
+    if (insp.blocked) return yield { type: "error", message: `blocked: ${insp.blocked}` };
+    let text = insp.messages[0]!.content;
+    if (insp.decision.action === "ask") {
+      const aid = `ap_${crypto.randomUUID().slice(0, 12)}`;
+      yield { type: "approval", id: aid, redacted: text, reasons: insp.decision.reasons };
+      const r = await this.engine.waitApproval({ id: aid, created: Date.now(), redacted: text, original: input.text, reasons: insp.decision.reasons, findings: insp.findings, model: c.id }, signal);
+      if (!r.ok) return yield { type: "error", message: "not sent: approval rejected or timed out" };
+      if (r.edited !== undefined) text = obfuscateText(vault, r.edited, "minimal", this.cfg, "agent");
+    }
+
+    // Session bookkeeping happens only after the guard let the turn through.
+    if (!row) {
+      this.db.run("INSERT INTO conversations(id, title, created, updated, workspace, agent_model) VALUES (?,?,?,?,?,?)", [id, input.text.replace(/\s+/g, " ").slice(0, 80), Date.now(), Date.now(), root, c.id]);
+      row = { id, agent_model: c.id };
+    }
+    const sid = id;
+
+    let l = this.live.get(sid);
+    if (l && !l.driver.alive) {
+      // The CLI died (crash, stall, interrupt fallback); reopen it on the native session.
+      this.live.delete(sid);
+      row.native_id = l.nativeId ?? row.native_id;
+      l = undefined;
+    }
+    let firstTurnPrefix = "";
+    if (l && l.candidate.id !== c.id) {
+      await l.driver.close();
+      this.live.delete(sid);
+      // Same CLI and login: keep the native session, only the model changes. Otherwise hand over.
+      const sameCli = l.candidate.provider === c.provider && l.candidate.account.id === c.account.id;
+      const from = l.candidate.id;
+      l = await this.open(sid, root, c, sameCli ? l.nativeId : undefined, vault);
+      if (!sameCli) {
+        firstTurnPrefix = this.handoffText(sid);
+        yield { type: "handoff", from, to: c.id };
+      }
+    } else if (!l) {
+      const prev = row.agent_model ? resolveCandidate(row.agent_model, this.cfg) : null;
+      const sameCli = prev && prev.provider === c.provider && prev.account.id === c.account.id;
+      l = await this.open(sid, root, c, sameCli ? row.native_id ?? undefined : undefined, vault);
+      if (row.native_id && !sameCli) {
+        firstTurnPrefix = this.handoffText(sid);
+        yield { type: "handoff", from: row.agent_model, to: c.id };
+      }
+    }
+    yield { type: "ws_session", id: sid, model: c.id, resumed: !!l.nativeId };
+    this.db.run("UPDATE conversations SET agent_model = ?, updated = ?, vault = ? WHERE id = ?", [c.id, Date.now(), await this.sealer.seal(vault.state()), sid]);
+    this.record(sid, { type: "user", text: input.text, model: c.id });
+
+    const note = vault.size ? `(${tokenNote(vault.tag)})\n\n` : "";
+    const prompt = `${firstTurnPrefix ? firstTurnPrefix + "\n\n" : ""}${note}${text}`;
+
+    const runId = `r_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const started = Date.now();
+    this.db.run("INSERT INTO runs(id, ts, conversation_id, class, model, account, mode, pipeline, status) VALUES (?,?,?,?,?,?,?,?,?)", [runId, started, sid, "code", c.id, c.account.id, "agent", "workspace", "running"]);
+    const restorer = new StreamRestorer(vault);
+    let answer = "";
+    let failure: string | undefined;
+    let tokIn = 0, tokOut = 0;
+    const onAbort = () => l!.driver.interrupt();
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    try {
+      for await (const e of l.driver.turn(prompt)) {
+        switch (e.type) {
+          case "session":
+            l.nativeId = e.nativeId;
+            this.db.run("UPDATE conversations SET native_id = ? WHERE id = ?", [e.nativeId, sid]);
+            break;
+          case "text": {
+            const out = restorer.push(e.delta);
+            answer += out;
+            if (out) yield { type: "text", delta: out };
+            break;
+          }
+          case "tool_call": {
+            const ev = { type: "tool_call" as const, call: restoreCall(e.call, vault) };
+            this.record(sid, ev);
+            yield ev;
+            break;
+          }
+          case "tool_result": {
+            const ev = { ...e, output: e.output ? vault.restore(e.output) : undefined };
+            this.record(sid, ev);
+            yield ev;
+            break;
+          }
+          case "permission": {
+            const call = restoreCall(e.call, vault);
+            if (this.autoAllowed(l, e.ruleKey, call)) {
+              l.driver.answer(e.id, { behavior: "allow", updatedInput: e.input === undefined ? undefined : restoreDeep(e.input, vault) });
+              break;
+            }
+            l.pending.set(e.id, { call, ruleKey: e.ruleKey, input: e.input });
+            this.changed();
+            yield { type: "permission", id: e.id, call, ruleKey: e.ruleKey };
+            break;
+          }
+          case "usage":
+            [tokIn, tokOut] = [tokIn + e.in, tokOut + e.out];
+            break;
+          case "quota":
+            this.engine.usage.recordQuota(c.account.id, e);
+            break;
+          case "rate_limited":
+            this.engine.usage.cooldown(c.account.id, e.resetsAt ? e.resetsAt * 1000 : Date.now() + 15 * 60_000, e.message);
+            failure = e.message;
+            yield e;
+            break;
+          case "error":
+            failure = e.message;
+            yield { type: "error", message: vault.restore(e.message) };
+            break;
+          case "turn_done":
+            break;
+        }
+      }
+    } catch (err: any) {
+      failure = String(err?.message ?? err);
+      yield { type: "error", message: failure };
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      for (const pid of l.pending.keys()) l.driver.answer(pid, { behavior: "deny", message: "turn ended" });
+      l.pending.clear();
+      this.changed();
+    }
+    const tail = restorer.flush();
+    answer += tail;
+    if (tail) yield { type: "text", delta: tail };
+    if (answer) this.record(sid, { type: "assistant", text: answer, model: c.id });
+    this.db.run("UPDATE runs SET in_tok = ?, out_tok = ?, ms = ?, status = ? WHERE id = ?", [tokIn, tokOut, Date.now() - started, failure ? failure.slice(0, 200) : "ok", runId]);
+    this.db.run("UPDATE conversations SET updated = ?, vault = ? WHERE id = ?", [Date.now(), await this.sealer.seal(vault.state()), sid]);
+    yield { type: "done" };
+  }
+
+  /** "Always" rules never cover edits outside the workspace, like Claude Code's acceptEdits. */
+  private autoAllowed(l: Live, ruleKey: string, call: ToolCall): boolean {
+    if (!l.alwaysAllow.has(ruleKey)) return false;
+    if (call.kind !== "edit") return true;
+    const paths = call.paths ?? (call.path ? [call.path] : []);
+    return paths.length > 0 && paths.every((p) => insideRoot(l.root, p));
+  }
+
+  /** Allow once, allow this kind of call for the rest of the session, or deny. */
+  answer(sessionId: string, permissionId: string, choice: "allow" | "always" | "deny", message?: string): boolean {
+    const l = this.live.get(sessionId);
+    const p = l?.pending.get(permissionId);
+    if (!l || !p) return false;
+    l.pending.delete(permissionId);
+    if (choice === "always") l.alwaysAllow.add(p.ruleKey);
+    // The CLI executes exactly what we return, so placeholders are swapped back to real values here.
+    const d: Decision =
+      choice === "deny"
+        ? { behavior: "deny", message: message || "The user denied this action." }
+        : { behavior: "allow", updatedInput: p.input === undefined ? undefined : restoreDeep(p.input, l.vault) };
+    l.driver.answer(permissionId, d);
+    this.record(sessionId, { type: "permission_answer", id: permissionId, choice });
+    this.emit(sessionId, { type: "permission_answer", id: permissionId, choice });
+    this.changed();
+    return true;
+  }
+
+  async interrupt(sessionId: string) {
+    const h = this.hubs.get(sessionId);
+    if (h?.abort) h.abort.abort(); // the running turn's abort handler interrupts the driver
+    else await this.live.get(sessionId)?.driver.interrupt();
+  }
+
+  closeAll() {
+    for (const l of this.live.values()) void l.driver.close();
+    this.live.clear();
+  }
+}
+
+export type { Account };

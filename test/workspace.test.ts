@@ -1,0 +1,69 @@
+import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { listFiles, readFile, safePath } from "../src/workspace/fs";
+import * as git from "../src/workspace/git";
+
+const g = (cwd: string, ...args: string[]) =>
+  Bun.spawnSync(["git", ...args], { cwd, env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
+
+function repo() {
+  const root = mkdtempSync(join(tmpdir(), "hib-ws-"));
+  writeFileSync(join(root, "a.ts"), "export const a = 1;\n");
+  writeFileSync(join(root, ".gitignore"), "secret.log\n");
+  writeFileSync(join(root, "secret.log"), "x");
+  mkdirSync(join(root, "src"));
+  writeFileSync(join(root, "src", "b.ts"), "b\n");
+  g(root, "init", "-q");
+  g(root, "add", ".");
+  g(root, "commit", "-qm", "init");
+  return root;
+}
+
+describe("workspace jail", () => {
+  test("rejects traversal and symlink escapes", () => {
+    const root = repo();
+    expect(() => safePath(root, "../../etc/passwd")).toThrow("outside workspace");
+    symlinkSync("/etc", join(root, "etc-link"));
+    expect(() => readFile(root, "etc-link/hosts")).toThrow("outside workspace");
+    expect(readFile(root, "src/b.ts").content).toBe("b\n");
+  });
+  test("file list honours .gitignore", async () => {
+    const root = repo();
+    writeFileSync(join(root, "new.ts"), "n");
+    const files = await listFiles(root);
+    expect(files).toContain("new.ts");
+    expect(files).toContain("src/b.ts");
+    expect(files).not.toContain("secret.log");
+  });
+});
+
+describe("git panel", () => {
+  test("status, diff, discard, commit", async () => {
+    const root = repo();
+    writeFileSync(join(root, "a.ts"), "export const a = 2;\n");
+    writeFileSync(join(root, "c.ts"), "new file\n");
+    const st = (await git.status(root))!;
+    expect(st.files.map((f) => [f.path, f.untracked])).toEqual([["a.ts", false], ["c.ts", true]]);
+    expect(await git.diff(root, "a.ts")).toContain("+export const a = 2;");
+    expect(await git.diff(root, "c.ts")).toContain("+new file");
+    await git.discard(root, "a.ts");
+    await git.discard(root, "c.ts");
+    expect(existsSync(join(root, "c.ts"))).toBe(false);
+    expect((await git.status(root))!.files).toEqual([]);
+    writeFileSync(join(root, "d.ts"), "d\n");
+    expect(await git.commit(root, "add d")).toContain("add d");
+    await expect(git.discard(root, "../x")).rejects.toThrow("outside workspace");
+  });
+});
+
+test("always-allow keys never let compound commands ride on a simple one", async () => {
+  const { commandRuleKey } = await import("../src/workspace/driver");
+  expect(commandRuleKey("Bash", "git status")).toBe("Bash:git status");
+  expect(commandRuleKey("Bash", "git log --oneline")).toBe("Bash:git log");
+  expect(commandRuleKey("Bash", "git push --force")).toBe("Bash:git push");
+  expect(commandRuleKey("Bash", "ls -la")).toBe("Bash:ls");
+  for (const c of ["cat a; rm -rf b", "cat a && rm b", "cat a | sh", "echo $(rm x)", "cat a > b", "ls `rm x`", "cat a\nrm b"])
+    expect(commandRuleKey("Bash", c)).toBe(`Bash:exact:${c}`);
+});
