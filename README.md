@@ -77,6 +77,36 @@ Limits:
 - Router chat that isn't tied to a folder isn't covered, so don't paste sensitive content into `hib chat`.
 - Check each subscription's own data settings (training opt-out, retention) and your employer's rules. hib can't change those.
 
+## Analysing data without sending it
+
+```sh
+hib analyze users.csv "average salary per department, and inactive users per department"
+hib ask -f users.csv "which 3 people in Engineering earn the most?"
+```
+
+**`hib analyze`: send code, not data.** The model gets only a profile of the table: column names and types, row, null and distinct counts, and three made-up rows showing the shape.
+- Columns that look identifying are marked so; their values are never shown. That means anything with a name like user, email, phone, IP or address, or values that look like emails, IPs or phone numbers.
+- `--share department` adds the real distinct values of a non-identifying column, so the model can filter on them.
+- The model writes an `analyze(rows)` function. You see it and approve it, and it runs **on your machine**:
+  - in a separate process, with no `eval` or imports;
+  - on macOS, inside a sandbox with no network, no file writes and no reads of your home folder.
+- The result stays local. Sending the question, code and result for interpretation is a separate step, and you see exactly what would be sent first.
+- If the code fails, only the error message is sent back for a fix.
+- In the browser, open a CSV, TSV or JSON file in a workspace and press **Analyze**.
+
+**`hib ask -f`: pseudonymise by column**, for questions that need the model to see rows.
+- Identifying columns become stable tokens (`[…-USERNAME-7]`). An email becomes two tokens, one for the name and one for the domain, so grouping by domain still works without revealing it.
+- Numbers and categories stay readable.
+- The answer comes back with real values restored.
+- `--hide col` and `--keep col` adjust which columns are tokenized.
+
+In a **sensitive workspace**, when you approve Claude reading a `.csv` or `.tsv`, it gets a pseudonymised copy instead of the real file. The egress log records which columns were tokenized.
+
+Limits:
+- The profile still reveals column names and row counts.
+- Detecting identifying columns is heuristic, so check the "identifying" list and use `--hide` for anything it missed.
+- Only Claude reads can be redirected, not Bash `cat`. In sensitive mode Bash asks, so deny it.
+
 ## How a router request flows
 
 1. **Classify** the request as chat, code, review or long. Heuristics come first; Haiku is asked only when they're unsure. Plugin routes can add classes.

@@ -190,8 +190,11 @@ export function detect(text: string, opts: DetectOptions): Finding[] {
     raw.push(...highEntropy(text));
   }
 
+  // Existing hib placeholders (e.g. from a pseudonymised table) are already safe; nothing inside them is a finding.
+  const tokens = [...text.matchAll(/\[?HIB[0-9a-f]{4}-[A-Z0-9-]+?-\d+\]?/g)].map((m) => [m.index!, m.index! + m[0].length] as const);
   const taken: Finding[] = [];
   for (const f of raw) {
+    if (tokens.some(([s, e]) => f.start < e && s < f.end)) continue;
     if (taken.some((t) => f.start < t.end && t.start < f.end)) continue;
     taken.push(f);
   }

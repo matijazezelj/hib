@@ -8,6 +8,11 @@ import type { AgentDriver, AgentEvent, Decision, ToolCall } from "./driver";
 import { insideRoot } from "./fs";
 import { detect } from "../guard/detectors";
 import { onPinnedAccount, pinnedModel } from "./registry";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, isAbsolute, join, resolve as resolvePath } from "node:path";
+import { loadTable, TABLE_FILE } from "../analyze/table";
+import { columnsToHide, pseudonymize } from "../analyze/pseudo";
 
 export type DriverFactory = (provider: string) => AgentDriver | null;
 
@@ -44,6 +49,14 @@ interface Live {
   alwaysAllow: Set<string>;
   pending: Map<string, { call: ToolCall; ruleKey: string; input?: unknown }>;
   askReads: boolean;
+}
+
+/** In a sensitive workspace, Claude reading or grepping a table file is pointed at a pseudonymised copy instead. */
+function tabularTarget(call: ToolCall, input: unknown): "file_path" | "path" | null {
+  const i = input as any;
+  if (call.name === "Read" && typeof i?.file_path === "string" && TABLE_FILE.test(i.file_path)) return "file_path";
+  if (call.name === "Grep" && typeof i?.path === "string" && TABLE_FILE.test(i.path)) return "path";
+  return null;
 }
 
 const PROTECTED = new Set([".claude", ".codex", ".git", ".hib", ".mcp.json"]);
@@ -310,7 +323,8 @@ export class WorkspaceSessions {
     this.db.run("UPDATE conversations SET agent_model = ?, updated = ?, vault = ? WHERE id = ?", [c.id, Date.now(), await this.sealer.seal(vault.state()), sid]);
     this.record(sid, { type: "user", text: input.text, model: c.id });
 
-    const note = vault.size ? `(${tokenNote(vault.tag)})\n\n` : "";
+    // Sensitive folders can hand the agent pseudonymised files later in the turn, so it always gets the note.
+    const note = vault.size || policy ? `(${tokenNote(vault.tag)})\n\n` : "";
     const prompt = `${firstTurnPrefix ? firstTurnPrefix + "\n\n" : ""}${note}${text}`;
     // Egress log: exactly what this turn sends, and to whom. The CLI's own reads show up as tool calls.
     const sentEv = { type: "sent" as const, account: c.account.id, model: c.id, text, handoff: !!firstTurnPrefix, chars: prompt.length };
@@ -359,8 +373,10 @@ export class WorkspaceSessions {
           }
           case "permission": {
             const call = restoreCall(e.call, vault);
+            if (policy && tabularTarget(call, e.input)) call.title += " (the agent gets a pseudonymised copy)";
+            else if (policy && call.name === "Grep") call.title += " (may return raw rows from table files)";
             if (this.autoAllowed(l, e.ruleKey, call)) {
-              l.driver.answer(e.id, { behavior: "allow", updatedInput: e.input === undefined ? undefined : restoreDeep(e.input, vault) });
+              l.driver.answer(e.id, this.allowDecision(l, call, e.input));
               break;
             }
             l.pending.set(e.id, { call, ruleKey: e.ruleKey, input: e.input });
@@ -415,6 +431,8 @@ export class WorkspaceSessions {
     for (const e of this.history(id)) {
       if (e.type === "sent") turns.push({ account: e.account, model: e.model, prompt: e.text, handoff: e.handoff, actions: [] });
       else if (e.type === "guard_decision" && turns.length) turns[turns.length - 1]!.guard = e.summary;
+      else if (e.type === "pseudonymised" && turns.length)
+        turns[turns.length - 1]!.actions.push({ kind: "read", title: `pseudonymised copy of ${e.file} (tokenized: ${e.columns.join(", ") || "none"})`, status: "done" });
       else if (e.type === "tool_call" && turns.length) {
         const known = byCall.get(e.call.id);
         if (known) {
@@ -430,6 +448,30 @@ export class WorkspaceSessions {
       }
     }
     return turns;
+  }
+
+  /**
+   * What the CLI actually executes: placeholders restored, and in sensitive folders table reads redirected to a
+   * pseudonymised copy. If that copy can't be made, the read is denied: it was approved on the promise of the copy.
+   */
+  private allowDecision(l: Live, call: ToolCall, input: unknown): Decision {
+    if (input === undefined) return { behavior: "allow" };
+    const real = restoreDeep(input, l.vault) as any;
+    const key = this.engine.workspaces.policy(l.root) ? tabularTarget(call, real) : null;
+    if (!key) return { behavior: "allow", updatedInput: real };
+    const src = isAbsolute(real[key]) ? real[key] : resolvePath(l.root, real[key]);
+    try {
+      const table = loadTable(src);
+      const cols = columnsToHide(table);
+      const dir = join(tmpdir(), `hib-pseudo-${process.getuid?.() ?? "u"}`, l.id);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const copy = join(dir, basename(src));
+      writeFileSync(copy, pseudonymize(table, cols, l.vault), { mode: 0o600 });
+      this.record(l.id, { type: "pseudonymised", file: real[key], columns: cols });
+      return { behavior: "allow", updatedInput: { ...real, [key]: copy } };
+    } catch (e: any) {
+      return { behavior: "deny", message: `hib couldn't make a pseudonymised copy of ${basename(src)} (${e?.message ?? e}), so the read was blocked.` };
+    }
   }
 
   /**
@@ -454,7 +496,7 @@ export class WorkspaceSessions {
     const d: Decision =
       choice === "deny"
         ? { behavior: "deny", message: message || "The user denied this action." }
-        : { behavior: "allow", updatedInput: p.input === undefined ? undefined : restoreDeep(p.input, l.vault) };
+        : this.allowDecision(l, p.call, p.input);
     l.driver.answer(permissionId, d);
     this.record(sessionId, { type: "permission_answer", id: permissionId, choice });
     this.emit(sessionId, { type: "permission_answer", id: permissionId, choice });

@@ -11,6 +11,9 @@ import { CLASSIFY_PROMPT, classify, parseClassifierReply } from "./router/classi
 import { Router, resolveCandidate, type Candidate } from "./router/route";
 import { Usage } from "./usage";
 import { onPinnedAccount, pinnedModel, Workspaces } from "./workspace/registry";
+import { columnsToHide, pseudonymize } from "./analyze/pseudo";
+import { dirname } from "node:path";
+import type { Table } from "./analyze/table";
 
 export interface ChatInput {
   conversationId?: string; // continue a saved conversation
@@ -21,6 +24,8 @@ export interface ChatInput {
   cwd?: string;
   arena?: boolean; // force head-to-head
   allowArena?: boolean; // let arenaRate trigger one (only for UIs that can show it)
+  solo?: boolean; // exactly one model: no advisor, arena or failover to another vendor
+  attachments?: { name: string; path?: string; table: Table; hide?: string[]; keep?: string[] }[]; // tables sent pseudonymised by column
 }
 
 export type HibEvent =
@@ -222,11 +227,28 @@ export class Engine {
       history = [];
       vault = new Vault();
     }
-    const messages = [...history, ...input.messages];
+    // Attached tables go out pseudonymised by column, with tokens from this conversation's vault so answers restore.
+    const attached = (input.attachments ?? []).map((a) => {
+      const cols = columnsToHide(a.table, a.hide, a.keep);
+      const csv = pseudonymize(a.table, cols, vault);
+      return { note: `[attached ${a.name}: ${a.table.rows.length} rows; pseudonymised: ${cols.join(", ") || "none"}]`, text: `<table name="${a.name}" rows="${a.table.rows.length}">\n${csv}</table>` };
+    });
+    if (attached.reduce((n, x) => n + x.text.length, 0) > 400_000)
+      return yield { type: "error", message: "attached table is too large to send; use `hib analyze`, which sends only the schema" };
+    const outgoingInput = attached.length
+      ? input.messages.map((m, i) => (i === lastIn && m.role === "user" ? { ...m, content: `${m.content}\n\n${attached.map((x) => x.text).join("\n\n")}` } : m))
+      : input.messages;
+    const messages = [...history, ...outgoingInput];
 
     // classify
     // Work inside a sensitive workspace goes to its one pinned account: no classifier call, failover, advisor or arena.
-    const sensitive = input.cwd ? this.workspaces.policyFor(input.cwd) : null;
+    // An attached file from a sensitive folder pins the request just like working in it.
+    const sensitive =
+      (input.cwd ? this.workspaces.policyFor(input.cwd) : null) ??
+      (input.attachments ?? []).map((a) => (a.path ? this.workspaces.policyFor(dirname(a.path)) : null)).find(Boolean) ??
+      null;
+    // Attached tables go to exactly one model: never to an advisor or arena opponent.
+    if (input.attachments?.length) input.solo = true;
     if (sensitive && input.model && !input.model.startsWith("hib/") && !onPinnedAccount(input.model, sensitive.policy, this.cfg))
       return yield { type: "error", message: `${sensitive.root} is sensitive and pinned to ${sensitive.policy.account}; ${input.model} is not allowed` };
     const forced = input.model?.startsWith("hib/") && input.model !== "hib/auto" ? input.model.slice(4) : undefined;
@@ -241,7 +263,8 @@ export class Engine {
 
     if (sensitive) explicit ??= pinnedModel(sensitive.policy, this.cfg, cls);
     const plan = await this.router.plan(cls, { explicit, mode: input.mode, cwd: input.cwd });
-    if (sensitive) plan.route = { ...plan.route, advisor: false };
+    if (sensitive || input.solo) plan.route = { ...plan.route, advisor: false };
+    if (input.solo) plan.ordered = plan.ordered.slice(0, 1);
     if (agent) plan.route = { ...plan.route, level: agent.level ?? plan.route.level, advisor: agent.advisor ?? plan.route.advisor };
     if (!plan.ordered.length) return yield { type: "error", message: `no usable model for ${cls}: ${plan.skipped.map((s) => `${s.id} (${s.why})`).join(", ")}` };
 
@@ -279,14 +302,15 @@ export class Engine {
         this.db.run("INSERT INTO conversations(id, title, created, updated) VALUES (?,?,?,?)", [conversationId, title, Date.now(), Date.now()]);
         yield { type: "conversation", id: conversationId };
       }
-      for (const m of input.messages) this.addMessage(conversationId, m);
+      // History keeps a note of attachments, not the tables themselves.
+      for (const [i, m] of input.messages.entries()) this.addMessage(conversationId, i === lastIn && attached.length ? { ...m, content: `${m.content}\n${attached.map((x) => x.note).join("\n")}` } : m);
     }
 
     const promptHash = hash(messages[lastUserIdx]?.content ?? "");
     this.noteRetry(promptHash);
 
     const base = { cls, mode: plan.route.mode, cwd: input.cwd, vault, signal, conversationId, promptHash };
-    const wantArena = !explicit && plan.ordered.length >= 2 && (input.arena || (input.allowArena && Math.random() < this.cfg.arenaRate));
+    const wantArena = !input.solo && !explicit && plan.ordered.length >= 2 && (input.arena || (input.allowArena && Math.random() < this.cfg.arenaRate));
     let finalText: string;
     let finalRun: string;
     let finalModel: string;

@@ -290,3 +290,70 @@ describe("sensitive workspaces (router)", () => {
     expect(sent.every((s) => s.provider === "alpha" && s.account === "work")).toBe(true);
   });
 });
+
+test("solo requests use exactly one model: no advisor, no failover", async () => {
+  beta.current = () => [{ type: "text", delta: "1. issue" }];
+  alpha.current = () => [{ type: "rate_limited", message: "usage limit" }];
+  const r = await run({ messages: [{ role: "user", content: "implement a function that sums" }], model: "hib/code", solo: true });
+  expect(r.of("advisor")).toEqual([]);
+  expect(sent.every((s) => s.provider === "alpha")).toBe(true);
+});
+
+test("attached tables go out pseudonymised and the answer comes back with real values", async () => {
+  const { loadTable } = await import("../src/analyze/table");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const p = join(mkdtempSync(join(tmpdir(), "hib-att-")), "u.csv");
+  writeFileSync(p, "username,email,department,salary\njsmith,john@acme.io,Finance,72000\nmkovac,marija@acme.io,IT,90000\n");
+  alpha.current = (req) => {
+    const tok = /\[HIB\w+-USERNAME-2\]/.exec(JSON.stringify(req.messages))![0];
+    return [{ type: "text", delta: `top earner: ${tok}` }];
+  };
+  const r = await run({ messages: [{ role: "user", content: "who earns most?" }], model: "alpha/fast", attachments: [{ name: "u.csv", table: loadTable(p) }], persist: true });
+  const wire = JSON.stringify(sent);
+  for (const real of ["jsmith", "mkovac", "john@", "acme.io"]) expect(wire).not.toContain(real);
+  expect(wire).toContain("Finance");
+  expect(r.text).toBe("top earner: mkovac");
+  const conv = engine.getConversation(r.of("conversation")[0]!.id);
+  expect(conv.messages[0].content).toContain("[attached u.csv: 2 rows; pseudonymised: username, email]");
+  expect(conv.messages[0].content).not.toContain("jsmith");
+});
+
+describe("tables and the sensitive pin", () => {
+  async function csvIn(dir: string) {
+    const { writeFileSync } = await import("node:fs");
+    const p = join(dir, "u.csv");
+    writeFileSync(p, "username,salary\njsmith,72000\n");
+    return p;
+  }
+  test("a CSV from a sensitive folder can't be attached for another vendor", async () => {
+    const { mkdtempSync, realpathSync } = await import("node:fs");
+    const { loadTable } = await import("../src/analyze/table");
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "hib-sens-att-")));
+    engine.workspaces.register(dir);
+    engine.workspaces.setPolicy(dir, { sensitive: true, account: "alpha@work" });
+    const p = await csvIn(dir);
+    const r = await run({ messages: [{ role: "user", content: "summarise" }], model: "beta/fast", attachments: [{ name: "u.csv", path: p, table: loadTable(p) }] });
+    expect(r.of("error")[0]!.message).toContain("pinned to alpha@work");
+    expect(sent.length).toBe(0);
+  });
+  test("attachments never reach an advisor", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { loadTable } = await import("../src/analyze/table");
+    const p = await csvIn(mkdtempSync(join(tmpdir(), "hib-att2-")));
+    beta.current = () => [{ type: "text", delta: "1. issue" }];
+    const r = await run({ messages: [{ role: "user", content: "implement a function over this table" }], model: "hib/code", attachments: [{ name: "u.csv", path: p, table: loadTable(p) }] });
+    expect(r.of("advisor")).toEqual([]);
+    expect(sent.every((s) => s.provider === "alpha")).toBe(true);
+  });
+  test("analysis warns when a result carries identifying values back out", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { Analyzer } = await import("../src/analyze");
+    const p = await csvIn(mkdtempSync(join(tmpdir(), "hib-leak-")));
+    alpha.current = () => [{ type: "text", delta: "```js\nfunction analyze(rows) { return rows.map((r) => ({ who: r.username })); }\n```\nlists users" }];
+    const a = new Analyzer(engine);
+    const plan = await a.plan({ path: p, question: "who?", model: "alpha/fast" });
+    expect(JSON.stringify(sent)).not.toContain("jsmith");
+    expect((await a.run(plan.id)).ok).toBe(true);
+    expect(a.leaks(plan.id)).toEqual(["username"]);
+  });
+});

@@ -301,3 +301,51 @@ test("egress shows the guard decision and one entry per action, with its final d
   expect(t!.guard).toContain("TERM×1");
   expect(t!.actions).toEqual([{ kind: "web", title: 'web search "aws example key"', status: "done" }]);
 });
+
+test("sensitive workspaces hand Claude a pseudonymised copy when it reads a CSV", async () => {
+  const { writeFileSync, readFileSync } = await import("node:fs");
+  writeFileSync(join(root, "users.csv"), "username,email,salary\njsmith,john@acme.io,72000\n");
+  engine.workspaces.register(root);
+  engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@work" });
+  script.current = async (_t, d, q) => {
+    q.push({ type: "permission", id: "r1", ruleKey: "read:.", call: { id: "c1", name: "Read", kind: "read", title: "Read users.csv", path: "users.csv" }, input: { file_path: join(root, "users.csv") } });
+    await d.ask("r1");
+  };
+  const r = await turn("summarise users.csv", undefined, () => "allow", "hib/auto");
+  const d = drivers[0]!.decisions.get("r1") as any;
+  expect(d.updatedInput.file_path).not.toBe(join(root, "users.csv"));
+  const copy = readFileSync(d.updatedInput.file_path, "utf8");
+  expect(copy).not.toContain("jsmith");
+  expect(copy).not.toContain("acme.io");
+  expect(copy).toContain("72000");
+  expect(sessions.egress(r.sid)[0]!.actions.map((a) => a.title).join()).toContain("pseudonymised copy of");
+});
+
+describe("sensitive table reads", () => {
+  const setup = async () => {
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(join(root, "users.csv"), "username,email,salary\njsmith,john@acme.io,72000\n");
+    engine.workspaces.register(root);
+    engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@work" });
+  };
+  test("grep on a CSV is redirected to the copy too", async () => {
+    await setup();
+    script.current = async (_t, d, q) => {
+      q.push({ type: "permission", id: "g1", ruleKey: "Grep", call: { id: "c1", name: "Grep", kind: "search", title: "Grep jsmith" }, input: { pattern: "j", path: join(root, "users.csv") } });
+      await d.ask("g1");
+    };
+    await turn("find j", undefined, () => "allow", "hib/auto");
+    const d = drivers[0]!.decisions.get("g1") as any;
+    expect(d.updatedInput.path).not.toBe(join(root, "users.csv"));
+    expect(d.updatedInput.pattern).toBe("j");
+  });
+  test("if the copy can't be made, the read is denied instead of falling back to the real file", async () => {
+    await setup();
+    script.current = async (_t, d, q) => {
+      q.push({ type: "permission", id: "r1", ruleKey: "read:.", call: { id: "c1", name: "Read", kind: "read", title: "Read gone.csv" }, input: { file_path: join(root, "gone.csv") } });
+      await d.ask("r1");
+    };
+    await turn("read gone.csv", undefined, () => "allow", "hib/auto");
+    expect(drivers[0]!.decisions.get("r1")).toMatchObject({ behavior: "deny", message: expect.stringContaining("couldn't make a pseudonymised copy") });
+  });
+});

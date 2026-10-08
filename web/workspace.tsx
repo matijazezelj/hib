@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { HibClient } from "../src/client";
 import { Markdown } from "./markdown";
+import { ANALYZABLE, AnalyzePanel } from "./analyze";
 
 const api = new HibClient();
 
@@ -157,7 +158,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
   const [files, setFiles] = useState<string[]>([]);
   const [gitState, setGit] = useState<any>(null);
   const [open, setOpen] = useState<Set<string>>(new Set());
-  const [viewer, setViewer] = useState<{ path: string; content?: string; diff?: string; note?: string } | null>(null);
+  const [viewer, setViewer] = useState<{ path: string; content?: string; diff?: string; note?: string; analyze?: boolean } | null>(null);
   const [sessions, setSessions] = useState<any[]>([]);
   const [sessionId, setSessionId] = useState<string | undefined>();
   const [items, setItems] = useState<Item[]>([]);
@@ -455,13 +456,19 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
         </div>
       </main>
 
-      {viewer && (
+      {viewer?.analyze && (
+        <section className="ws-viewer">
+          <AnalyzePanel root={root} path={viewer.path} models={agentModels} onClose={() => setViewer({ ...viewer, analyze: false })} />
+        </section>
+      )}
+      {viewer && !viewer.analyze && (
         <section className="ws-viewer">
           <div className="viewer-head">
             <b>{viewer.path}</b>
             <span style={{ flex: 1 }} />
             {changed.has(viewer.path) && !viewer.diff && <button className="mini" onClick={() => openDiff(viewer.path)}>diff</button>}
             {viewer.diff && <button className="mini" onClick={() => openFile(viewer.path)}>file</button>}
+            {ANALYZABLE.test(viewer.path) && <button className="mini primary" onClick={() => setViewer({ ...viewer, analyze: true })} title="The model writes code from the schema only; it runs here">Analyze</button>}
             <button className="mini" onClick={() => setViewer(null)}>✕</button>
           </div>
           {viewer.note && <div className="note">{viewer.note}</div>}

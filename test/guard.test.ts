@@ -103,6 +103,12 @@ describe("vault", () => {
   });
 });
 
+test("nothing inside an existing hib token is detected again", () => {
+  const text = "row: [HIBab12-EMAIL-1]@[HIBab12-DOMAIN-1], ticket PAY-1234";
+  const f = detect(text, { level: "paranoid", patterns: [{ category: "TICKET", regex: "\\b[A-Z]{2,6}-\\d{2,6}\\b" }] });
+  expect(f.map((x) => x.value)).toEqual(["PAY-1234"]);
+});
+
 describe("conversation-scoped vault", () => {
   test("ips in the same /24 share a NET group", () => {
     const v = new Vault("ab12");

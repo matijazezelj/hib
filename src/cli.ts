@@ -18,6 +18,12 @@ const HELP = `hib — harness in a box
   hib workspace normal [dir]  lift that
   hib workspace egress [session]    what left the machine in a session (default: latest here)
   hib ask "prompt" [-m model] one-shot answer on stdout
+  hib ask -f data.csv "question" [--hide col,col] [--keep col,col]
+                              attach a table pseudonymised by column (identifying columns become
+                              stable tokens; the answer comes back with real values)
+  hib analyze <file> "question" [-m model] [--share col,col] [-y]
+                              analyse a CSV/TSV/JSON locally: the model sees only the schema and
+                              writes code; you approve it; it runs here in a sandbox
   hib conversations           list saved conversations
   hib usage                   quota per account
   hib stats                   learned scores per task class
@@ -37,6 +43,11 @@ const { values, positionals } = parseArgs({
     model: { type: "string", short: "m" },
     resume: { type: "boolean", short: "r" },
     account: { type: "string" },
+    share: { type: "string" },
+    file: { type: "string", short: "f" },
+    hide: { type: "string" },
+    keep: { type: "string" },
+    yes: { type: "boolean", short: "y" },
     help: { type: "boolean", short: "h" },
   },
 });
@@ -149,7 +160,10 @@ async function main() {
       const { client } = await connect();
       let failed = false;
       let revising = false;
-      for await (const e of client.chat({ messages: [{ role: "user", content: prompt }], model: values.model })) {
+      const { resolve } = await import("node:path");
+      const list = (v: unknown) => (v ? String(v).split(",").map((s) => s.trim()) : []);
+      const attachments = values.file ? [{ path: resolve(String(values.file)), hide: list(values.hide), keep: list(values.keep) }] : undefined;
+      for await (const e of client.chat({ messages: [{ role: "user", content: prompt }], model: values.model, attachments })) {
         if (e.type === "meta") console.error(`[${e.cls} → ${e.model}]`);
         if (e.type === "guard" && Object.keys(e.findings).length) console.error(`[guard: ${e.action} ${JSON.stringify(e.findings)}]`);
         if (e.type === "approval") console.error(`[waiting for approval in the web UI or TUI: ${e.reasons.join("; ")}]`);
@@ -184,6 +198,9 @@ async function main() {
     }
     case "plugin":
       return pluginCmd(rest);
+    case "analyze":
+    case "analyse":
+      return analyzeCmd(rest[0], rest.slice(1).join(" "));
     case undefined:
       return agent();
     default:
@@ -203,6 +220,69 @@ async function agent(resume?: string | true) {
   }
   const { runAgent } = await import("./tui/Agent");
   return runAgent({ dir: here.root, resume, model: values.model as string | undefined });
+}
+
+async function confirm(q: string): Promise<boolean> {
+  if (values.yes) return true;
+  if (!process.stdin.isTTY) return false;
+  process.stdout.write(`${q} [y/N] `);
+  for await (const line of console) return /^y(es)?$/i.test(line.trim());
+  return false;
+}
+
+/** Arrays of flat objects print as an aligned table; anything else as JSON. */
+function printResult(result: unknown) {
+  if (Array.isArray(result) && result.length && result.every((r) => r && typeof r === "object" && !Array.isArray(r))) {
+    const cols = [...new Set(result.flatMap((r) => Object.keys(r)))];
+    const cell = (v: unknown) => (v === null || v === undefined ? "" : typeof v === "number" ? (Number.isInteger(v) ? String(v) : v.toFixed(2)) : typeof v === "object" ? JSON.stringify(v) : String(v));
+    const rows = result.slice(0, 100).map((r: any) => cols.map((c) => cell(r[c])));
+    const w = cols.map((c, i) => Math.min(40, Math.max(c.length, ...rows.map((r) => r[i]!.length))));
+    const line = (xs: string[]) => xs.map((x, i) => (x.length > w[i]! ? x.slice(0, w[i]! - 1) + "…" : x.padEnd(w[i]!))).join("  ");
+    console.log(line(cols));
+    console.log(w.map((n) => "─".repeat(n)).join("  "));
+    for (const r of rows) console.log(line(r));
+    if (result.length > 100) console.log(`… ${result.length - 100} more rows`);
+  } else console.log(JSON.stringify(result, null, 2));
+}
+
+async function analyzeCmd(file: string | undefined, question: string) {
+  if (!file || !question) throw new Error('usage: hib analyze <file.csv|tsv|json|jsonl> "question" [-m model] [--share col,col] [-y]');
+  const { resolve } = await import("node:path");
+  const { ensureDaemon } = await import("./boot");
+  const { client } = await ensureDaemon();
+  const path = resolve(file);
+  const share = values.share ? String(values.share).split(",").map((s) => s.trim()) : [];
+  const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
+
+  console.log(dim("profiling locally and asking for analysis code…"));
+  let plan = await client.post("/hib/analyze/plan", { path, question, model: values.model, share });
+  const withheld = plan.profile.columns.filter((c: any) => c.identifying).map((c: any) => c.name);
+  const shared = plan.profile.columns.filter((c: any) => c.values).map((c: any) => c.name);
+  console.log(`\nSent to ${plan.model ?? "model"}: the schema of ${plan.profile.rows} rows × ${plan.profile.columns.length} columns and 3 synthetic rows. No real values${shared.length ? ` except the distinct values of: ${shared.join(", ")}` : ""}.`);
+  if (withheld.length) console.log(dim(`identifying columns (never shared): ${withheld.join(", ")}`));
+  if (!plan.code) throw new Error(`the model didn't return an analyze() function:\n${plan.raw ?? ""}`);
+
+  for (let attempt = 0; ; attempt++) {
+    console.log(`\n${dim("── code to run locally ──")}\n${plan.code}\n${dim("──")}${plan.note ? `\n${dim(plan.note)}` : ""}`);
+    if (!(await confirm("Run this locally (sandboxed: no network, no file access)?"))) return console.log("not run");
+    const r = await client.post("/hib/analyze/run", { id: plan.id });
+    console.log(dim(`\nran in ${r.ms} ms · ${r.sandbox === "macos-sandbox" ? "macOS sandbox" : "isolated process (no OS sandbox on this platform)"}\n`));
+    if (r.ok) {
+      printResult(r.result);
+      break;
+    }
+    console.log(`\x1b[31m${r.error}\x1b[0m`);
+    if (attempt >= 2 || !(await confirm("Ask the model to fix it? (sends the error message above)"))) return;
+    plan = { ...plan, ...(await client.post("/hib/analyze/fix", { id: plan.id })) };
+  }
+
+  const pv = await client.post("/hib/analyze/explain", { id: plan.id, preview: true });
+  const preview = pv.sent as string;
+  if (pv.leaks?.length) console.log(`\x1b[33m\n⚠ the result contains real values from identifying columns: ${pv.leaks.join(", ")}\x1b[0m`);
+  console.log(dim(`\nTo interpret this, hib would send the question, the code and the result above (${preview.length} characters, through the guard). The table itself stays here.`));
+  if (!(await confirm("Send the result for interpretation?"))) return;
+  const ex = await client.post("/hib/analyze/explain", { id: plan.id });
+  console.log(`\n${ex.answer}`);
 }
 
 async function pluginCmd([sub, arg]: string[]) {

@@ -7,6 +7,10 @@ import { listFiles, readFile } from "./workspace/fs";
 import * as git from "./workspace/git";
 import { terminalSocket, type TermData } from "./workspace/terminal";
 import { WorkspaceSessions } from "./workspace/sessions";
+import { Analyzer } from "./analyze";
+import { loadTable } from "./analyze/table";
+import { basename } from "node:path";
+import { safePath } from "./workspace/fs";
 import { ClaudeDriver } from "./workspace/claude-driver";
 import { CodexDriver } from "./workspace/codex-driver";
 
@@ -103,6 +107,17 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
       return root ? fn(root, req) : json({ error: { message: "unknown workspace; run hib in that folder first" } }, 404);
     });
   const sessions = new WorkspaceSessions(engine, engine.sealer, (p) => (p === "claude" ? new ClaudeDriver() : p === "codex" ? new CodexDriver() : null));
+  const analyzer = new Analyzer(engine);
+  // Files for analysis: a path inside a registered workspace (web), or an absolute path from the local CLI.
+  const analysisPath = (b: any) => {
+    if (b.root) {
+      const root = workspaces.resolve(b.root);
+      if (!root) throw new Error("unknown workspace");
+      return safePath(root, String(b.path ?? ""));
+    }
+    if (!String(b.path ?? "").startsWith("/")) throw new Error("path must be absolute");
+    return String(b.path);
+  };
   const sessionIn = (root: string, id: string) => {
     const snap = sessions.snapshot(id);
     return snap.row && (snap.row as any).workspace !== root ? null : snap;
@@ -207,6 +222,26 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           return json({ root: workspaces.setPolicy(String(b.root ?? ""), p) });
         }),
       },
+      "/hib/analyze/profile": {
+        POST: guarded(async (req) => {
+          const b: any = await req.json();
+          return json(analyzer.profileOf(analysisPath(b), b.share ?? []));
+        }),
+      },
+      "/hib/analyze/plan": {
+        POST: guarded(async (req) => {
+          const b: any = await req.json();
+          return json(await analyzer.plan({ path: analysisPath(b), question: String(b.question ?? ""), model: b.model || undefined, share: b.share ?? [] }));
+        }),
+      },
+      "/hib/analyze/run": { POST: guarded(async (req) => json(await analyzer.run(((await req.json()) as any).id))) },
+      "/hib/analyze/fix": { POST: guarded(async (req) => json(await analyzer.fix(((await req.json()) as any).id))) },
+      "/hib/analyze/explain": {
+        POST: guarded(async (req) => {
+          const b: any = await req.json();
+          return json(b.preview ? { sent: analyzer.explainPreview(b.id), leaks: analyzer.leaks(b.id) } : await analyzer.explain(b.id));
+        }),
+      },
       "/hib/shutdown": {
         POST: guarded(() => {
           setTimeout(() => {
@@ -291,7 +326,11 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
             mode: b.mode || undefined,
             cwd: b.cwd || undefined,
             arena: !!b.arena,
-            allowArena: true,
+            allowArena: !b.attachments?.length,
+            attachments: (b.attachments ?? []).map((a: any) => {
+              const path = analysisPath(a);
+              return { name: basename(path), path, table: loadTable(path), hide: a.hide ?? [], keep: a.keep ?? [] };
+            }),
           };
           return sse(eventStream(engine, input, (e) => [JSON.stringify(e)]));
         }),
