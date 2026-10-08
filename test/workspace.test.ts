@@ -41,6 +41,8 @@ describe("workspace jail", () => {
 
 describe("git panel", () => {
   test("status, diff, discard, commit", async () => {
+    // commit() runs git with the daemon's environment; CI runners have no author identity configured.
+    Object.assign(process.env, { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" });
     const root = repo();
     writeFileSync(join(root, "a.ts"), "export const a = 2;\n");
     writeFileSync(join(root, "c.ts"), "new file\n");
