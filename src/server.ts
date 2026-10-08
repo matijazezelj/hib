@@ -242,6 +242,11 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           return json(b.preview ? { sent: analyzer.explainPreview(b.id), leaks: analyzer.leaks(b.id) } : await analyzer.explain(b.id));
         }),
       },
+      "/hib/egress": guarded((req) => json(engine.egressList({ limit: Number(q(req, "limit") || 20), cwd: q(req, "cwd") || undefined }))),
+      "/hib/egress/:id": guarded((req) => {
+        const row = engine.egressGet(req.params.id === "last" ? "last" : Number(req.params.id));
+        return row ? json(row) : json({ error: { message: "not found" } }, 404);
+      }),
       "/hib/shutdown": {
         POST: guarded(() => {
           setTimeout(() => {

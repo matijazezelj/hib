@@ -260,7 +260,9 @@ export class WorkspaceSessions {
     const route = { ...this.cfg.routes.code, mode: "agent" as const, level: "minimal" as const };
 
     // Guard: secrets and configured terms are tokenized; the folder pre-scan runs once per session.
-    const insp = inspect([{ role: "user", content: input.text }], route, this.cfg, { cwd: root, vault, skipScan: !!row });
+    // In sensitive folders, names/places/companies in your prompt are tokenized too (local NER, if enabled).
+    const ner = policy ? await this.engine.ner([input.text]) : undefined;
+    const insp = inspect([{ role: "user", content: input.text }], route, this.cfg, { cwd: root, vault, skipScan: !!row, ner });
     yield { type: "guard", findings: insp.findings, action: insp.blocked ? "block" : insp.decision.action, reasons: insp.blocked ? [insp.blocked] : insp.decision.reasons };
     if (insp.blocked) return yield { type: "error", message: `blocked: ${insp.blocked}` };
     if (policy) {

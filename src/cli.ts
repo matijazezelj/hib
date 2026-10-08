@@ -17,6 +17,8 @@ const HELP = `hib — harness in a box
                               no browser terminal, secrets blocked, every read needs approval
   hib workspace normal [dir]  lift that
   hib workspace egress [session]    what left the machine in a session (default: latest here)
+  hib guard ner setup|status|off    local name/place/company detection (one-time ~180 MB model download)
+  hib egress [last|id] [--here]     what router requests (ask, chat, analyze, API) sent, and to whom
   hib ask "prompt" [-m model] one-shot answer on stdout
   hib ask -f data.csv "question" [--hide col,col] [--keep col,col]
                               attach a table pseudonymised by column (identifying columns become
@@ -44,6 +46,7 @@ const { values, positionals } = parseArgs({
     resume: { type: "boolean", short: "r" },
     account: { type: "string" },
     share: { type: "string" },
+    here: { type: "boolean" },
     file: { type: "string", short: "f" },
     hide: { type: "string" },
     keep: { type: "string" },
@@ -138,7 +141,7 @@ async function main() {
         if (!here.ok) throw new Error(here.why);
         const q = `root=${encodeURIComponent(here.root)}`;
         const id = rest[1] ?? (await client.get(`/ws/sessions?${q}`))[0]?.id;
-        if (!id) throw new Error("no sessions in this folder");
+        if (!id) throw new Error("no agent sessions in this folder. For hib ask / hib chat / analyze, use: hib egress (or hib egress --here)");
         for (const t of await client.get(`/ws/egress/${id}?${q}`)) {
           console.log(`\n→ ${t.account} (${t.model})${t.handoff ? " + handoff transcript" : ""}`);
           console.log(`  prompt: ${t.prompt.replace(/\s+/g, " ").slice(0, 200)}`);
@@ -163,10 +166,21 @@ async function main() {
       const { resolve } = await import("node:path");
       const list = (v: unknown) => (v ? String(v).split(",").map((s) => s.trim()) : []);
       const attachments = values.file ? [{ path: resolve(String(values.file)), hide: list(values.hide), keep: list(values.keep) }] : undefined;
-      for await (const e of client.chat({ messages: [{ role: "user", content: prompt }], model: values.model, attachments })) {
+      // cwd: a sensitive folder's pin applies to asks from inside it, and `hib egress --here` can find them.
+      for await (const e of client.chat({ messages: [{ role: "user", content: prompt }], model: values.model, attachments, cwd: process.cwd() })) {
         if (e.type === "meta") console.error(`[${e.cls} → ${e.model}]`);
         if (e.type === "guard" && Object.keys(e.findings).length) console.error(`[guard: ${e.action} ${JSON.stringify(e.findings)}]`);
-        if (e.type === "approval") console.error(`[waiting for approval in the web UI or TUI: ${e.reasons.join("; ")}]`);
+        if (e.type === "approval") {
+          // Answer the guard here when there's a terminal; otherwise the web UI or TUI can.
+          if (!process.stdin.isTTY) {
+            console.error(`[waiting for approval in the web UI or TUI: ${e.reasons.join("; ")}]`);
+            continue;
+          }
+          const shown = e.redacted.length > 1500 ? `${e.redacted.slice(0, 1500)}\n… (${e.redacted.length - 1500} more characters)` : e.redacted;
+          console.error(`\n\x1b[33mguard: ${e.reasons.join("; ")}\x1b[0m\nThis is exactly what would be sent:\n\x1b[2m${shown}\x1b[0m\n`);
+          const ok = await confirm("Send it?");
+          await client.post(`/hib/approvals/${e.id}`, { approve: ok });
+        }
         if (e.type === "advisor") console.error(`\n[advisor ${e.model}: ${e.verdict}]`);
         if (e.type === "text") {
           if (e.part === "revision" && !revising) {
@@ -198,6 +212,11 @@ async function main() {
     }
     case "plugin":
       return pluginCmd(rest);
+    case "egress":
+      return egressCmd(rest[0]);
+    case "guard":
+      if (rest[0] !== "ner") throw new Error("usage: hib guard ner setup|status|off");
+      return nerCmd(rest[1] ?? "status");
     case "analyze":
     case "analyse":
       return analyzeCmd(rest[0], rest.slice(1).join(" "));
@@ -220,6 +239,64 @@ async function agent(resume?: string | true) {
   }
   const { runAgent } = await import("./tui/Agent");
   return runAgent({ dir: here.root, resume, model: values.model as string | undefined });
+}
+
+/** Sets `ner = …` in the [guard] section of config.toml, adding the line if an older config lacks it. */
+function setNerFlag(on: boolean) {
+  const { readFileSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+  const file = `${hibHome()}/config.toml`;
+  let s = readFileSync(file, "utf8");
+  if (/^ner\s*=.*$/m.test(s)) s = s.replace(/^ner\s*=.*$/m, `ner = ${on}                     # local name/place/company detection`);
+  else if (/^\[guard\]\s*$/m.test(s)) s = s.replace(/^\[guard\]\s*$/m, `[guard]\nner = ${on}                     # local name/place/company detection`);
+  else s += `\n[guard]\nner = ${on}\n`;
+  writeFileSync(file, s);
+}
+
+async function nerCmd(sub: string) {
+  const { join } = await import("node:path");
+  const { NerModel, nerFindings, NER_MODEL, NER_REVISION } = await import("./guard/ner");
+  const { loadConfig } = await import("./config");
+  const model = new NerModel(join(hibHome(), "models"));
+  if (sub === "off") {
+    setNerFlag(false);
+    return console.log("name detection off. Restart the daemon: hib daemon stop");
+  }
+  if (sub === "status") {
+    const on = loadConfig().guard.ner;
+    const ok = await model.load(false).then(() => true, () => false);
+    return console.log(`name detection: ${on ? "on" : "off"}; model ${ok ? "installed" : "not installed"} (${NER_MODEL}@${NER_REVISION.slice(0, 8)})`);
+  }
+  if (sub !== "setup") throw new Error("usage: hib guard ner setup|status|off");
+  console.log(`downloading ${NER_MODEL} @ ${NER_REVISION.slice(0, 8)} into ${join(hibHome(), "models")} (once, ~300 MB)…`);
+  const t0 = Date.now();
+  await model.load(true);
+  const sample = "Ask Marija Horvat from Podravka d.d. whether Ivan Kovačević is still in Zagreb; the build uses Redis and Postgres.";
+  const found = await nerFindings(sample, model.infer);
+  console.log(`self-test (${Date.now() - t0} ms): ${found.map((f) => `${f.category}:${f.value}`).join(", ")}`);
+  if (!found.some((f) => f.value === "Marija Horvat") || found.some((f) => /Redis|Postgres/.test(f.value))) throw new Error("self-test failed; leaving name detection off");
+  setNerFlag(true);
+  console.log("name detection on. Restart the daemon to use it: hib daemon stop");
+}
+
+async function egressCmd(which?: string) {
+  const { ensureDaemon } = await import("./boot");
+  const { client } = await ensureDaemon();
+  const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
+  if (which) {
+    const r = await client.get(`/hib/egress/${which}`);
+    console.log(`#${r.id}  ${new Date(r.ts).toLocaleString()}  → ${r.model} (${r.part})  ${r.chars} chars${r.guard ? `\nguard: ${r.guard}` : ""}\n`);
+    console.log(r.text);
+    return;
+  }
+  const { realpathSync } = await import("node:fs");
+  const rows = await client.get(`/hib/egress?limit=30${values.here ? `&cwd=${encodeURIComponent(realpathSync(process.cwd()))}` : ""}`);
+  if (!rows.length) return console.log("nothing sent yet" + (values.here ? " from this folder" : ""));
+  for (const r of rows) {
+    const user = /<user>\n([\s\S]*)/.exec(r.head)?.[1] ?? r.head;
+    console.log(`#${String(r.id).padEnd(5)} ${new Date(r.ts).toLocaleTimeString()}  → ${r.model.padEnd(28)} ${r.part.padEnd(10)} ${String(r.chars).padStart(7)} chars  ${dim(user.replace(/\s+/g, " ").slice(0, 70))}`);
+    if (r.guard) console.log(dim(`        guard: ${r.guard}`));
+  }
+  console.log(dim(`\nfull text of one: hib egress <id>   ·   latest: hib egress last`));
 }
 
 async function confirm(q: string): Promise<boolean> {

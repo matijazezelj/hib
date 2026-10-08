@@ -163,6 +163,12 @@ describe("policy", () => {
     expect(d.action).toBe("ask");
     expect(d.reasons.join()).toContain("DB-URI");
   });
+  test("names/places/companies from NER don't count toward the findings limit", () => {
+    const ner = Array.from({ length: 50 }, (_, i) => ({ start: i, end: i + 1, value: "x", category: i % 2 ? "PERSON" : "PLACE", kind: "pii" as const }));
+    expect(decide(ner, cfg.routes.chat, cfg.guard).action).toBe("redact");
+    const ips = Array.from({ length: 11 }, (_, i) => ({ start: i, end: i + 1, value: "x", category: "IP-INTERNAL", kind: "infra" as const }));
+    expect(decide(ips, cfg.routes.chat, cfg.guard).reasons.join()).toContain("11 findings > 10");
+  });
   test("route-level ask", () => {
     expect(decide([], { ...cfg.routes.chat, ask: true }, cfg.guard).action).toBe("ask");
   });

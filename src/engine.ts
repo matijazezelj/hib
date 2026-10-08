@@ -1,6 +1,9 @@
 import type { Database } from "bun:sqlite";
 import type { Config, Mode, TaskClass } from "./config";
-import { inspect, obfuscateText, StreamRestorer, tokenNote, Vault } from "./guard";
+import { inspect, obfuscateText, runNer, StreamRestorer, tokenNote, Vault, type NerResult } from "./guard";
+import { NerModel, type Infer } from "./guard/ner";
+import type { Finding } from "./guard/detectors";
+import { join } from "node:path";
 import type { VaultState } from "./guard/vault";
 import type { Sealer } from "./guard/seal";
 import { Learner, SIGNALS } from "./learn";
@@ -78,6 +81,7 @@ interface RunCtx {
   promptHash: string;
   part: "primary" | "revision" | "advisor" | "arena";
   explicit?: boolean;
+  guard?: string; // the guard's summary for this request, kept with the egress record
 }
 
 interface RunResult {
@@ -92,6 +96,8 @@ export class Engine {
   readonly learner: Learner;
   readonly router: Router;
   readonly workspaces: Workspaces;
+  readonly nerModel: NerModel;
+  private nerCache = new Map<string, Finding[]>();
   private approvals = new Map<string, Approval>();
   private approvalListeners = new Set<() => void>();
 
@@ -100,6 +106,40 @@ export class Engine {
     this.learner = new Learner(db);
     this.router = new Router(cfg, registry, this.usage, this.learner);
     this.workspaces = new Workspaces(db, cfg);
+    this.nerModel = new NerModel(join(cfg.home, "models"));
+  }
+
+  /** Local NER over texts, cached per text so long conversations aren't re-scanned every turn. Tests swap `nerInfer`. */
+  nerInfer?: Infer;
+  async ner(texts: string[]): Promise<NerResult> {
+    if (!this.cfg.guard.ner) return { byText: new Map() };
+    const todo = texts.filter((t) => !this.nerCache.has(t));
+    const r = await runNer(todo, this.cfg, this.nerInfer ?? this.nerModel.infer);
+    if (r.error) return r;
+    for (const [t, f] of r.byText) {
+      if (this.nerCache.size > 2000) this.nerCache.delete(this.nerCache.keys().next().value!);
+      this.nerCache.set(t, f);
+    }
+    return { byText: new Map(texts.map((t) => [t, this.nerCache.get(t) ?? []])) };
+  }
+
+  /** Egress log for router requests: exactly what each model call sent (already redacted), and to whom. */
+  private recordEgress(runId: string | null, part: string, c: Candidate, outbound: Message[], cwd: string | undefined, guard: string | undefined) {
+    const text = outbound.map((m) => `<${m.role}>\n${m.content}`).join("\n\n");
+    this.db.run("INSERT INTO egress(ts, run_id, part, cwd, model, account, guard, chars, text) VALUES (?,?,?,?,?,?,?,?,?)", [
+      Date.now(), runId, part, cwd ?? null, c.id, c.account.id, guard ?? null, text.length, text.slice(0, 500_000),
+    ]);
+  }
+
+  egressList(opts: { limit?: number; cwd?: string } = {}) {
+    const rows = this.db
+      .query(`SELECT id, ts, run_id, part, cwd, model, account, guard, chars, substr(text, CASE WHEN instr(text, '<user>') > 0 THEN instr(text, '<user>') ELSE 1 END, 400) AS head FROM egress ${opts.cwd ? "WHERE cwd = ?" : ""} ORDER BY id DESC LIMIT ?`)
+      .all(...(opts.cwd ? [opts.cwd, opts.limit ?? 20] : [opts.limit ?? 20])) as any[];
+    return rows;
+  }
+
+  egressGet(id: number | "last") {
+    return id === "last" ? this.db.query("SELECT * FROM egress ORDER BY id DESC LIMIT 1").get() : this.db.query("SELECT * FROM egress WHERE id = ?").get(id);
   }
 
   // ---------- conversations ----------
@@ -257,7 +297,7 @@ export class Engine {
     let { cls, confident, why } = classify(messages, input.mode ?? "chat", this.plugins.routes);
     if (forced) [cls, why] = [forced, `forced by ${input.model}`];
     else if (!confident && !explicit && !sensitive) {
-      const llm = await this.classifyWithModel(messages, signal);
+      const llm = await this.classifyWithModel(messages, signal, await this.ner(messages.map((m) => m.content)));
       if (llm) [cls, why] = [llm, `${why}; classifier said ${llm}`];
     }
 
@@ -269,7 +309,9 @@ export class Engine {
     if (!plan.ordered.length) return yield { type: "error", message: `no usable model for ${cls}: ${plan.skipped.map((s) => `${s.id} (${s.why})`).join(", ")}` };
 
     // guard
-    const insp = inspect(messages, plan.route, this.cfg, { cwd: input.cwd, vault });
+    // Names, places and companies (local NER) are tokenized too, unless the route only covers secrets.
+    const ner = plan.route.level === "minimal" ? undefined : await this.ner(messages.map((m) => m.content));
+    const insp = inspect(messages, plan.route, this.cfg, { cwd: input.cwd, vault, ner });
     yield { type: "guard", findings: insp.findings, action: insp.blocked ? "block" : insp.decision.action, reasons: insp.blocked ? [insp.blocked] : insp.decision.reasons };
     if (insp.blocked) return yield { type: "error", message: `blocked: ${insp.blocked}` };
     let outbound = insp.messages;
@@ -286,7 +328,9 @@ export class Engine {
       if (!r.ok) return yield { type: "error", message: "not sent: approval rejected or timed out" };
       if (r.edited !== undefined && lastUserIdx >= 0) {
         // Edits are made to the redacted text; re-check them so nothing new slips out unredacted.
-        const again = obfuscateText(vault, r.edited, plan.route.level, this.cfg, plan.route.mode);
+        const edNer = ner ? await this.ner([r.edited]) : undefined;
+        if (edNer?.error) return yield { type: "error", message: `not sent: ${edNer.error}` };
+        const again = obfuscateText(vault, r.edited, plan.route.level, this.cfg, plan.route.mode, edNer?.byText.get(r.edited));
         outbound = outbound.map((m, i) => (i === lastUserIdx ? { ...m, content: again } : m));
       }
       yield { type: "approved", edited: r.edited !== undefined };
@@ -309,7 +353,8 @@ export class Engine {
     const promptHash = hash(messages[lastUserIdx]?.content ?? "");
     this.noteRetry(promptHash);
 
-    const base = { cls, mode: plan.route.mode, cwd: input.cwd, vault, signal, conversationId, promptHash };
+    const guardSummary = `${Object.entries(insp.findings).map(([k, v]) => `${k}×${v}`).join(" ") || "no findings"} → ${insp.decision.action === "ask" ? "approved by you" : "redacted"}`;
+    const base = { cls, mode: plan.route.mode, cwd: input.cwd, vault, signal, conversationId, promptHash, guard: guardSummary };
     const wantArena = !input.solo && !explicit && plan.ordered.length >= 2 && (input.arena || (input.allowArena && Math.random() < this.cfg.arenaRate));
     let finalText: string;
     let finalRun: string;
@@ -406,6 +451,7 @@ export class Engine {
   private async *stream(x: RunCtx): AsyncGenerator<HibEvent, RunResult> {
     const { c, runId, outbound, cls, mode, cwd, vault, signal, conversationId, promptHash, part, explicit } = x;
     const started = Date.now();
+    this.recordEgress(runId, part, c, outbound, x.cwd, x.guard);
     this.db.run("INSERT INTO runs(id, ts, conversation_id, class, model, account, mode, pipeline, status, prompt_hash, explicit) VALUES (?,?,?,?,?,?,?,?,?,?,?)", [
       runId, started, conversationId ?? null, cls, c.id, c.account.id, mode, part, "running", promptHash, explicit ? 1 : 0,
     ]);
@@ -455,16 +501,20 @@ export class Engine {
     return r.value;
   }
 
-  private async classifyWithModel(messages: Message[], signal: AbortSignal): Promise<TaskClass | null> {
+  private async classifyWithModel(messages: Message[], signal: AbortSignal, ner: NerResult): Promise<TaskClass | null> {
+    if (ner.error) return null; // can't redact names: classify from heuristics only, send nothing
     const c = resolveCandidate(this.cfg.classifierModel, this.cfg);
     const provider = c && this.registry.get(c.provider);
     if (!c || !provider || !(await this.registry.available(c.account)) || !this.usage.usable(c.account)) return null;
     const last = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
     // Classifier sees only a paranoid-redacted excerpt under a throwaway vault.
-    const excerpt = new Vault().obfuscate(last.slice(0, 2000), { level: "paranoid", terms: this.cfg.guard.terms }).text;
+    const extra = (ner.byText.get(last) ?? []).filter((f) => f.end <= 2000);
+    const excerpt = new Vault().obfuscate(last.slice(0, 2000), { level: "paranoid", terms: this.cfg.guard.terms, extra }).text;
     let out = "";
     try {
-      for await (const ev of provider.run({ model: c.model, account: c.account, mode: "chat", messages: [{ role: "system", content: CLASSIFY_PROMPT }, { role: "user", content: excerpt }] }, signal)) {
+      const msgs: Message[] = [{ role: "system", content: CLASSIFY_PROMPT }, { role: "user", content: excerpt }];
+      this.recordEgress(null, "classifier", c, msgs, undefined, "paranoid excerpt of your message");
+      for await (const ev of provider.run({ model: c.model, account: c.account, mode: "chat", messages: msgs }, signal)) {
         if (ev.type === "text") out += ev.delta;
         if (ev.type === "quota") this.usage.recordQuota(c.account.id, ev.quota);
       }

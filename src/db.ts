@@ -32,6 +32,11 @@ CREATE TABLE IF NOT EXISTS audit (
   run_id TEXT, ts INTEGER, route TEXT, account TEXT, findings TEXT, action TEXT, reasons TEXT, decided_by TEXT
 );
 CREATE TABLE IF NOT EXISTS workspaces (root TEXT PRIMARY KEY, added INTEGER);
+CREATE TABLE IF NOT EXISTS egress (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, run_id TEXT, part TEXT, cwd TEXT, model TEXT, account TEXT,
+  guard TEXT, chars INTEGER, text TEXT -- exactly what was sent (already redacted), capped
+);
+CREATE INDEX IF NOT EXISTS egress_ts ON egress(ts);
 CREATE TABLE IF NOT EXISTS ws_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, ts INTEGER, event TEXT
 );

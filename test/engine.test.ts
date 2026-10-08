@@ -357,3 +357,49 @@ describe("tables and the sensitive pin", () => {
     expect(a.leaks(plan.id)).toEqual(["username"]);
   });
 });
+
+describe("local NER in the guard", () => {
+  test("names, places and companies are tokenized on the wire and restored in the answer", async () => {
+    const { fakeInfer } = await import("./helpers/fake-ner");
+    engine.cfg.guard.ner = true;
+    engine.nerInfer = fakeInfer;
+    alpha.current = (req) => {
+      const tok = /\[HIB\w+-PERSON-1\]/.exec(JSON.stringify(req.messages))![0];
+      return [{ type: "text", delta: `${tok} is in charge` }];
+    };
+    const r = await run({ messages: [{ role: "user", content: "Who is Marija Horvat at Acme d.o.o. in Zagreb?" }], model: "hib/chat" });
+    const wire = JSON.stringify(sent);
+    for (const real of ["Marija Horvat", "Acme d.o.o.", "Zagreb"]) expect(wire).not.toContain(real);
+    expect(r.text).toBe("Marija Horvat is in charge");
+    expect(r.of("guard")[0]!.findings).toMatchObject({ PERSON: 1, ORG: 1, PLACE: 1 });
+    engine.cfg.guard.ner = false;
+  });
+
+  test("if detection fails, nothing is sent without approval", async () => {
+    engine.cfg.guard.ner = true;
+    engine.nerInfer = async () => {
+      throw new Error("model missing");
+    };
+    const p = run({ messages: [{ role: "user", content: "Who is Marija Horvat?" }], model: "hib/chat" });
+    await Bun.sleep(30);
+    const [a] = engine.pendingApprovals();
+    expect(a!.reasons.join()).toContain("name detection failed");
+    engine.decideApproval(a!.id, false);
+    await p;
+    expect(sent.length).toBe(0);
+    engine.cfg.guard.ner = false;
+  });
+});
+
+test("egress log: every model call is recorded with exactly what was sent (redacted), advisor included", async () => {
+  beta.current = () => [{ type: "text", delta: "1. off by one" }];
+  await run({ messages: [{ role: "user", content: "implement a sum for jane@acme.io's report" }], model: "hib/code", cwd: "/tmp/somewhere" });
+  const rows = engine.egressList({ limit: 10 });
+  expect(rows.map((r: any) => `${r.part}:${r.model}`)).toEqual(["revision:alpha@main/big", "advisor:beta@main/big", "primary:alpha@main/big"]);
+  const full = engine.egressGet(rows[2].id) as any;
+  expect(full.text).toContain("[HIB");
+  expect(full.text).not.toContain("jane@acme.io");
+  expect(full.guard).toContain("EMAIL×1");
+  expect(engine.egressList({ cwd: "/tmp/somewhere" }).length).toBe(3);
+  expect((engine.egressGet("last") as any).part).toBe("revision");
+});

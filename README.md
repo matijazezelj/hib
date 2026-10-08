@@ -121,6 +121,29 @@ Limits:
 6. **Advisor** (set per route): a different provider critiques the answer, and the primary model revises it if problems are found.
 7. **Learn** from thumbs up/down, arena picks, retries, advisor findings and errors.
 
+## Name detection (optional, local)
+
+```sh
+hib guard ner setup     # one-time download of a pinned ~180 MB model, then a self-test
+hib daemon stop         # restart to pick it up; `hib guard ner status|off` to check or disable
+```
+
+Pattern matching catches emails, keys and IPs, but not "Marija Horvat", "Podravka d.d." or "Trg bana Josipa Jelačića 3". With name detection on, a multilingual entity-recognition model (`bert-base-multilingual-cased-ner-hrl`, pinned revision) runs **on your machine** and finds people, places and organisations. Two rules add companies with legal suffixes (d.o.o., d.d., GmbH, Ltd, Inc…) and street addresses. The findings become the same stable tokens as everything else: `[…-PERSON-1]`, `[…-ORG-1]`, `[…-PLACE-1]`, `[…-ADDRESS-1]`. The model sees them as placeholders and you see the real values.
+
+- **Covers:** router prompts, `hib ask -f` tables, the LLM classifier's excerpt, and prompts in sensitive workspaces.
+- **Prose only:** fenced code, inline code and code-looking lines are skipped, and a built-in list keeps tech names like Redis and Grafana from being treated as companies. Add your own with `nerIgnore = [...]` in `[guard]`.
+- **Lowercase chat** ("luka novak from infobip") gets a second pass on a title-cased copy.
+- **Fails closed:** if the model is missing or errors, the request waits for your approval and is not sent as-is. Inputs over 200 KB are refused rather than partly scanned.
+- **Measured** on two small hand-labelled sets in English, Croatian, Serbian and German: 24/24 and 19/20 entities found, 0 and 2 code false positives, about 20 ms per typical prompt, about 600 MB of memory once loaded. It's a model, so it will miss things; it adds to the rules and doesn't replace them.
+
+## What left the machine
+
+- `hib workspace egress` shows what an agent session sent: each turn's redacted prompt, the account it went to, and every tool call.
+- `hib egress [--here]` lists every router call (from `hib ask`, `hib chat`, `hib analyze`, the browser chat and the API): the time, model, size and what the guard found. The advisor's and classifier's calls are listed too.
+- `hib egress last` or `hib egress <id>` prints the exact text that was sent.
+
+The log stores the redacted text locally in `~/.hib/hib.db`, so anything the guard missed is in there too.
+
 ## Security model
 
 - **Network:** the daemon listens on `127.0.0.1` only.

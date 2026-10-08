@@ -166,6 +166,7 @@ export interface DetectOptions {
   identities?: string[]; // this machine's username/hostname, tokenized as USER outside of paths too
   patterns?: { category: string; regex: string; flags?: string }[]; // from guard plugins; applied at every level
   keepPaths?: boolean; // agent mode: the CLI must open real paths, and its tool output reveals them anyway
+  extra?: Finding[]; // precomputed findings for this exact text (local NER)
 }
 
 /** Non-overlapping findings, earlier detectors (secrets, then terms) winning ties. */
@@ -176,6 +177,7 @@ export function detect(text: string, opts: DetectOptions): Finding[] {
     if (!t.trim()) continue;
     raw.push(...run(text, { category: "TERM", kind: "term", re: new RegExp(`(?<![\\w])${escapeRe(t)}(?![\\w])`, "gi") }));
   }
+  raw.push(...(opts.extra ?? []));
   for (const p of opts.patterns ?? []) {
     const flags = (p.flags ?? "").includes("g") ? p.flags! : (p.flags ?? "") + "g";
     raw.push(...run(text, { category: p.category, kind: "term", re: new RegExp(p.regex, flags) }));

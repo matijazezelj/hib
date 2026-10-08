@@ -31,6 +31,8 @@ export interface GuardConfig {
   askIfFindingsOver: number;
   approvalTimeoutSec: number;
   patterns: { category: string; regex: string; flags?: string }[]; // added by guard plugins
+  ner: boolean; // local name/place/organisation detection (hib guard ner setup)
+  nerIgnore: string[]; // words the NER should never treat as names
 }
 
 export interface Config {
@@ -117,6 +119,8 @@ agentDirs = []                  # dirs where agent mode may run
 askOn = ["PRIVATE-KEY", "DB-URI", "AWS", "TERM"]
 askIfFindingsOver = 10
 approvalTimeoutSec = 300
+ner = false                     # local name/place/company detection; run "hib guard ner setup" first
+nerIgnore = []                  # words never treated as names (product or tech names)
 `;
 
 export function expandHome(p: string): string {
@@ -186,6 +190,8 @@ export function parseConfig(raw: any, home: string): Config {
       askIfFindingsOver: g.askIfFindingsOver ?? 10,
       approvalTimeoutSec: g.approvalTimeoutSec ?? 300,
       patterns: [],
+      ner: !!g.ner,
+      nerIgnore: g.nerIgnore ?? [],
     },
   };
 }
