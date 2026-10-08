@@ -150,3 +150,10 @@ details summary { padding: 0 10px 6px; cursor: pointer; }
 .md blockquote { margin: 0 0 .75em; padding-left: 12px; border-left: 3px solid var(--line); color: var(--muted); }
 .md a { color: var(--accent); }
 .md hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
+
+.egress-turn { border-bottom: 1px solid var(--line); padding: 6px 2px; font-size: 12px; }
+.egress-act { font-family: var(--mono); font-size: 11px; padding-left: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.egress-act.denied { text-decoration: line-through; color: var(--muted); }
+.egress-act.failed { color: var(--bad); }
+.tabs button { padding: 4px 2px; }
+.egress-guard { font-size: 11px; color: var(--warn); }

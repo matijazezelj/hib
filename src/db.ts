@@ -57,6 +57,9 @@ function migrate(db: Database) {
       db.exec(`ALTER TABLE conversations ADD COLUMN ${col}`);
     } catch {}
   }
+  try {
+    db.exec("ALTER TABLE workspaces ADD COLUMN policy TEXT");
+  } catch {}
 }
 
 export function memoryDb(): Database {

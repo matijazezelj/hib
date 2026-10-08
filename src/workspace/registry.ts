@@ -4,6 +4,16 @@ import { homedir } from "node:os";
 import type { Config } from "../config";
 
 /**
+ * A sensitive workspace sends its contents to exactly one vendor account. It allows no handoff,
+ * failover, advisor or arena, has no browser terminal, blocks secrets in prompts, and asks before every read.
+ */
+export interface Policy {
+  sensitive: true;
+  account: string; // "claude@work": the only provider@account allowed to see this folder
+  model?: string; // default model on that account
+}
+
+/**
  * Folders the user has opened hib in. Registering a folder is consent for agents to work in it,
  * so registered roots are also agent dirs. `hib workspace forget` withdraws that.
  */
@@ -24,8 +34,38 @@ export class Workspaces {
     for (const r of this.list()) if (!cfg.guard.agentDirs.includes(r.root)) cfg.guard.agentDirs.push(r.root);
   }
 
-  list(): { root: string; added: number }[] {
-    return this.db.query("SELECT root, added FROM workspaces ORDER BY added DESC").all() as any[];
+  list(): { root: string; added: number; policy: Policy | null }[] {
+    return (this.db.query("SELECT root, added, policy FROM workspaces ORDER BY added DESC").all() as any[]).map((r) => ({ ...r, policy: r.policy ? JSON.parse(r.policy) : null }));
+  }
+
+  policy(root: string): Policy | null {
+    const r = this.db.query("SELECT policy FROM workspaces WHERE root = ?").get(root) as any;
+    return r?.policy ? JSON.parse(r.policy) : null;
+  }
+
+  /** Policy of the registered workspace containing `dir` (the innermost one), if any. */
+  policyFor(dir: string): { root: string; policy: Policy } | null {
+    let real: string;
+    try {
+      real = realpathSync(dir);
+    } catch {
+      return null;
+    }
+    const hits = this.list().filter((w) => w.policy && (real === w.root || real.startsWith(w.root + "/")));
+    hits.sort((a, b) => b.root.length - a.root.length);
+    return hits[0] ? { root: hits[0].root, policy: hits[0].policy! } : null;
+  }
+
+  setPolicy(dir: string, policy: Policy | null) {
+    const root = this.resolve(dir);
+    if (!root) throw new Error(`${dir} is not a registered workspace; run hib there first`);
+    if (policy) {
+      if (!/^[a-z0-9_-]+@[A-Za-z0-9_-]+$/.test(policy.account) || !this.cfg.accounts.some((a) => a.id === policy.account))
+        throw new Error(`unknown account ${policy.account}; known: ${this.cfg.accounts.map((a) => a.id).join(", ")}`);
+      if (policy.model && !policy.model.startsWith(policy.account + "/")) throw new Error(`model must be on ${policy.account}, e.g. ${policy.account}/sonnet`);
+    }
+    this.db.run("UPDATE workspaces SET policy = ? WHERE root = ?", [policy ? JSON.stringify(policy) : null, root]);
+    return root;
   }
 
   has(root: string): boolean {
@@ -57,4 +97,20 @@ export class Workspaces {
     const i = this.cfg.guard.agentDirs.indexOf(root);
     if (i >= 0) this.cfg.guard.agentDirs.splice(i, 1);
   }
+}
+
+/** True if a model id ("claude@work/sonnet", "claude/sonnet") runs on the pinned account. */
+export function onPinnedAccount(modelId: string, policy: Policy, cfg: Config): boolean {
+  const m = /^([a-z0-9_-]+)(?:@([A-Za-z0-9_-]+))?\/(.+)$/.exec(modelId);
+  if (!m) return false;
+  const account = m[2] ?? cfg.defaultAccount[m[1]!] ?? "default";
+  return `${m[1]}@${account}` === policy.account;
+}
+
+/** The model a sensitive workspace uses when none is chosen: its policy model, else the route's choice moved onto the pinned account. */
+export function pinnedModel(policy: Policy, cfg: Config, cls = "code"): string {
+  if (policy.model) return policy.model;
+  const provider = policy.account.split("@")[0]!;
+  const fromRoute = (cfg.routes[cls] ?? cfg.routes.code).candidates.map((c) => /^([a-z0-9_-]+)(?:@[^/]+)?\/(.+)$/.exec(c)).find((m) => m?.[1] === provider)?.[2];
+  return `${policy.account}/${fromRoute ?? Object.keys(cfg.models[provider] ?? {})[0] ?? "default"}`;
 }

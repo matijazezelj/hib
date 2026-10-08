@@ -21,7 +21,7 @@ const HELP = [
   "y / a / n         answer a permission prompt: allow once, always (this session), deny",
   "Esc               stop the running turn",
   "/model <id>       switch model (same CLI keeps its native session, otherwise hands over)",
-  "/models  /new  /resume  /web (open this session in the browser)  /usage  /quit",
+  "/models  /new  /resume  /web (open this session in the browser)  /egress (what left, and to whom)  /usage  /quit",
 ].join("\n");
 
 const KIND_COLOR: Record<string, string> = { edit: "yellow", command: "blue", read: "gray", search: "gray", web: "magenta" };
@@ -58,9 +58,11 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
   const [pending, setPending] = useState<Pending[]>([]);
   const [approval, setApproval] = useState<any | null>(null);
   const [picker, setPicker] = useState<any[] | null>(null);
+  const [policy, setPolicy] = useState<{ account: string } | null>(null);
   const [pickIdx, setPickIdx] = useState(0);
   const follow = useRef<AbortController | null>(null);
   const liveRef = useRef("");
+  const seenCalls = useRef(new Set<string>());
   const q = `root=${encodeURIComponent(root)}`;
 
   const push = (...ls: (Line | Omit<Line, "key">)[]) => setLines((d) => [...d, ...ls.map((l) => ({ key: seq++, ...l }))]);
@@ -91,6 +93,8 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         setModel(e.model);
         break;
       case "tool_call":
+        if (seenCalls.current.has(e.call.id)) break; // same call re-announced with more detail
+        seenCalls.current.add(e.call.id);
         flushLive();
         push({ text: `● ${e.call.title}`, color: KIND_COLOR[e.call.kind] ?? "white" }, ...diffLines(e.call.diff));
         break;
@@ -113,6 +117,9 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         break;
       case "approval":
         push({ text: `guard wants approval: ${e.reasons.join("; ")} — /approve or /reject`, color: "yellow" });
+        break;
+      case "sent":
+        push({ text: `→ sent to ${e.account}${e.handoff ? " (with handoff transcript)" : ""}`, dim: true });
         break;
       case "handoff":
         push({ text: `handed over ${e.from} → ${e.to}`, color: "yellow" });
@@ -170,6 +177,11 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
 
   useEffect(() => {
     push({ text: `hib · ${root}`, color: "cyan" }, { text: "describe a task; /help for commands", dim: true });
+    client.get(`/ws/tree?${q}`).then((t) => {
+      if (!t.policy) return;
+      setPolicy(t.policy);
+      push({ text: `sensitive workspace: only ${t.policy.account} sees this folder; every read asks; secrets are blocked`, color: "yellow" });
+    }).catch(() => {});
     if (initial === true) openPicker();
     else if (initial) attach(initial).catch((e) => push({ text: String(e.message), color: "red" }));
     const t = setInterval(async () => {
@@ -213,7 +225,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         }
         return true;
       case "models":
-        push({ text: (await client.get("/hib/info")).models.filter((m: string) => /^(claude|codex)@/.test(m)).join("\n"), dim: true });
+        push({ text: (await client.get("/hib/info")).models.filter((m: string) => /^(claude|codex)@/.test(m) && (!policy || m.startsWith(policy.account + "/"))).join("\n"), dim: true });
         return true;
       case "new":
         follow.current?.abort();
@@ -228,6 +240,15 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
       case "stop":
         await interrupt();
         return true;
+      case "egress": {
+        if (!sidRef.current) return push({ text: "no session yet", dim: true }), true;
+        for (const t of await client.get(`/ws/egress/${sidRef.current}?${q}`)) {
+          push({ text: `→ ${t.account}${t.handoff ? " (+ handoff transcript)" : ""}: ${t.prompt.replace(/\s+/g, " ").slice(0, 120)}`, color: "cyan" });
+          if (t.guard) push({ text: `   guard: ${t.guard}`, color: "yellow" });
+          for (const a of t.actions) push({ text: `   ${a.status.padEnd(9)} ${a.kind.padEnd(7)} ${a.title}`, dim: a.status !== "done", color: a.status === "failed" ? "red" : undefined });
+        }
+        return true;
+      }
       case "web":
         push({ text: workspaceUrl(url, root, sidRef.current), color: "cyan" });
         return true;
@@ -327,7 +348,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         </Box>
       )}
       <Text dimColor>
-        [{model}{sid ? ` · ${sid}` : ""}] {busy ? "working… (esc to stop)" : ""}
+        [{model}{sid ? ` · ${sid}` : ""}{policy ? ` · sensitive → ${policy.account}` : ""}] {busy ? "working… (esc to stop)" : ""}
       </Text>
       <Box>
         <Text color="cyan">› </Text>

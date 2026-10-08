@@ -74,3 +74,10 @@ test("a CLI that goes silent is killed and reported as stalled", async () => {
   expect(got).toEqual(["started"]);
   expect(p.stalled()).toBe(true);
 });
+
+test("codex web searches and other agent actions are visible, never dropped", async () => {
+  const { describeOther } = await import("../src/workspace/codex-driver");
+  expect(describeOther({ type: "webSearch", id: "w1", query: "AKIA example key", action: { type: "search", query: "aws example secret key", queries: null } }).title).toBe('web search "aws example secret key"');
+  expect(describeOther({ type: "webSearch", id: "w2", query: "", action: { type: "openPage", url: "https://docs.aws.amazon.com/x" } })).toMatchObject({ kind: "web", title: "web open https://docs.aws.amazon.com/x" });
+  expect(describeOther({ type: "collabAgentToolCall", id: "c1", tool: "spawn" })).toMatchObject({ kind: "other", title: "collabAgentToolCall spawn" });
+});

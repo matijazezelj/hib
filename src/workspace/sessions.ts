@@ -6,6 +6,8 @@ import type { Sealer } from "../guard/seal";
 import { resolveCandidate, type Candidate } from "../router/route";
 import type { AgentDriver, AgentEvent, Decision, ToolCall } from "./driver";
 import { insideRoot } from "./fs";
+import { detect } from "../guard/detectors";
+import { onPinnedAccount, pinnedModel } from "./registry";
 
 export type DriverFactory = (provider: string) => AgentDriver | null;
 
@@ -17,6 +19,7 @@ export type WsEvent =
   | { type: "approval"; id: string; redacted: string; reasons: string[] }
   | { type: "turn_start"; text: string; model?: string }
   | { type: "permission_answer"; id: string; choice: string }
+  | { type: "sent"; account: string; model: string; text: string; handoff: boolean; chars: number }
   | AgentEvent
   | { type: "done" }
   | { type: "turn_end" }; // always last; clients stop following a turn here
@@ -40,6 +43,13 @@ interface Live {
   vault: Vault;
   alwaysAllow: Set<string>;
   pending: Map<string, { call: ToolCall; ruleKey: string; input?: unknown }>;
+  askReads: boolean;
+}
+
+const PROTECTED = new Set([".claude", ".codex", ".git", ".hib", ".mcp.json"]);
+function protectedPath(root: string, p: string): boolean {
+  const rel = p.startsWith(root + "/") ? p.slice(root.length + 1) : p.replace(/^\.\//, "");
+  return PROTECTED.has(rel.split("/")[0] ?? "");
 }
 
 const newId = () => `w_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
@@ -184,8 +194,9 @@ export class WorkspaceSessions {
   private async open(id: string, root: string, c: Candidate, resume: string | undefined, vault: Vault, system?: string): Promise<Live> {
     const driver = this.drivers(c.provider);
     if (!driver) throw new Error(`provider ${c.provider} has no agent driver`);
-    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system });
-    const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map() };
+    const askReads = !!this.engine.workspaces.policy(root);
+    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system, askReads });
+    const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads };
     this.live.set(id, l);
     return l;
   }
@@ -220,7 +231,14 @@ export class WorkspaceSessions {
     let row = input.isNew ? null : (this.db.query("SELECT * FROM conversations WHERE id = ? AND workspace = ?").get(id, root) as any);
     if (!input.isNew && !row) return yield { type: "error", message: `no session ${id} in this workspace` };
 
-    const modelId = input.model && input.model !== "hib/auto" ? input.model : row?.agent_model ?? (await this.defaultModel(root));
+    const policy = this.engine.workspaces.policy(root);
+    const chosen = input.model && input.model !== "hib/auto" ? input.model : undefined;
+    let modelId = chosen ?? row?.agent_model ?? (policy ? pinnedModel(policy, this.cfg) : await this.defaultModel(root));
+    if (policy && !onPinnedAccount(modelId, policy, this.cfg)) {
+      // A sensitive folder only ever talks to its pinned account.
+      if (chosen) return yield { type: "error", message: `this workspace is sensitive and pinned to ${policy.account}; ${chosen} is not allowed` };
+      modelId = pinnedModel(policy, this.cfg);
+    }
     const c = resolveCandidate(modelId, this.cfg);
     if (!c) return yield { type: "error", message: `unknown model ${modelId}` };
     if (!(await this.engine.registry.available(c.account))) return yield { type: "error", message: `${c.id} is not logged in` };
@@ -232,6 +250,11 @@ export class WorkspaceSessions {
     const insp = inspect([{ role: "user", content: input.text }], route, this.cfg, { cwd: root, vault, skipScan: !!row });
     yield { type: "guard", findings: insp.findings, action: insp.blocked ? "block" : insp.decision.action, reasons: insp.blocked ? [insp.blocked] : insp.decision.reasons };
     if (insp.blocked) return yield { type: "error", message: `blocked: ${insp.blocked}` };
+    if (policy) {
+      // Sensitive workspaces never send a secret, not even tokenized: the agent could still act on it.
+      const secrets = [...new Set(detect(input.text, { level: "minimal" }).filter((f) => f.kind === "secret").map((f) => f.category))];
+      if (secrets.length) return yield { type: "error", message: `blocked: this workspace is sensitive and your message contains ${secrets.join(", ")}. Remove it and send again.` };
+    }
     let text = insp.messages[0]!.content;
     if (insp.decision.action === "ask") {
       const aid = `ap_${crypto.randomUUID().slice(0, 12)}`;
@@ -249,6 +272,13 @@ export class WorkspaceSessions {
     const sid = id;
 
     let l = this.live.get(sid);
+    if (l && !!policy !== l.askReads) {
+      // The folder's sensitivity changed since this CLI started; restart it on its native session with the right permissions.
+      await l.driver.close();
+      this.live.delete(sid);
+      row.native_id = l.nativeId ?? row.native_id;
+      l = undefined;
+    }
     if (l && !l.driver.alive) {
       // The CLI died (crash, stall, interrupt fallback); reopen it on the native session.
       this.live.delete(sid);
@@ -282,6 +312,15 @@ export class WorkspaceSessions {
 
     const note = vault.size ? `(${tokenNote(vault.tag)})\n\n` : "";
     const prompt = `${firstTurnPrefix ? firstTurnPrefix + "\n\n" : ""}${note}${text}`;
+    // Egress log: exactly what this turn sends, and to whom. The CLI's own reads show up as tool calls.
+    const sentEv = { type: "sent" as const, account: c.account.id, model: c.id, text, handoff: !!firstTurnPrefix, chars: prompt.length };
+    this.record(sid, sentEv);
+    yield sentEv;
+    if (Object.keys(insp.findings).length || insp.decision.reasons.length)
+      this.record(sid, {
+        type: "guard_decision",
+        summary: `${Object.entries(insp.findings).map(([k, v]) => `${k}×${v}`).join(" ") || "no findings"} → ${insp.decision.action === "ask" ? "you approved sending the redacted text" : "redacted"}${insp.decision.reasons.length ? ` (${insp.decision.reasons.join("; ").slice(0, 160)})` : ""}`,
+      });
 
     const runId = `r_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const started = Date.now();
@@ -366,12 +405,42 @@ export class WorkspaceSessions {
     yield { type: "done" };
   }
 
-  /** "Always" rules never cover edits outside the workspace, like Claude Code's acceptEdits. */
+  /**
+   * What left the machine in a session, turn by turn: the redacted prompt and the vendor account that got it,
+   * plus every tool call the agent made (file reads and command output go to the same account).
+   */
+  egress(id: string) {
+    const turns: { at?: number; account: string; model: string; prompt: string; handoff: boolean; guard?: string; actions: { kind: string; title: string; status: string }[] }[] = [];
+    const byCall = new Map<string, { kind: string; title: string; status: string }>();
+    for (const e of this.history(id)) {
+      if (e.type === "sent") turns.push({ account: e.account, model: e.model, prompt: e.text, handoff: e.handoff, actions: [] });
+      else if (e.type === "guard_decision" && turns.length) turns[turns.length - 1]!.guard = e.summary;
+      else if (e.type === "tool_call" && turns.length) {
+        const known = byCall.get(e.call.id);
+        if (known) {
+          known.title = e.call.title; // a later event can carry more detail (e.g. the final search query)
+          continue;
+        }
+        const a = { kind: e.call.kind, title: e.call.title, status: "requested" };
+        byCall.set(e.call.id, a);
+        turns[turns.length - 1]!.actions.push(a);
+      } else if (e.type === "tool_result") {
+        const a = byCall.get(e.id);
+        if (a) a.status = e.ok ? "done" : /denied|declined/i.test(e.output ?? "") ? "denied" : "failed";
+      }
+    }
+    return turns;
+  }
+
+  /**
+   * "Always" rules never cover edits outside the workspace (like Claude Code's acceptEdits), nor tool
+   * config inside it: writing .claude/ or .codex/ could widen the agent's own permissions, and .git/hooks runs on commit.
+   */
   private autoAllowed(l: Live, ruleKey: string, call: ToolCall): boolean {
     if (!l.alwaysAllow.has(ruleKey)) return false;
     if (call.kind !== "edit") return true;
     const paths = call.paths ?? (call.path ? [call.path] : []);
-    return paths.length > 0 && paths.every((p) => insideRoot(l.root, p));
+    return paths.length > 0 && paths.every((p) => insideRoot(l.root, p) && !protectedPath(l.root, p));
   }
 
   /** Allow once, allow this kind of call for the rest of the session, or deny. */

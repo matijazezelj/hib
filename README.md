@@ -20,7 +20,7 @@ hib drives the official CLIs you're already logged into. It never extracts OAuth
 ```sh
 git clone git@github.com:matijazezelj/hib.git ~/work/personal/hib
 cd ~/work/personal/hib && bun install
-alias hib="bun ~/work/personal/hib/src/cli.ts"   # put this in your shell rc
+ln -s ~/work/personal/hib/src/cli.ts ~/.local/bin/hib   # any dir on your PATH; the file has a bun shebang
 ```
 
 ## Quick start
@@ -54,6 +54,29 @@ Any OpenAI client can use the router: set `OPENAI_BASE_URL=http://127.0.0.1:4141
 
 The browser home page `/` lists your workspaces, and `/?router` is the multi-model chat. hib refuses `~` and `/` as workspaces, and `hib workspace forget` removes a folder.
 
+## Sensitive workspaces
+
+```sh
+cd ~/code/client-project
+hib workspace sensitive --account claude@work   # pin this folder to one vendor account
+hib workspace egress                            # what left the machine in the latest session, and to whom
+hib workspace normal                            # lift it
+```
+
+A sensitive folder is seen by exactly one vendor account. The policy is stored in hib's database, not in the repo, so an agent working in the folder can't edit it. While it's on:
+- **One account only.** Models on other accounts or vendors are refused, in the workspace and in router requests whose working directory is inside the folder.
+- **Nothing that copies data elsewhere:** no handoff, failover, advisor, arena, or classifier call.
+- **Reads need approval.** Every file read, search, Bash command and subagent asks first, so you see each file before its contents go out. "Always" for a read covers only that directory.
+- **Secrets are blocked** in prompts outright, not just tokenized.
+- **Repo config is ignored.** Claude sessions load only your user settings, never the repo's `.claude/` settings or hooks, and no MCP servers. A cloned repo can't add allow rules or run hooks.
+- **No browser terminal** (the server refuses it).
+- **Egress log.** Each turn records the redacted prompt and the account it went to, plus every tool call. View it in the *Egress* tab, with `/egress` in the terminal, or with `hib workspace egress`.
+
+Limits:
+- Codex runs read-only commands like `cat` and `grep` without asking, so reads can't be gated on a Codex account. Prefer a Claude account for sensitive folders.
+- Router chat that isn't tied to a folder isn't covered, so don't paste sensitive content into `hib chat`.
+- Check each subscription's own data settings (training opt-out, retention) and your employer's rules. hib can't change those.
+
 ## How a router request flows
 
 1. **Classify** the request as chat, code, review or long. Heuristics come first; Haiku is asked only when they're unsure. Plugin routes can add classes.
@@ -82,6 +105,10 @@ The browser home page `/` lists your workspaces, and `/?router` is the multi-mod
   - the folder boundary;
   - a one-time pre-scan for `.env` and key files;
   - per-action permission prompts.
+- **Credentials are off-limits.** Every workspace session, sensitive or not, is denied reads of `~/.hib`, `~/.claude*`, `~/.codex`, `~/.ssh`, `~/.aws`, `~/.gnupg` and `~/.config/gh`.
+- **Tool config needs approval every time.** "Always allow edits" never covers `.claude/`, `.codex/`, `.git/` or `.mcp.json` inside the folder, so an agent can't quietly widen its own permissions or plant a git hook.
+- **Policies can only be tightened over the API.** Lifting one takes `hib workspace normal` at the terminal, so the API token alone can't switch it off.
+- **Local processes are trusted.** Anything already running as your user can read `~/.hib`. hib raises the bar but doesn't sandbox your own account.
 - **Your own CLI config still applies:** your `settings.json` allow rules, MCP servers and `CLAUDE.md` / `AGENTS.md` load into agent sessions. Broad allow rules there bypass hib's prompts.
 - **Rendering:** model output is rendered as markdown without raw HTML.
 

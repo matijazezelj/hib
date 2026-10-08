@@ -19,6 +19,8 @@ big = "strong"
 default = "main"
 [providers.alpha.accounts.main]
 env = {}
+[providers.alpha.accounts.work]
+env = {}
 [routes.code]
 candidates = ["alpha/big"]
 [guard]
@@ -62,7 +64,7 @@ class FakeDriver implements AgentDriver {
   }
 }
 
-let root: string, sessions: WorkspaceSessions, script: { current: Script }, drivers: FakeDriver[];
+let root: string, sessions: WorkspaceSessions, script: { current: Script }, drivers: FakeDriver[], engine: Engine;
 
 beforeEach(async () => {
   const home = mkdtempSync(join(tmpdir(), "hib-ses-"));
@@ -71,7 +73,7 @@ beforeEach(async () => {
   cfg.guard.agentDirs.push(root);
   const alpha: Provider = { id: "alpha", available: async () => true, async *run() {} };
   const sealer = await Sealer.open(home);
-  const engine = new Engine(cfg, memoryDb(), new Registry([alpha]), sealer, { skills: new Map(), agents: new Map(), routes: [], guardTerms: [], guardPatterns: [], askOn: [], advisor: [], providers: [], warnings: [] });
+  engine = new Engine(cfg, memoryDb(), new Registry([alpha]), sealer, { skills: new Map(), agents: new Map(), routes: [], guardTerms: [], guardPatterns: [], askOn: [], advisor: [], providers: [], warnings: [] });
   script = { current: async () => {} };
   drivers = [];
   sessions = new WorkspaceSessions(engine, sealer, () => {
@@ -82,10 +84,10 @@ beforeEach(async () => {
 });
 
 /** Runs a turn, answering permissions with `choose` as they arrive. */
-async function turn(text: string, sessionId?: string, choose: (e: Extract<WsEvent, { type: "permission" }>) => "allow" | "always" | "deny" | null = () => "allow") {
+async function turn(text: string, sessionId?: string, choose: (e: Extract<WsEvent, { type: "permission" }>) => "allow" | "always" | "deny" | null = () => "allow", model = "alpha/big") {
   const events: WsEvent[] = [];
   let sid = sessionId;
-  for await (const e of sessions.send({ sessionId, root, model: "alpha/big", text }, new AbortController().signal)) {
+  for await (const e of sessions.send({ sessionId, root, model, text }, new AbortController().signal)) {
     events.push(e);
     if (e.type === "ws_session") sid = e.id;
     if (e.type === "permission") {
@@ -129,6 +131,24 @@ describe("workspace sessions", () => {
     expect(prompted).toEqual(["p1", "p3"]);
     expect(drivers[0]!.decisions.get("p2")!.behavior).toBe("allow");
     expect(drivers[0]!.decisions.get("p3")!.behavior).toBe("deny");
+  });
+
+  test("'always' never covers tool config inside the folder (.claude, .codex, .git/hooks, .mcp.json)", async () => {
+    const edit = (id: string, path: string): AgentEvent => ({ type: "permission", id, ruleKey: "edit", call: { id, name: "Write", kind: "edit", title: `Write ${path}`, path, paths: [path] }, input: {} });
+    const prompted: string[] = [];
+    script.current = async (_t, d, q) => {
+      q.push(edit("p0", "src/a.ts"));
+      await d.ask("p0");
+      for (const [i, p] of [".claude/settings.local.json", `${root}/.codex/config.toml`, ".git/hooks/pre-commit", ".mcp.json", "src/b.ts"].entries()) {
+        q.push(edit(`p${i + 1}`, p));
+        await d.ask(`p${i + 1}`);
+      }
+    };
+    await turn("go", undefined, (e) => {
+      prompted.push(e.id);
+      return e.id === "p0" ? "always" : "deny";
+    });
+    expect(prompted).toEqual(["p0", "p1", "p2", "p3", "p4"]); // src/b.ts (p5) was auto-allowed
   });
 
   test("unanswered permissions are denied when the turn ends", async () => {
@@ -199,8 +219,8 @@ describe("shared live sessions", () => {
     expect(seen).toEqual([]);
     expect(late).toEqual(["part one ", "part two"]); // replay from 0 plus live
     const after = sessions.snapshot(id);
-    expect(after.events.map((e: any) => e.type)).toEqual(["user", "assistant"]);
-    expect(after.events[1].text).toBe("part one part two");
+    expect(after.events.map((e: any) => e.type)).toEqual(["user", "sent", "assistant"]);
+    expect(after.events[2].text).toBe("part one part two");
   });
 });
 
@@ -213,4 +233,71 @@ describe("workspace registry", () => {
     expect(eligible("/definitely/not/here").ok).toBe(false);
     expect(eligible(root)).toEqual({ ok: true, root });
   });
+});
+
+describe("sensitive workspaces", () => {
+  const sensitive = () => {
+    engine.workspaces.register(root);
+    engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@work" });
+  };
+
+  test("only the pinned account is used; other accounts are refused", async () => {
+    sensitive();
+    const ok = await turn("hello", undefined, undefined, "hib/auto");
+    expect(ok.events.find((e) => e.type === "ws_session")).toMatchObject({ model: "alpha@work/big" });
+    expect(drivers[0]!.started[0]!.account.id).toBe("alpha@work");
+    const refused = await turn("again", ok.sid, undefined, "hib/auto");
+    expect(refused.events.some((e) => e.type === "error")).toBe(false);
+    const r = sessions.send({ sessionId: ok.sid, root, model: "alpha@main/big", text: "x" });
+    const evs: WsEvent[] = [];
+    for await (const e of r) evs.push(e);
+    expect(evs.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("pinned to alpha@work") });
+  });
+
+  test("secrets in the prompt are blocked outright and nothing is sent", async () => {
+    sensitive();
+    let sent = false;
+    script.current = async () => void (sent = true);
+    const r = await turn("deploy with AKIAIOSFODNN7EXAMPLE please", undefined, undefined, "hib/auto");
+    expect(r.events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("AWS-KEY") });
+    expect(sent).toBe(false);
+    expect(drivers.length).toBe(0);
+  });
+
+  test("reads must be approved, and marking a running session sensitive restarts it that way", async () => {
+    const first = await turn("hello", undefined, undefined, "alpha@work/big");
+    expect(drivers[0]!.started[0]!.askReads).toBe(false);
+    sensitive();
+    await turn("again", first.sid, undefined, "hib/auto");
+    expect(drivers.length).toBe(2);
+    expect(drivers[1]!.started[0]).toMatchObject({ askReads: true, resume: "native-1" });
+  });
+
+  test("every turn records what was sent and to which account", async () => {
+    sensitive();
+    const r = await turn("rename ProjectFalcon", undefined, undefined, "hib/auto");
+    expect(r.events.find((e) => e.type === "sent")).toMatchObject({ account: "alpha@work" }); // live viewers see it too
+    const sentEv = sessions.snapshot(r.sid).events.find((e: any) => e.type === "sent");
+    expect(sentEv).toMatchObject({ account: "alpha@work", model: "alpha@work/big" });
+    expect(sentEv.text).not.toContain("ProjectFalcon");
+  });
+
+  test("policy validation", () => {
+    engine.workspaces.register(root);
+    expect(() => engine.workspaces.setPolicy(root, { sensitive: true, account: "nope@x" })).toThrow("unknown account");
+    expect(() => engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@work", model: "alpha@main/big" })).toThrow("must be on alpha@work");
+    expect(() => engine.workspaces.setPolicy("/definitely/not", { sensitive: true, account: "alpha@work" })).toThrow("not a registered workspace");
+  });
+});
+
+test("egress shows the guard decision and one entry per action, with its final detail", async () => {
+  script.current = async (_t, _d, q) => {
+    q.push({ type: "tool_call", call: { id: "w1", name: "webSearch", kind: "web", title: "web search" } });
+    q.push({ type: "tool_call", call: { id: "w1", name: "webSearch", kind: "web", title: 'web search "aws example key"' } });
+    q.push({ type: "tool_result", id: "w1", ok: true });
+  };
+  const r = await turn("is ProjectFalcon's key public?");
+  const [t] = sessions.egress(r.sid);
+  expect(t!.guard).toContain("TERM×1");
+  expect(t!.actions).toEqual([{ kind: "web", title: 'web search "aws example key"', status: "done" }]);
 });

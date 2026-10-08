@@ -10,6 +10,7 @@ import type { Message, RunEvent } from "./providers/types";
 import { CLASSIFY_PROMPT, classify, parseClassifierReply } from "./router/classify";
 import { Router, resolveCandidate, type Candidate } from "./router/route";
 import { Usage } from "./usage";
+import { onPinnedAccount, pinnedModel, Workspaces } from "./workspace/registry";
 
 export interface ChatInput {
   conversationId?: string; // continue a saved conversation
@@ -85,6 +86,7 @@ export class Engine {
   readonly usage: Usage;
   readonly learner: Learner;
   readonly router: Router;
+  readonly workspaces: Workspaces;
   private approvals = new Map<string, Approval>();
   private approvalListeners = new Set<() => void>();
 
@@ -92,6 +94,7 @@ export class Engine {
     this.usage = new Usage(db, cfg);
     this.learner = new Learner(db);
     this.router = new Router(cfg, registry, this.usage, this.learner);
+    this.workspaces = new Workspaces(db, cfg);
   }
 
   // ---------- conversations ----------
@@ -222,17 +225,23 @@ export class Engine {
     const messages = [...history, ...input.messages];
 
     // classify
+    // Work inside a sensitive workspace goes to its one pinned account: no classifier call, failover, advisor or arena.
+    const sensitive = input.cwd ? this.workspaces.policyFor(input.cwd) : null;
+    if (sensitive && input.model && !input.model.startsWith("hib/") && !onPinnedAccount(input.model, sensitive.policy, this.cfg))
+      return yield { type: "error", message: `${sensitive.root} is sensitive and pinned to ${sensitive.policy.account}; ${input.model} is not allowed` };
     const forced = input.model?.startsWith("hib/") && input.model !== "hib/auto" ? input.model.slice(4) : undefined;
     if (forced && !this.cfg.routes[forced]) return yield { type: "error", message: `no route "${forced}"` };
-    const explicit = input.model && !forced && input.model !== "hib/auto" ? input.model : undefined;
+    let explicit = input.model && !forced && input.model !== "hib/auto" ? input.model : undefined;
     let { cls, confident, why } = classify(messages, input.mode ?? "chat", this.plugins.routes);
     if (forced) [cls, why] = [forced, `forced by ${input.model}`];
-    else if (!confident && !explicit) {
+    else if (!confident && !explicit && !sensitive) {
       const llm = await this.classifyWithModel(messages, signal);
       if (llm) [cls, why] = [llm, `${why}; classifier said ${llm}`];
     }
 
+    if (sensitive) explicit ??= pinnedModel(sensitive.policy, this.cfg, cls);
     const plan = await this.router.plan(cls, { explicit, mode: input.mode, cwd: input.cwd });
+    if (sensitive) plan.route = { ...plan.route, advisor: false };
     if (agent) plan.route = { ...plan.route, level: agent.level ?? plan.route.level, advisor: agent.advisor ?? plan.route.advisor };
     if (!plan.ordered.length) return yield { type: "error", message: `no usable model for ${cls}: ${plan.skipped.map((s) => `${s.id} (${s.why})`).join(", ")}` };
 

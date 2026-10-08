@@ -255,3 +255,38 @@ describe("agent mode", () => {
     await p;
   });
 });
+
+describe("sensitive workspaces (router)", () => {
+  async function sensitiveDir() {
+    const { mkdtempSync, realpathSync } = await import("node:fs");
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "hib-sens-")));
+    engine.workspaces.register(dir);
+    engine.workspaces.setPolicy(dir, { sensitive: true, account: "alpha@work" });
+    return dir;
+  }
+
+  test("pinned account only: no failover, advisor or arena", async () => {
+    const dir = await sensitiveDir();
+    beta.current = () => [{ type: "text", delta: "1. issue" }];
+    const r = await run({ messages: [{ role: "user", content: "implement a function that sums" }], model: "hib/code", cwd: dir, arena: true, persist: true });
+    expect(r.of("meta")[0]!.model).toBe("alpha@work/big");
+    expect(r.of("advisor")).toEqual([]);
+    expect(r.of("arena")).toEqual([]);
+    expect(new Set(sent.map((s) => `${s.provider}@${s.account}`))).toEqual(new Set(["alpha@work"]));
+  });
+
+  test("other accounts are refused before anything is sent", async () => {
+    const dir = await sensitiveDir();
+    const r = await run({ messages: [{ role: "user", content: "hi" }], model: "beta/fast", cwd: dir });
+    expect(r.of("error")[0]!.message).toContain("pinned to alpha@work");
+    expect(sent.length).toBe(0);
+  });
+
+  test("a rate-limited pinned account fails instead of spilling over", async () => {
+    const dir = await sensitiveDir();
+    alpha.current = () => [{ type: "rate_limited", message: "usage limit" }];
+    const r = await run({ messages: [{ role: "user", content: "hi" }], model: "hib/chat", cwd: dir });
+    expect(r.of("error").length).toBe(1);
+    expect(sent.every((s) => s.provider === "alpha" && s.account === "work")).toBe(true);
+  });
+});

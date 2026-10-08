@@ -12,6 +12,11 @@ const HELP = `hib — harness in a box
   hib chat [--resume [id]]    multi-model router chat in the terminal
   hib daemon status|stop      the shared background daemon (logs: ~/.hib/daemon.log)
   hib workspace list|forget [dir]   folders agents may work in
+  hib workspace sensitive --account claude@work [--model m] [dir]
+                              pin a folder to one account: no handoff/failover/advisor/arena,
+                              no browser terminal, secrets blocked, every read needs approval
+  hib workspace normal [dir]  lift that
+  hib workspace egress [session]    what left the machine in a session (default: latest here)
   hib ask "prompt" [-m model] one-shot answer on stdout
   hib conversations           list saved conversations
   hib usage                   quota per account
@@ -31,6 +36,7 @@ const { values, positionals } = parseArgs({
     port: { type: "string" },
     model: { type: "string", short: "m" },
     resume: { type: "boolean", short: "r" },
+    account: { type: "string" },
     help: { type: "boolean", short: "h" },
   },
 });
@@ -80,6 +86,8 @@ async function main() {
       } else if (sub === "stop") {
         if (!up) return console.log("daemon not running");
         await client.post("/hib/shutdown", {});
+        // Wait until it's really gone, so an immediate `hib` starts a fresh daemon instead of finding this one.
+        for (let i = 0; i < 50 && (await b.daemonUp(client)); i++) await Bun.sleep(100);
         console.log("daemon stopped");
       } else if (sub === "start") {
         const d = await b.ensureDaemon();
@@ -90,10 +98,45 @@ async function main() {
     case "workspace": {
       const b = await import("./boot");
       const { client } = await b.ensureDaemon();
-      if (rest[0] === "forget") {
-        await client.del(`/hib/workspaces?root=${encodeURIComponent(rest[1] ?? process.cwd())}`);
+      const sub = rest[0] ?? "list";
+      const dir = rest[1] ?? process.cwd();
+      if (sub === "forget") {
+        await client.del(`/hib/workspaces?root=${encodeURIComponent(dir)}`);
         console.log("forgotten");
-      } else for (const w of await client.get("/hib/workspaces")) console.log(`${new Date(w.added).toLocaleDateString()}  ${w.root}`);
+      } else if (sub === "sensitive") {
+        if (!values.account) {
+          const info = await client.get("/hib/info");
+          const accounts = [...new Set((info.models as string[]).filter((m) => /^(claude|codex)@/.test(m)).map((m) => m.split("/")[0]))];
+          throw new Error(`choose the one account this folder may use: --account ${accounts.join(" | ")}`);
+        }
+        const root = await b.registerWorkspace(client, dir);
+        await client.post("/hib/workspaces/policy", { root, policy: { account: values.account, model: values.model } });
+        console.log(`${root} is sensitive: only ${values.account} sees it; no handoff, failover, advisor, arena or browser terminal; secrets blocked; every read asks.`);
+        if (String(values.account).startsWith("codex@"))
+          console.log("note: Codex runs read-only commands like cat/ls/grep without asking, so reads can't be gated there. Prefer a Claude account for sensitive folders.");
+      } else if (sub === "normal") {
+        // Written straight to the database: the HTTP API refuses to lift a policy.
+        const { openDb } = await import("./db");
+        const { loadConfig } = await import("./config");
+        const { Workspaces } = await import("./workspace/registry");
+        const root = new Workspaces(openDb(hibHome()), loadConfig()).setPolicy(dir, null);
+        console.log(`${root} is a normal workspace again (running sessions switch on their next turn)`);
+      } else if (sub === "egress") {
+        const { eligible } = await import("./workspace/registry");
+        const here = eligible(process.cwd());
+        if (!here.ok) throw new Error(here.why);
+        const q = `root=${encodeURIComponent(here.root)}`;
+        const id = rest[1] ?? (await client.get(`/ws/sessions?${q}`))[0]?.id;
+        if (!id) throw new Error("no sessions in this folder");
+        for (const t of await client.get(`/ws/egress/${id}?${q}`)) {
+          console.log(`\n→ ${t.account} (${t.model})${t.handoff ? " + handoff transcript" : ""}`);
+          console.log(`  prompt: ${t.prompt.replace(/\s+/g, " ").slice(0, 200)}`);
+          if (t.guard) console.log(`  guard:  ${t.guard}`);
+          for (const a of t.actions) console.log(`  ${a.status.padEnd(9)} ${a.kind.padEnd(7)} ${a.title}`);
+        }
+      } else
+        for (const w of await client.get("/hib/workspaces"))
+          console.log(`${new Date(w.added).toLocaleDateString()}  ${w.root}${w.policy ? `  [sensitive → ${w.policy.account}]` : ""}`);
       return;
     }
     case "chat": {

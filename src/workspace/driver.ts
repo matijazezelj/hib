@@ -40,6 +40,7 @@ export interface StartOptions {
   account: Account;
   resume?: string; // native session/thread id
   system?: string;
+  askReads?: boolean; // sensitive workspaces: file reads need approval too
 }
 
 /** A long-lived agent CLI process for one workspace session. */

@@ -9,7 +9,6 @@ import { terminalSocket, type TermData } from "./workspace/terminal";
 import { WorkspaceSessions } from "./workspace/sessions";
 import { ClaudeDriver } from "./workspace/claude-driver";
 import { CodexDriver } from "./workspace/codex-driver";
-import { Workspaces } from "./workspace/registry";
 
 export function apiToken(home: string): string {
   const file = join(home, "token");
@@ -71,7 +70,7 @@ function openaiChunk(id: string, model: string, delta: Record<string, unknown>, 
 
 export function startServer(engine: Engine, opts: { port: number; token: string; onShutdown?: () => void }) {
   const { port, token } = opts;
-  const workspaces = new Workspaces(engine.db, engine.cfg);
+  const workspaces = engine.workspaces;
   const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
   const origins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`]);
 
@@ -124,7 +123,8 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
     idleTimeout: 255,
     websocket: terminalSocket,
     routes: {
-      "/ws/tree": ws(async (root) => json({ root, files: await listFiles(root), git: await git.status(root) })),
+      "/ws/tree": ws(async (root) => json({ root, files: await listFiles(root), git: await git.status(root), policy: workspaces.policy(root) })),
+      "/ws/egress/:id": ws((root, req) => (sessionIn(root, req.params.id!) ? json(sessions.egress(req.params.id!)) : json({ error: { message: "not found" } }, 404))),
       "/ws/file": ws((root, req) => json(readFile(root, q(req, "path")))),
       "/ws/git/status": ws(async (root) => json(await git.status(root))),
       "/ws/git/diff": ws(async (root, req) => json({ diff: await git.diff(root, q(req, "path")) })),
@@ -190,12 +190,22 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
         if (!authorized(req)) return new Response("unauthorized", { status: 401 });
         const root = workspaces.resolve(q(req, "root"));
         if (!root) return new Response("unknown workspace", { status: 404 });
+        if (workspaces.policy(root)) return new Response("the browser terminal is off in sensitive workspaces", { status: 403 });
         return server.upgrade(req, { data: { kind: "terminal", cwd: root } }) ? undefined : new Response("upgrade failed", { status: 400 });
       },
       "/hib/workspaces": {
         GET: guarded(() => json(workspaces.list())),
         POST: guarded(async (req) => json({ root: workspaces.register(String(((await req.json()) as any).root ?? "")) })),
         DELETE: guarded((req) => (workspaces.forget(q(req, "root")), json({ ok: true }))),
+      },
+      "/hib/workspaces/policy": {
+        POST: guarded(async (req) => {
+          const b: any = await req.json();
+          // Tightening works over HTTP; lifting a policy only from the CLI, so a token alone can't switch it off.
+          if (!b.policy) return json({ error: { message: "lift a sensitive policy with `hib workspace normal` in that folder" } }, 403);
+          const p = { sensitive: true as const, account: String(b.policy.account ?? ""), ...(b.policy.model ? { model: String(b.policy.model) } : {}) };
+          return json({ root: workspaces.setPolicy(String(b.root ?? ""), p) });
+        }),
       },
       "/hib/shutdown": {
         POST: guarded(() => {
@@ -338,6 +348,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           pluginWarnings: engine.plugins.warnings,
           agentDirs: engine.cfg.guard.agentDirs,
           workspaces: workspaces.list().map((w) => w.root),
+          policies: Object.fromEntries(workspaces.list().map((w) => [w.root, w.policy])),
         }),
       ),
     },

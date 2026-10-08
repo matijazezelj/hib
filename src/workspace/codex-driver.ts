@@ -7,6 +7,19 @@ import { Queue } from "./queue";
  * Codex via `codex app-server` (JSON-RPC over stdio). Commands and patches run in the workspace-write
  * sandbox with approvalPolicy "untrusted", so each one is sent to hib for approval.
  */
+// Items that are conversation, not actions.
+const QUIET_ITEMS = new Set(["userMessage", "agentMessage", "reasoning", "plan", "contextCompaction", "hookPrompt", "enteredReviewMode", "exitedReviewMode", "commandExecution", "fileChange", "mcpToolCall"]);
+
+export function describeOther(it: any): ToolCall {
+  if (it.type === "webSearch") {
+    const a = it.action ?? {};
+    const what = a.type === "openPage" ? `open ${a.url ?? ""}` : a.type === "findInPage" ? `find "${a.pattern ?? ""}" in ${a.url ?? ""}` : `search "${(a.queries ?? [a.query ?? it.query]).filter(Boolean).join('", "')}"`;
+    return { id: it.id, name: "webSearch", kind: "web", title: `web ${short(what)}` };
+  }
+  if (it.type === "imageView") return { id: it.id, name: "imageView", kind: "read", title: `View image ${it.path ?? ""}`, path: it.path };
+  return { id: it.id, name: it.type, kind: "other", title: `${it.type}${it.tool ? ` ${it.tool}` : it.name ? ` ${it.name}` : ""}` };
+}
+
 export class CodexDriver implements AgentDriver {
   readonly provider = "codex";
   private proc?: ReturnType<typeof Bun.spawn>;
@@ -125,6 +138,9 @@ export class CodexDriver implements AgentDriver {
           q?.push({ type: "tool_call", call });
         } else if (it.type === "mcpToolCall") {
           q?.push({ type: "tool_call", call: { id: it.id, name: `${it.server}.${it.tool}`, kind: "other", title: `${it.server}.${it.tool}` } });
+        } else if (it.id && !QUIET_ITEMS.has(it.type)) {
+          // Anything else the agent does (web search, subagents, image tools…) must still show up in the egress log.
+          q?.push({ type: "tool_call", call: describeOther(it) });
         }
         break;
       }
@@ -133,6 +149,11 @@ export class CodexDriver implements AgentDriver {
         if (it.type === "commandExecution") q?.push({ type: "tool_result", id: it.id, ok: it.status === "completed" && it.exitCode === 0, output: it.status === "declined" ? "declined" : it.aggregatedOutput });
         else if (it.type === "fileChange") q?.push({ type: "tool_result", id: it.id, ok: it.status === "completed", output: it.status === "declined" ? "declined" : undefined });
         else if (it.type === "mcpToolCall") q?.push({ type: "tool_result", id: it.id, ok: it.status === "completed" });
+        else if (it.id && !QUIET_ITEMS.has(it.type)) {
+          // webSearch only knows its query once completed; re-send the call so the log has it.
+          if (it.type === "webSearch") q?.push({ type: "tool_call", call: describeOther(it) });
+          q?.push({ type: "tool_result", id: it.id, ok: !it.status || it.status === "completed" });
+        }
         else if (it.type === "agentMessage" && it.phase === "commentary") q?.push({ type: "text", delta: "\n\n" });
         break;
       }

@@ -4,6 +4,8 @@ import type { AgentDriver, AgentEvent, Decision, StartOptions, ToolCall, ToolKin
 import { commandRuleKey, short } from "./driver";
 import { Queue } from "./queue";
 
+const SECRET_READS = ["~/.hib/**", "~/.claude/**", "~/.claude.json", "~/.claude-*/**", "~/.codex/**", "~/.ssh/**", "~/.aws/**", "~/.gnupg/**", "~/.config/gh/**"].map((p) => `Read(${p})`);
+
 const KIND: Record<string, ToolKind> = {
   Read: "read", Write: "edit", Edit: "edit", NotebookEdit: "edit", Bash: "command",
   Grep: "search", Glob: "search", WebFetch: "web", WebSearch: "web",
@@ -58,6 +60,15 @@ export class ClaudeDriver implements AgentDriver {
     ];
     if (opts.resume) args.push("--resume", opts.resume);
     if (opts.system) args.push("--append-system-prompt", opts.system);
+    // Agents never read hib's or the CLIs' credentials, whatever else is allowed.
+    const permissions: Record<string, string[]> = { deny: SECRET_READS };
+    if (opts.askReads) {
+      // Reads (and read-only Bash like `cat`) are normally auto-allowed; asking shows every file before its content leaves.
+      permissions.ask = ["Read", "Grep", "Glob", "NotebookRead", "Bash", "Task", "Agent", "WebFetch", "WebSearch"];
+      // Repo-committed .claude settings (allow rules, hooks) and MCP servers can't loosen a sensitive session.
+      args.push("--setting-sources", "user", "--strict-mcp-config");
+    }
+    args.push("--settings", JSON.stringify({ permissions }));
     this.proc = Bun.spawn(args, { cwd: opts.cwd, env: accountEnv(opts.account), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     this.readLoop();
   }
@@ -112,7 +123,15 @@ export class ClaudeDriver implements AgentDriver {
           const pid = `cl_${m.request_id}`;
           this.requests.set(pid, { requestId: m.request_id, input: r.input });
           const call = describe(r.tool_use_id ?? pid, r.tool_name, r.input, this.cwd);
-          const ruleKey = r.tool_name === "Bash" ? commandRuleKey("Bash", String(r.input?.command ?? "")) : KIND[r.tool_name] === "edit" ? "edit" : r.tool_name;
+          const ruleKey =
+            r.tool_name === "Bash"
+              ? commandRuleKey("Bash", String(r.input?.command ?? ""))
+              : KIND[r.tool_name] === "edit"
+                ? "edit"
+                : // "always" for a read covers that directory only
+                  r.tool_name === "Read" && call.path
+                  ? `read:${call.path.includes("/") ? call.path.slice(0, call.path.lastIndexOf("/")) : "."}`
+                  : r.tool_name;
           q.push({ type: "permission", id: pid, call, ruleKey, input: r.input });
         } else this.send({ type: "control_response", response: { subtype: "error", request_id: m.request_id, error: `hib does not handle ${m.request?.subtype}` } });
         break;

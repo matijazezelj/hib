@@ -40,6 +40,8 @@ function fold(items: Item[], e: any): Item[] {
     }
     case "permission_answer":
       return items.map((x) => (x.kind === "tool" && x.permission && x.permission.id === e.id ? { ...x, permission: { ...x.permission, answered: e.choice } } : x));
+    case "sent":
+      return [...items, { kind: "note", text: `→ sent to ${e.account}${e.handoff ? " (with handoff transcript)" : ""}` }];
     case "handoff":
       return [...items, { kind: "note", text: `handed over from ${e.from} to ${e.to} (new native session, transcript passed along)`, tone: "warn" }];
     case "guard":
@@ -53,6 +55,8 @@ function fold(items: Item[], e: any): Item[] {
   }
   return items;
 }
+
+const denied = (output?: string) => !!output && /^(declined|denied)$|denied this action/i.test(output.trim());
 
 // ---------- diff rendering ----------
 
@@ -147,7 +151,9 @@ function TerminalPane({ root }: { root: string }) {
 
 export function WorkspaceApp({ info, root }: { info: any; root: string }) {
   const q = `root=${encodeURIComponent(root)}`;
-  const [tab, setTab] = useState<"files" | "changes" | "sessions">("files");
+  const [tab, setTab] = useState<"files" | "changes" | "sessions" | "egress">("files");
+  const [policy, setPolicy] = useState<{ account: string; model?: string } | null>(null);
+  const [egress, setEgress] = useState<any[]>([]);
   const [files, setFiles] = useState<string[]>([]);
   const [gitState, setGit] = useState<any>(null);
   const [open, setOpen] = useState<Set<string>>(new Set());
@@ -165,7 +171,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
   const logRef = useRef<HTMLDivElement>(null);
   const sidRef = useRef<string | undefined>(undefined);
 
-  const agentModels = (info.models as string[]).filter((m) => /^(claude|codex)@/.test(m));
+  const agentModels = (info.models as string[]).filter((m) => /^(claude|codex)@/.test(m) && (!policy || m.startsWith(policy.account + "/")));
   const changed = useMemo(() => new Map<string, string>((gitState?.files ?? []).map((f: any) => [f.path, f.untracked ? "U" : (f.worktree.trim() || f.index).trim()])), [gitState]);
   const tree = useMemo(() => buildTree(files), [files]);
 
@@ -174,7 +180,9 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     if (t) {
       setFiles(t.files);
       setGit(t.git);
+      setPolicy(t.policy);
     }
+    if (sidRef.current) setEgress(await api.get(`/ws/egress/${sidRef.current}?${q}`).catch(() => []));
     setSessions(await api.get(`/ws/sessions?${q}`).catch(() => []));
   }
   useEffect(() => {
@@ -219,6 +227,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     }
     if (snap.row?.model) setModel(snap.row.model);
     setBusy(snap.running);
+    api.get(`/ws/egress/${id}?${q}`).then(setEgress).catch(() => setEgress([]));
     let after = quiet ? 0 : snap.seq;
     (async () => {
       while (!ctl.signal.aborted) {
@@ -299,17 +308,22 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
         <b>hib</b>
         <a className="muted" href="/" title={root}>{root.split("/").slice(-2).join("/")}</a>
         {gitState?.branch && <span className="chip">{gitState.branch.split("...")[0]}</span>}
+        {policy && (
+          <span className="chip warn" title="Only this account sees this folder. No handoff, failover, advisor, arena or browser terminal; secrets are blocked; every read asks.">
+            sensitive → {policy.account}
+          </span>
+        )}
         <span style={{ flex: 1 }} />
         <select value={model} onChange={(e) => setModel(e.target.value)} title="Switching model mid-session hands the session over">
-          <option value="hib/auto">auto (code route)</option>
+          <option value="hib/auto">{policy ? `auto (pinned to ${policy.account})` : "auto (code route)"}</option>
           {agentModels.map((m) => <option key={m}>{m}</option>)}
         </select>
-        <button onClick={() => setTerm((t) => !t)}>{term ? "Hide terminal" : "Terminal"}</button>
+        {!policy && <button onClick={() => setTerm((t) => !t)}>{term ? "Hide terminal" : "Terminal"}</button>}
       </header>
 
       <aside className="ws-side">
         <div className="tabs">
-          {(["files", "changes", "sessions"] as const).map((t) => (
+          {(["files", "changes", "sessions", "egress"] as const).map((t) => (
             <button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>
               {t}{t === "changes" && changed.size ? ` (${changed.size})` : ""}
             </button>
@@ -337,6 +351,25 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
               </div>
             )}
             {gitState && gitState.files.length === 0 && <div className="note">working tree clean</div>}
+          </div>
+        )}
+        {tab === "egress" && (
+          <div className="egress">
+            {!sessionId && <div className="note">Open a session to see what it sent, and where.</div>}
+            {sessionId && egress.length === 0 && <div className="note">Nothing sent yet.</div>}
+            {egress.map((t, i) => (
+              <div key={i} className="egress-turn">
+                <div><b>→ {t.account}</b> <span className="muted">{t.model.split("/").pop()}{t.handoff ? " · handoff" : ""}</span></div>
+                <div className="muted" title={t.prompt}>{t.prompt.slice(0, 140)}</div>
+                {t.guard && <div className="egress-guard">guard: {t.guard}</div>}
+                {t.actions.map((a: any, j: number) => (
+                  <div key={j} className={`egress-act ${a.status}`}>
+                    <span className={`kind ${a.kind}`}>{a.kind}</span> {a.title}
+                  </div>
+                ))}
+              </div>
+            ))}
+            <div className="note">File contents the agent reads and command output also go to that account.</div>
           </div>
         )}
         {tab === "sessions" && (
@@ -382,7 +415,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
                 <div className="tool-head" onClick={() => c.path && openFile(c.path)}>
                   <span className={`kind ${c.kind}`}>{c.kind}</span>
                   <span className="tool-title">{c.title}</span>
-                  {it.result && <span className={it.result.ok ? "ok" : "bad"}>{it.result.ok ? "✓" : it.result.output === "declined" ? "denied" : "✗"}</span>}
+                  {it.result && <span className={it.result.ok ? "ok" : "bad"}>{it.result.ok ? "✓" : denied(it.result.output) ? "denied" : "✗"}</span>}
                   {it.permission?.answered && !it.result && <span className="muted">{it.permission.answered}</span>}
                 </div>
                 {c.diff && <DiffView diff={c.diff} />}
@@ -394,7 +427,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
                     <button onClick={() => answer(it.permission!.id, "deny")}>Deny</button>
                   </div>
                 )}
-                {it.result?.output && it.result.output !== "declined" && c.kind !== "edit" && (
+                {it.result?.output && !denied(it.result.output) && c.kind !== "edit" && (
                   <details><summary className="muted">output</summary><pre className="out">{it.result.output}</pre></details>
                 )}
               </div>
@@ -444,7 +477,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
         </section>
       )}
 
-      {term && (
+      {term && !policy && (
         <section className="ws-term">
           <TerminalPane root={root} />
         </section>
