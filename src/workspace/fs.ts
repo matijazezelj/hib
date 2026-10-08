@@ -31,7 +31,7 @@ async function run(cmd: string[], cwd: string): Promise<{ out: string; code: num
   return { out, code: await p.exited };
 }
 
-export async function isGitRepo(root: string): Promise<boolean> {
+async function isGitRepo(root: string): Promise<boolean> {
   return (await run(["git", "rev-parse", "--is-inside-work-tree"], root)).code === 0;
 }
 

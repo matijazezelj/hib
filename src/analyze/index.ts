@@ -50,7 +50,7 @@ function profileText(p: Profile): string {
 }
 
 /** The result as it would be sent for interpretation: compact JSON, capped. */
-export function resultText(result: unknown, max = 6000): string {
+function resultText(result: unknown, max = 6000): string {
   const s = JSON.stringify(result, null, 1) ?? "null";
   return s.length > max ? s.slice(0, max) + `\n… (${s.length - max} more characters not sent)` : s;
 }

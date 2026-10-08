@@ -3,7 +3,7 @@ import type { Finding } from "./detectors";
 
 const NER_CATEGORIES = new Set(["PERSON", "ORG", "PLACE", "ADDRESS"]);
 
-export type Action = "redact" | "ask";
+type Action = "redact" | "ask";
 
 export interface Decision {
   action: Action;

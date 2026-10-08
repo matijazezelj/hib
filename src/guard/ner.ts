@@ -64,7 +64,7 @@ export function isLowerProse(text: string): boolean {
  * Lowercase stretches inside a segment, judged per field/clause: a CSV row can carry "SMB" in one column and
  * "met luka novak in pula" in its notes; the notes still need the title-cased pass.
  */
-export function lowercasePieces(seg: Segment): Segment[] {
+function lowercasePieces(seg: Segment): Segment[] {
   const out: Segment[] = [];
   // Any clause with a few lowercase words: "met luka vuković at the Graz conference" has a capital, and a name.
   for (const m of seg.text.matchAll(/[^",;|\t()]+/g)) if ((m[0].match(/(?<![\p{L}\p{N}])\p{Ll}{2,}/gu) ?? []).length >= 2) out.push({ start: seg.start + m.index!, text: m[0] });

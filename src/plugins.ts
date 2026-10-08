@@ -5,10 +5,10 @@ import type { Level } from "./guard/detectors";
 import type { Provider } from "./providers/types";
 
 export interface Skill { name: string; description?: string; template: string; model?: string; mode?: Mode; plugin: string }
-export interface Agent { name: string; description?: string; system: string; model?: string; route?: string; mode?: Mode; level?: Level; advisor?: boolean; plugin: string }
-export interface RoutePlugin { name: string; route: Route; keywords: string[]; plugin: string }
-export interface GuardPattern { category: string; regex: string; flags?: string }
-export interface AdvisorChecklist { classes: string[]; text: string; plugin: string }
+interface Agent { name: string; description?: string; system: string; model?: string; route?: string; mode?: Mode; level?: Level; advisor?: boolean; plugin: string }
+interface RoutePlugin { name: string; route: Route; keywords: string[]; plugin: string }
+interface GuardPattern { category: string; regex: string; flags?: string }
+interface AdvisorChecklist { classes: string[]; text: string; plugin: string }
 
 export interface Plugins {
   skills: Map<string, Skill>;
@@ -35,7 +35,7 @@ const CODE_FILE = /\.provider\.(ts|js)$/;
 export const pluginsDir = (home: string) => join(home, "plugins");
 const lockFile = (home: string) => join(home, "plugins.json");
 
-export function readLock(home: string): Lock {
+function readLock(home: string): Lock {
   try {
     return JSON.parse(readFileSync(lockFile(home), "utf8"));
   } catch {
@@ -46,7 +46,7 @@ function writeLock(home: string, lock: Lock) {
   writeFileSync(lockFile(home), JSON.stringify(lock, null, 2), { mode: 0o600 });
 }
 
-export function parseFrontmatter(text: string): { meta: Record<string, any>; body: string } {
+function parseFrontmatter(text: string): { meta: Record<string, any>; body: string } {
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(text);
   if (!m) return { meta: {}, body: text };
   return { meta: (Bun.YAML.parse(m[1]!) as any) ?? {}, body: m[2]!.trim() };
@@ -64,7 +64,7 @@ function walk(dir: string, out: string[] = []): string[] {
 
 const isMd = (p: string) => p.endsWith(".md") && !/^(readme|license|changelog|contributing)\.md$/i.test(basename(p));
 
-export function codeFiles(dir: string): string[] {
+function codeFiles(dir: string): string[] {
   return walk(dir).filter((p) => CODE_FILE.test(p)).map((p) => relative(dir, p));
 }
 
@@ -174,7 +174,7 @@ async function sh(cmd: string[], cwd?: string): Promise<string> {
 
 const isGit = (s: string) => /^(git:\/\/|file:\/\/|git@|ssh:\/\/|https?:\/\/.*\.git$|https:\/\/(github|gitlab|codeberg)\.\w+\/[^/]+\/[^/]+\/?$)/.test(s);
 
-export function nameFor(source: string): string {
+function nameFor(source: string): string {
   return basename(source.replace(/\/$/, "")).replace(/\.git$/, "").replace(/\.md$/, "").replace(/[^\w.-]/g, "-");
 }
 

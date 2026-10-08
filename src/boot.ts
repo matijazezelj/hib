@@ -10,7 +10,7 @@ import { Registry } from "./providers/registry";
 import { apiToken, startServer } from "./server";
 import { HibClient } from "./client";
 
-export async function boot(home = hibHome()) {
+async function boot(home = hibHome()) {
   process.umask(0o077); // db, wal, scratch dirs: owner-only
   const plugins = await loadPlugins(home);
   const cfg = applyPlugins(loadConfig(home), plugins);

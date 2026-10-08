@@ -51,7 +51,7 @@ export function isCommand(line: string): boolean {
 }
 
 /** Longest common prefix of the suggestions' inserts, used for Tab when several match. */
-export function commonPrefix(s: Suggestion[]): string {
+function commonPrefix(s: Suggestion[]): string {
   if (!s.length) return "";
   let p = s[0]!.insert;
   for (const x of s.slice(1)) while (!x.insert.startsWith(p)) p = p.slice(0, -1);

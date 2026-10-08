@@ -64,7 +64,7 @@ function sampleGamma(k: number, rand: () => number): number {
   }
 }
 
-export function sampleBeta(a: number, b: number, rand = Math.random): number {
+function sampleBeta(a: number, b: number, rand = Math.random): number {
   const x = sampleGamma(a, rand);
   return x / (x + sampleGamma(b, rand));
 }

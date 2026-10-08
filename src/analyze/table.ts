@@ -2,14 +2,14 @@ import { readFileSync, statSync } from "node:fs";
 import { basename, extname } from "node:path";
 
 export type Cell = string | number | boolean | null;
-export type ColType = "integer" | "number" | "boolean" | "date" | "string";
+type ColType = "integer" | "number" | "boolean" | "date" | "string";
 
 export interface Table {
   columns: string[];
   rows: Record<string, Cell>[];
 }
 
-export interface ColumnProfile {
+interface ColumnProfile {
   name: string;
   type: ColType;
   nulls: number;
@@ -125,7 +125,7 @@ export function loadTable(path: string): Table {
 const IDENTIFYING_NAME = /user|login|name|e-?mail|mail|phone|mobile|tel|\bip\b|ip_?addr|address|addr|street|zip|postal|ssn|oib|jmbg|iban|account|card|passport|birth|dob|token|password|secret|host|device|mac_?addr|uuid|guid|person|employee|customer|client|owner/i;
 const IDENTIFYING_VALUE = /@[\w-]+\.\w|^\d{1,3}(\.\d{1,3}){3}$|^\+?\d[\d\s()-]{7,}$/;
 
-export function columnType(rows: Record<string, Cell>[], col: string): ColType {
+function columnType(rows: Record<string, Cell>[], col: string): ColType {
   const v = rows.map((r) => r[col]).find((x) => x !== null && x !== undefined);
   if (typeof v === "number") return rows.every((r) => r[col] === null || Number.isInteger(r[col])) ? "integer" : "number";
   if (typeof v === "boolean") return "boolean";

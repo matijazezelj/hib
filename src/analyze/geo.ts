@@ -1,6 +1,6 @@
 // Local gazetteer for analyses: country and city coordinates from GeoNames (CC-BY 4.0), so code running in the
 // sandbox can reason about distance (e.g. impossible travel) without any lookup leaving the machine.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const CITIES_URL = "https://download.geonames.org/export/dump/cities15000.zip";
@@ -15,10 +15,6 @@ export interface GeoData {
 
 export const geoFile = (home: string) => join(home, "geo", "geo.json");
 export const geoInstalled = (home: string) => existsSync(geoFile(home));
-
-export function loadGeo(home: string): GeoData | null {
-  return geoInstalled(home) ? JSON.parse(readFileSync(geoFile(home), "utf8")) : null;
-}
 
 /** Parses GeoNames' cities15000.txt and countryInfo.txt into the compact form the sandbox gets. */
 export function buildGeo(citiesTsv: string, countryInfo: string): GeoData {

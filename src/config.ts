@@ -5,7 +5,7 @@ import type { Level } from "./guard/detectors";
 
 export type TaskClass = "chat" | "code" | "review" | "long" | (string & {}); // plugins add more
 export type Mode = "chat" | "agent";
-export type Tier = "fast" | "balanced" | "strong";
+type Tier = "fast" | "balanced" | "strong";
 
 export interface Route {
   candidates: string[];
@@ -123,7 +123,7 @@ ner = false                     # local name/place/company detection; run "hib g
 nerIgnore = []                  # words never treated as names (product or tech names)
 `;
 
-export function expandHome(p: string): string {
+function expandHome(p: string): string {
   return p.startsWith("~") ? join(homedir(), p.slice(1)) : p;
 }
 

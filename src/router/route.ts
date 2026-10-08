@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { parseModelId, type Account, type Config, type Route, type TaskClass, type Tier } from "../config";
+import { parseModelId, type Account, type Config, type Route, type TaskClass } from "../config";
 import type { Learner } from "../learn";
 import type { Registry } from "../providers/registry";
 import type { Usage } from "../usage";
@@ -24,10 +24,6 @@ export function resolveCandidate(id: string, cfg: Config): Candidate | null {
   const account = cfg.accounts.find((a) => a.provider === p.provider && a.name === p.account);
   if (!account) return null;
   return { id: `${p.provider}@${p.account}/${p.model}`, provider: p.provider, account, model: p.model };
-}
-
-export function tierOf(c: Candidate, cfg: Config): Tier | undefined {
-  return cfg.models[c.provider]?.[c.model];
 }
 
 /** In agent mode, a dir pinned to an account forces that account (e.g. work repos -> work login). */

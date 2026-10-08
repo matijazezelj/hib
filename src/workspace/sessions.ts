@@ -1,4 +1,4 @@
-import type { Account, Config } from "../config";
+import type { Config } from "../config";
 import type { Engine } from "../engine";
 import { inspect, obfuscateText, StreamRestorer, tokenNote, Vault } from "../guard";
 import type { VaultState } from "../guard/vault";
@@ -568,5 +568,3 @@ export class WorkspaceSessions {
     this.live.clear();
   }
 }
-
-export type { Account };

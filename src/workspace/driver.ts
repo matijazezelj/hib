@@ -2,7 +2,7 @@ import type { Account } from "../config";
 
 export type ToolKind = "read" | "edit" | "command" | "search" | "web" | "other";
 
-export interface Diff {
+interface Diff {
   path: string;
   unified?: string; // unified diff when the CLI provides one
   before?: string; // otherwise old/new text (Edit) or new content (Write)

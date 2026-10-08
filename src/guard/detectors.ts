@@ -1,7 +1,7 @@
 // Ported from ../sib/analysis/obfuscator.py (TruffleHog-derived patterns), adapted for code-heavy prompts.
 
 export type Level = "minimal" | "standard" | "paranoid";
-export type Kind = "secret" | "pii" | "infra" | "term";
+type Kind = "secret" | "pii" | "infra" | "term";
 
 export interface Finding {
   start: number;
@@ -121,7 +121,7 @@ const PARANOID: Detector[] = [
   { category: "PATH", kind: "pii", path: true, re: /(?:~|\/(?:Users|home|var|opt|srv|mnt|Volumes))\/[\w.@/-]+/g },
 ];
 
-export function entropy(s: string): number {
+function entropy(s: string): number {
   const counts = new Map<string, number>();
   for (const c of s) counts.set(c, (counts.get(c) ?? 0) + 1);
   let h = 0;
