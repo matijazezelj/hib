@@ -372,6 +372,9 @@ export class WorkspaceSessions {
     const base = this.sandbox(this.cfg);
     // Sensitive folders: commands can't read data files (enforced by the OS sandbox). Claude's Read tool runs outside it,
     // so it's hib's permission handling, not the sandbox, that gives Read a pseudonymised copy.
+    // Without the sandbox nothing but the up-front command check and your approval would keep a script from a data
+    // file, so a sensitive session doesn't start at all.
+    if (askReads && !base) throw new Error(`hib won't start a sensitive session without the OS sandbox that keeps commands away from data files: ${sandboxProblem() ?? "no OS sandbox is available"}`);
     let sandbox = base;
     if (base && askReads) {
       try {

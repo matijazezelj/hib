@@ -695,3 +695,13 @@ describe("sensitive data denial", () => {
     }
   });
 });
+
+test("a sensitive session refuses to start without the OS sandbox", async () => {
+  sandbox = undefined;
+  engine.workspaces.register(root);
+  engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@work" });
+  const r = await turn("look at users.csv", undefined, () => "allow", "hib/auto");
+  expect(r.events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("without the OS sandbox") });
+  expect(r.events.some((e) => e.type === "sent")).toBe(false);
+  expect(drivers.flatMap((d) => d.started)).toHaveLength(0);
+});

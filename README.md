@@ -93,6 +93,7 @@ A sensitive folder is seen by exactly one vendor account, and it must be a Claud
   - The agent's commands can't read data files; the OS sandbox enforces it.
     - On macOS the sandbox denies data files by pattern (`*.csv`, `*.tsv`, `*.xlsx`, `*.parquet`, `*.sqlite`… and every `*.json` except build config like `package.json` and `tsconfig*.json`). That covers any depth, any case, files created later, symlinks, hard links, renames and copies.
     - On Linux it denies the data files found when the session starts. A folder hib can't list completely is refused rather than half protected.
+    - Without a working OS sandbox (Linux without bubblewrap, or a kernel that blocks it), a sensitive session doesn't start, and hib says why.
     - Commands that obviously try (`head`/`cat`/`awk` on a data file, inline `python -c`/`node -e`) are refused up front, with a message pointing the agent to Read.
     - `bun test/manual/sandbox-probe.ts` rechecks this against your installed Claude Code; run it after an upgrade.
   - Claude's Read and Grep tools aren't in that sandbox. hib's permission handling is what makes Read return a pseudonymised copy, so that part relies on Claude sending every file read through hib.
