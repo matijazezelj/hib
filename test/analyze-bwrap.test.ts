@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { bwrapArgv, runAnalysis } from "../src/analyze/sandbox";
 
 const pairs = (a: string[], flag: string) => a.flatMap((x, i) => (x === flag ? [`${a[i + 1]} ${a[i + 2]}`] : []));
@@ -21,15 +23,24 @@ test("bwrapArgv starts from an empty root and mounts only system libraries, bun 
 const linux = process.platform === "linux" && !!Bun.which("bwrap");
 
 test.skipIf(!linux)("under bubblewrap the runner can't see host files, sockets or the network", async () => {
+  // bun and the runner may live under $HOME (CI: ~/.bun/bin, ~/work/…), so bwrap creates their parent folders as empty
+  // mount points. What matters is that nothing else is there: home lists only the way to those mounts, and of the repo
+  // only src/analyze is visible.
+  const repo = join(import.meta.dir, "..");
   const probe = `const fs = require("node:fs");
-    const seen = ["/etc/passwd", "/run/user", "/var", "/home", ${JSON.stringify(homedir())}].filter((p) => fs.existsSync(p));
+    const seen = ["/etc/passwd", "/etc/hostname", "/run/user", "/var", "/srv", "/opt", ${JSON.stringify(join(repo, "package.json"))}, ${JSON.stringify(join(repo, "src/workspace"))}].filter((p) => fs.existsSync(p));
+    const home = fs.existsSync(${JSON.stringify(homedir())}) ? fs.readdirSync(${JSON.stringify(homedir())}) : [];
     const tmp = fs.readdirSync("/tmp");
     let net = "blocked"; try { await fetch("http://1.1.1.1", { signal: AbortSignal.timeout(2000) }); net = "open"; } catch {}
-    console.log(JSON.stringify({ seen, tmp, net }));`;
+    console.log(JSON.stringify({ seen, home, tmp, net }));`;
   const p = Bun.spawn(bwrapArgv([process.execPath, "-e", probe]), { stdout: "pipe", stderr: "pipe", env: { PATH: "/usr/bin:/bin" } });
   const out = await new Response(p.stdout).text();
   expect(await p.exited, await new Response(p.stderr).text()).toBe(0);
-  expect(JSON.parse(out)).toEqual({ seen: [], tmp: [], net: "blocked" });
+  const r = JSON.parse(out);
+  expect({ seen: r.seen, tmp: r.tmp, net: r.net }).toEqual({ seen: [], tmp: [], net: "blocked" });
+  // Only first path segments that lead to a mount (e.g. ".bun", "work"); never dotfiles like .ssh or .bashrc.
+  const leads = [dirname(realpathSync(process.execPath)), repo].filter((p) => p.startsWith(homedir() + "/")).map((p) => p.slice(homedir().length + 1).split("/")[0]);
+  for (const n of r.home) expect(leads).toContain(n);
 });
 
 test.skipIf(!linux)("analysis runs under bubblewrap on Linux", async () => {
