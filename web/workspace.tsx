@@ -14,7 +14,7 @@ type Item =
   | { kind: "user"; text: string; model?: string }
   | { kind: "assistant"; text: string }
   | { kind: "tool"; call: any; result?: { ok: boolean; output?: string }; permission?: { id: string; ruleKey: string; answered?: string }; pseudo?: string[] }
-  | { kind: "egress"; account?: string; handoff?: boolean; findings?: Record<string, number>; action?: string; summary?: string }
+  | { kind: "egress"; account?: string; handoff?: boolean; progress?: boolean; findings?: Record<string, number>; action?: string; summary?: string }
   | { kind: "note"; text: string; tone?: "warn" | "bad" | "ok" }
   | { kind: "usage"; usage: any[] }
   | { kind: "advice"; model: string; question: string; advice: string; ok: boolean; guard: string }
@@ -58,9 +58,9 @@ function fold(items: Item[], e: any): Item[] {
       // The guard row (live) comes first, possibly followed by an approval card; the send fills in where it went.
       for (let i = items.length - 1; i >= 0 && items[i]!.kind !== "user"; i--) {
         const x = items[i]!;
-        if (x.kind === "egress" && !x.account) return items.map((y, j) => (j === i ? { ...x, account: e.account, handoff: e.handoff } : y));
+        if (x.kind === "egress" && !x.account) return items.map((y, j) => (j === i ? { ...x, account: e.account, handoff: e.handoff, progress: e.progress } : y));
       }
-      return [...items, { kind: "egress", account: e.account, handoff: e.handoff }];
+      return [...items, { kind: "egress", account: e.account, handoff: e.handoff, progress: e.progress }];
     }
     case "guard_decision": {
       const i = items.map((x) => x.kind).lastIndexOf("egress");
@@ -528,6 +528,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
                   <Icon name="shield-check" size={13} />
                   <span>Sent to <b>{it.account ?? "…"}</b></span>
                   {it.handoff && <span className="chip warn">with handoff transcript</span>}
+                  {it.progress && <span className="chip" title="The folder's PROGRESS.md went with this message, through the guard">with PROGRESS.md</span>}
                   {f.length > 0 ? f.map(([k, v]) => <span key={k} className="chip guard mono">{k} ×{v}</span>) : it.summary ? <span className="muted">{it.summary}</span> : <span className="muted">nothing to redact</span>}
                 </div>
               );

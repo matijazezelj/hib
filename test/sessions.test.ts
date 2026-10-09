@@ -511,3 +511,40 @@ describe("advisor tool", () => {
     expect(drivers[0]!.started[0]!.mcp).toBeUndefined();
   });
 });
+
+describe("PROGRESS.md", () => {
+  test("a fresh session starts from it, guarded; resumed turns don't resend it", async () => {
+    await Bun.write(join(root, "PROGRESS.md"), "Done: parser.\nNext: wire ProjectFalcon export.\n");
+    const seen: string[] = [];
+    script.current = async (text) => void seen.push(text);
+    const first = await turn("continue");
+    await turn("and then?", first.sid);
+    expect(seen[0]).toContain('<progress file="PROGRESS.md">');
+    expect(seen[0]).toContain("Next: wire");
+    expect(seen[0]).toContain("update PROGRESS.md");
+    expect(seen[0]).not.toContain("ProjectFalcon");
+    expect(seen[1]).not.toContain("<progress");
+    const sent = sessions.history(first.sid).filter((e) => e.type === "sent");
+    expect(sent.map((e: any) => e.progress)).toEqual([true, false]);
+  });
+
+  test("sensitive folders only get a pointer, so reading it still asks", async () => {
+    engine.workspaces.register(root);
+    engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@main" });
+    await Bun.write(join(root, "PROGRESS.md"), "Next: look at the March logins.\n");
+    let seen = "";
+    script.current = async (text) => void (seen = text);
+    await turn("continue", undefined, undefined, "hib/auto");
+    expect(seen).toContain("Read it before starting");
+    expect(seen).not.toContain("March logins");
+  });
+
+  test("the handoff transcript goes through the guard too", async () => {
+    const seen: string[] = [];
+    script.current = async (text) => void seen.push(text);
+    const first = await turn("rename ProjectFalcon in a.ts");
+    await turn("go on", first.sid, undefined, "alpha@work/big");
+    expect(seen[1]).toContain("<transcript>");
+    expect(seen[1]).not.toContain("ProjectFalcon");
+  });
+});

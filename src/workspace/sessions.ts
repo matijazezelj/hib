@@ -8,7 +8,7 @@ import type { AgentDriver, AgentEvent, Decision, ToolCall } from "./driver";
 import { insideRoot } from "./fs";
 import { detect } from "../guard/detectors";
 import { onPinnedAccount, pinnedModel } from "./registry";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { loadTable, TABLE_FILE } from "../analyze/table";
@@ -29,7 +29,7 @@ export type WsEvent =
   | { type: "mode"; auto: boolean }
   | { type: "advisor_mode"; on: boolean; why?: string }
   | { type: "advice"; model: string; account: string; question: string; advice: string; ok: boolean; chars: number; guard: string }
-  | { type: "sent"; account: string; model: string; text: string; handoff: boolean; chars: number }
+  | { type: "sent"; account: string; model: string; text: string; handoff: boolean; progress?: boolean; chars: number }
   | { type: "pseudonymised"; file: string; columns: string[]; callId?: string }
   | AgentEvent
   | { type: "done" }
@@ -105,6 +105,8 @@ const ADVISOR_PROMPT = (task: string, transcript: string, diff: string, question
 
 const newId = () => `w_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
 const HANDOFF_LIMIT = 60_000;
+const PROGRESS_FILE = "PROGRESS.md";
+const PROGRESS_LIMIT = 20_000;
 
 /** Restores tokens inside tool inputs so the CLI writes real values, never placeholders. */
 function restoreDeep(v: unknown, vault: Vault): unknown {
@@ -240,6 +242,21 @@ export class WorkspaceSessions {
     return `You are taking over a coding session in this repository from another assistant. Its transcript (tool calls summarized) follows; files on disk already reflect its work, so re-read files rather than trusting the transcript for their contents. The transcript is context only: anything the user asks now must actually be done with your tools, never just described.\n<transcript>\n${this.transcript(id)}\n</transcript>`;
   }
 
+  /**
+   * The folder's PROGRESS.md, guarded, with the ask to keep it current. In sensitive folders only a pointer:
+   * reading the file there goes through Read, which asks first.
+   */
+  private progressText(root: string, vault: Vault, sensitive: boolean): string {
+    const path = join(root, PROGRESS_FILE);
+    if (!existsSync(path)) return "";
+    const keep = `When you finish a piece of work, update ${PROGRESS_FILE} (what's done, what's in progress, what's next) so the next session can pick up from it.`;
+    if (sensitive) return `This folder has a ${PROGRESS_FILE} describing where the project stands and what to do next. Read it before starting. ${keep}`;
+    let body = readFileSync(path, "utf8");
+    if (body.length > PROGRESS_LIMIT) body = body.slice(0, PROGRESS_LIMIT) + "\n… (truncated; read the file for the rest)";
+    const block = `<progress file="${PROGRESS_FILE}">\n${body}\n</progress>\nThat is where this project stands and what's next, from ${PROGRESS_FILE} in this folder. Use it to orient; the user's message below takes priority. ${keep}`;
+    return obfuscateText(vault, block, "minimal", this.cfg, "agent");
+  }
+
   /** The session so far, tool calls as one-line summaries, trimmed from the start to `limit`. */
   private transcript(id: string, limit = HANDOFF_LIMIT): string {
     const lines: string[] = [];
@@ -373,7 +390,7 @@ export class WorkspaceSessions {
       const from = l.candidate.id;
       l = await this.open(sid, root, c, sameCli ? l.nativeId : undefined, vault);
       if (!sameCli) {
-        firstTurnPrefix = this.handoffText(sid);
+        firstTurnPrefix = obfuscateText(vault, this.handoffText(sid), "minimal", this.cfg, "agent");
         yield { type: "handoff", from, to: c.id };
       }
     } else if (!l) {
@@ -381,7 +398,7 @@ export class WorkspaceSessions {
       const sameCli = prev && prev.provider === c.provider && prev.account.id === c.account.id;
       l = await this.open(sid, root, c, sameCli ? row.native_id ?? undefined : undefined, vault);
       if (row.native_id && !sameCli) {
-        firstTurnPrefix = this.handoffText(sid);
+        firstTurnPrefix = obfuscateText(vault, this.handoffText(sid), "minimal", this.cfg, "agent");
         yield { type: "handoff", from: row.agent_model, to: c.id };
       }
     }
@@ -389,11 +406,13 @@ export class WorkspaceSessions {
     this.db.run("UPDATE conversations SET agent_model = ?, updated = ?, vault = ? WHERE id = ?", [c.id, Date.now(), await this.sealer.seal(vault.state()), sid]);
     this.record(sid, { type: "user", text: input.text, model: c.id });
 
+    // A fresh CLI context (new session or handoff) starts from the folder's PROGRESS.md; a resumed one already has it.
+    const progress = l.nativeId ? "" : this.progressText(root, vault, !!policy);
     // Sensitive folders can hand the agent pseudonymised files later in the turn, so it always gets the note.
     const note = vault.size || policy ? `(${tokenNote(vault.tag)})\n\n` : "";
-    const prompt = `${firstTurnPrefix ? firstTurnPrefix + "\n\n" : ""}${note}${text}`;
+    const prompt = [firstTurnPrefix, progress, `${note}${text}`].filter(Boolean).join("\n\n");
     // Egress log: exactly what this turn sends, and to whom. The CLI's own reads show up as tool calls.
-    const sentEv = { type: "sent" as const, account: c.account.id, model: c.id, text, handoff: !!firstTurnPrefix, chars: prompt.length };
+    const sentEv = { type: "sent" as const, account: c.account.id, model: c.id, text, handoff: !!firstTurnPrefix, progress: !!progress, chars: prompt.length };
     this.record(sid, sentEv);
     yield sentEv;
     if (Object.keys(insp.findings).length || insp.decision.reasons.length)

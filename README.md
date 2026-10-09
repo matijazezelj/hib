@@ -55,6 +55,7 @@ Any OpenAI client can use the router: set `OPENAI_BASE_URL=http://127.0.0.1:4141
 - **Advisor** (`/advisor`, or the **Advisor** chip; off by default, never in sensitive folders). The agent gets an `advisor` tool, served by hib over MCP. It can consult a model from the other provider (Claude asks Codex, Codex asks Claude) before it starts, when stuck and before it says it's done.
   - The advisor sees the task, a session summary and the current diff, redacted by the guard with the session's placeholders.
   - Every consult shows in the timeline and the egress log.
+- **PROGRESS.md.** If the folder has a `PROGRESS.md` at its root, every fresh agent session (new, or after a handoff) starts from it. The file goes through the guard and shows in the egress log, and the agent is asked to keep it updated. In sensitive folders hib only points the agent at the file, so reading it still asks.
 - **Native sessions.** Claude runs as a long-lived `claude -p --input-format stream-json --permission-prompt-tool stdio` process, and Codex as `codex app-server`. Sessions resume natively. Switching to a model on another CLI mid-session hands the transcript over.
 - **Files, changes, terminal** (browser only):
   - a file tree and viewer, jailed to the folder and gitignore-aware;

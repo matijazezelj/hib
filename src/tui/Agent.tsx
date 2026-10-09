@@ -163,7 +163,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         push({ text: `guard wants approval: ${e.reasons.join("; ")} — /approve or /reject`, color: "yellow" });
         break;
       case "sent":
-        push({ text: `→ sent to ${e.account}${e.handoff ? " (with handoff transcript)" : ""}`, dim: true });
+        push({ text: `→ sent to ${e.account}${e.handoff ? " (with handoff transcript)" : ""}${e.progress ? " (with PROGRESS.md)" : ""}`, dim: true });
         break;
       case "handoff":
         push({ text: `handed over ${e.from} → ${e.to}`, color: "yellow" });
