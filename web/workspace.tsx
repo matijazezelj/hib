@@ -66,6 +66,8 @@ function fold(items: Item[], e: any): Item[] {
       const i = items.map((x) => x.kind).lastIndexOf("egress");
       return i < 0 ? items : items.map((x, j) => (j === i ? { ...(x as any), summary: e.summary } : x));
     }
+    case "protected_reverted":
+      return [...items, { kind: "note", tone: "bad", text: `hib put back ${e.changes.length} unapproved change(s) to git hooks/config or tool config: ${e.changes.map((c: any) => `${c.path} (${c.change})`).join(", ")}${e.failed.length ? `; couldn't restore ${e.failed.join(", ")}` : ""}. If you made one yourself, redo it.` }];
     case "pseudonymised": {
       const i = items.findIndex((x) => x.kind === "tool" && x.call.id === e.callId);
       const at = i >= 0 ? i : items.map((x) => (x.kind === "tool" && x.call.kind === "read" ? "r" : "")).lastIndexOf("r");
@@ -414,7 +416,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     refresh();
   }
 
-  const ruleLabel = (k: string) => k.replace(/^(Bash|command):exact:.*/, "this exact command").replace(/^(Bash|command):/, "").replace(/^edit$/, "edits in this folder");
+  const ruleLabel = (k: string) => k.replace(/^net:(.*)/, "network access to $1").replace(/^WebFetch:(.*)/, "fetches from $1").replace(/^(Bash|command):exact:.*/, "this exact command").replace(/^(Bash|command):/, "").replace(/^edit$/, "edits in this folder");
 
   return (
     <div className={`ws ${viewer ? "with-viewer" : ""} ${term ? "with-term" : ""}`}>
@@ -580,6 +582,15 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
                 )}
                 {c.diff && <DiffView diff={c.diff} />}
                 {c.command && c.kind === "command" && pending && <pre className="cmd">{c.command}</pre>}
+                {c.outbound && pending && (
+                  <div className="outbound">
+                    <div>to <strong>{c.outbound.host}</strong></div>
+                    {c.outbound.url && <pre className="cmd">{c.outbound.url}</pre>}
+                    {c.outbound.text && <div className="muted">sends: {c.outbound.text}</div>}
+                    {c.outbound.findings && <span className="chip bad">guard: contains {c.outbound.findings.join(", ")}</span>}
+                    {c.outbound.placeholders ? <span className="chip guard">{c.outbound.placeholders} redacted value(s) go out as placeholders, not real values</span> : null}
+                  </div>
+                )}
                 {pending && (
                   <div className="perm-actions">
                     <button className="primary" onClick={() => answer(it.permission!.id, "allow")}>Allow</button>

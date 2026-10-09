@@ -8,7 +8,7 @@ _Last updated: 2026-10-09_
 ## Where it stands
 
 hib is usable day to day: a local daemon, a terminal agent (`hib`), a web workspace (`hib serve`), a multi-model chat, and an
-OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (208 tests).
+OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (223 tests, 2 of them Linux-only).
 
 ### Done
 - **Router.** OpenAI-compatible `/v1`. Classification uses rules first, then Haiku for anything ambiguous. Routes come from config with learned scores (Thompson sampling), and failover is driven by usage and rate limits. Also: advisor review on routes, arena, and work/personal accounts via `CLAUDE_CONFIG_DIR` / `CODEX_HOME`.
@@ -51,6 +51,16 @@ OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. 
 - **Web UI.** Dark-first redesign of chat, analyze, home and workspace. Slash commands in the web composer.
 - **Terminal.** Ink terminal agent and router chat with slash autocomplete, and `**bold**` rendering.
 - **Plugins.** Markdown plugins (skill, agent, route, guard, advisor) and code plugins pinned by SHA with trust.
+- **PR #1 (merged).** Protected paths are judged on the resolved path, case-insensitively. Auto mode asks for WebFetch/WebSearch. "Always" for interpreters and wrappers (`python`, `node`, `bash`, `env`, `xargs`, `sudo`…) covers only the exact command line. Analysis code runs under bubblewrap on Linux.
+- **PR #1 review follow-ups (2026-10-09).**
+  - Race between check and use for protected files: every turn snapshots git hooks/config (the common dir too, for worktrees), `.claude/`, `.codex/`, `.hib/` and `.mcp.json` by content. Unapproved changes are put back, and a `protected_reverted` event reports them (`src/workspace/protect.ts`). Claude also gets `Edit(./.git/**)` as a deny rule; only `Edit(...)` rules are honoured, and they cover Write too.
+  - `realTarget()` follows dangling symlinks, since a write through one creates its target. Tests cover dangling, nested and chained links, loops, paths that don't exist yet and a swapped hooks directory.
+  - Web approvals carry `outbound` (host, full URL, prompt or query, guard findings, placeholder count), and both UIs show it.
+    - Web calls get placeholders, not restored values, so a fetch can't leak what the guard redacted.
+    - "Always" for WebFetch covers one host.
+    - Claude always asks hib for WebFetch/WebSearch via an `ask` rule. Checked live: without it, the user's own settings or Claude's pre-approved sites let WebFetch run unasked.
+  - Analysis on Linux: bubblewrap starts from an empty root with only `/usr`, `/lib*`, `/bin`, `/sbin`, bun and `src/analyze` mounted, read-only. All namespaces are unshared, and `/tmp` is empty.
+  - README: approvals are a user-interaction safeguard; the OS sandbox is the boundary.
 - **Ready to publish.** The repo has an MIT LICENSE, and the README says hib drives the official CLIs on your own subscriptions and never extracts their logins.
 - **PROGRESS.md.** Workspaces with this file at their root start every fresh session from it. In sensitive folders hib only points to it.
 
@@ -63,13 +73,17 @@ OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. 
 - **Advisor needs a logged-in account of the other provider.** Without one, `/advisor` switches itself off with a note.
 
 ## Next
-1. **Review feedback, P1 items** (a security review on 2026-10-09; the P0s, agent isolation and daemon auth, are done above):
+1. **Left over from the PR #1 review.**
+   - **Check the Linux analysis sandbox in CI.** The empty-root bubblewrap and its test that host files can't be seen are written but have only run on macOS, where they're skipped. CI now installs bwrap; confirm the Ubuntu job runs both Linux tests and passes.
+   - **macOS analysis Seatbelt has the same shape.** It's `(allow default)` with only `$HOME` denied, so `/Volumes`, `/private/var`, `/private/tmp` and other users' folders stay readable. Invert it like bubblewrap, or at least deny those. Test it outside a sandboxed Claude session, since nested Seatbelt fails there.
+   - **Codex web search isn't gated.** Codex runs `webSearch` items without asking, so hib only logs them.
+2. **Review feedback, P1 items** (a security review on 2026-10-09; the P0s, agent isolation and daemon auth, are done above):
    - Sensitive workspaces: check that native CLI reads, subprocesses, hooks and MCP all respect the policy, now that the sandbox is there.
    - Prompt injection from repo content and tool results.
    - Where the regex/NER guard misses things.
    - (P2) Whether the router's learned scores get enough real feedback.
-2. **Look into the empty `ls` output** in workspace sessions.
-3. **Background task polish.**
+3. **Look into the empty `ls` output** in workspace sessions.
+4. **Background task polish.**
    - A tasks panel in the web UI with review, merge and discard buttons. Today the web has only `/bg`, `/tasks` and `/task <id>`; review and merge need the CLI.
    - Worktrees start without `node_modules`, so the agent installs dependencies itself.
    - Tasks that branch from HEAD don't include the folder's uncommitted changes. hib warns about this.

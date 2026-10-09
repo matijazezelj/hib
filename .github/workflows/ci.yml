@@ -21,6 +21,13 @@ jobs:
         with:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
+      # So the analysis sandbox tests run under bubblewrap instead of being skipped. Ubuntu 24.04 restricts
+      # unprivileged user namespaces, which bwrap needs; this lifts that on the throwaway runner only.
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Typecheck
         run: bunx tsc --noEmit
       - name: Test

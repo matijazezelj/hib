@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Table } from "./table";
@@ -32,18 +32,38 @@ function seatbelt(): string {
   ].join("");
 }
 
+/** System folders bun needs to start: its shared libraries and the dynamic loader. Nothing with data in it. */
+const LINUX_SYSTEM = ["/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin"];
+
 /**
- * Linux: bubblewrap with the filesystem read-only, $HOME replaced by an empty tmpfs (hib's own files and the bun binary
- * are bound back read-only), no network, and its own PID namespace. Same promises as the Seatbelt profile.
+ * Linux: bubblewrap from an empty root. Only what the runner needs is mounted, read-only: the system libraries, the bun
+ * binary's folder and the runner's own folder (`src/analyze`), plus a fresh /dev, /proc and an empty /tmp. No /etc,
+ * /home, /run, /var, /srv, /opt or mounted volumes, so no host files and no socket files (ssh/gpg agents) to reach. Every
+ * namespace is unshared (no network, own PIDs), and the data arrives on stdin.
  */
-export function bwrapArgv(cmd: string[], home = homedir()): string[] {
-  const keep = [REPO, dirname(realpathSync(process.execPath))].filter((p) => p === home || p.startsWith(home + "/"));
+export function bwrapArgv(cmd: string[], pathKind: (p: string) => PathKind = linuxPathKind): string[] {
+  const mounts: string[] = [];
+  for (const p of LINUX_SYSTEM) {
+    const k = pathKind(p);
+    // Merged-/usr systems have /lib → usr/lib: recreate the link instead of binding the target twice.
+    if (k?.link) mounts.push("--symlink", k.link, p);
+    else if (k) mounts.push("--ro-bind", p, p);
+  }
+  const own = [...new Set([dirname(realpathSync(process.execPath)), dirname(RUNNER)])].filter((p) => !LINUX_SYSTEM.some((s) => p === s || p.startsWith(s + "/")));
   return [
-    "bwrap", "--die-with-parent", "--unshare-net", "--unshare-pid", "--unshare-ipc",
-    "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", home,
-    ...keep.flatMap((p) => ["--ro-bind", p, p]),
+    "bwrap", "--die-with-parent", "--new-session", "--unshare-all",
+    ...mounts,
+    ...own.flatMap((p) => ["--ro-bind", p, p]),
+    "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
     "--chdir", "/", ...cmd,
   ];
+}
+
+type PathKind = { link?: string } | null; // null: missing; {}: a directory; {link}: a symlink to `link`
+
+function linuxPathKind(p: string): PathKind {
+  const st = lstatSync(p, { throwIfNoEntry: false });
+  return st?.isSymbolicLink() ? { link: readlinkSync(p) } : st?.isDirectory() ? {} : null;
 }
 
 /** Runs model-written code against the table locally, isolated from the network and your files. */

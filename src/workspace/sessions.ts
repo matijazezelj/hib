@@ -4,9 +4,10 @@ import { inspect, obfuscateText, StreamRestorer, tokenNote, Vault } from "../gua
 import type { VaultState } from "../guard/vault";
 import type { Sealer } from "../guard/seal";
 import { resolveCandidate, type Candidate } from "../router/route";
-import type { AgentDriver, AgentEvent, Decision, Sandbox, ToolCall } from "./driver";
+import type { AgentDriver, AgentEvent, Decision, Outbound, Sandbox, ToolCall } from "./driver";
 import { REGISTRIES, sandboxFor } from "./sandbox";
 import { insideRoot, realTarget } from "./fs";
+import { changes as protectedChanges, revert as revertProtected, snapshot as protectedSnapshot } from "./protect";
 import { detect } from "../guard/detectors";
 import { onPinnedAccount, pinnedModel } from "./registry";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
@@ -32,6 +33,7 @@ export type WsEvent =
   | { type: "advice"; model: string; account: string; question: string; advice: string; ok: boolean; chars: number; guard: string }
   | { type: "sent"; account: string; model: string; text: string; handoff: boolean; progress?: boolean; chars: number }
   | { type: "pseudonymised"; file: string; columns: string[]; callId?: string }
+  | { type: "protected_reverted"; changes: { path: string; change: string }[]; failed: string[] } // unapproved changes to git hooks/config or tool config, put back
   | AgentEvent
   | { type: "done" }
   | { type: "turn_end" }; // always last; clients stop following a turn here
@@ -58,6 +60,7 @@ interface Live {
   askReads: boolean;
   advisorKey?: string; // set when this CLI was started with hib's advisor tool
   sandboxed: boolean; // the agent's commands run in the CLI's OS sandbox
+  approvedProtected: Set<string>; // protected files you approved edits to in the running turn (real paths)
 }
 
 /** A data file: CSV/TSV always; JSON only when it loads as a table (an array of records), not config like package.json. */
@@ -122,6 +125,17 @@ function restoreDeep(v: unknown, vault: Vault): unknown {
 
 function restoreCall(c: ToolCall, vault: Vault): ToolCall {
   return restoreDeep(c, vault) as ToolCall;
+}
+
+/**
+ * A web call exactly as it would leave (placeholders unrestored, since that's what is sent), with what the guard sees
+ * in it, so the approval shows the destination and the data, not just "WebFetch".
+ */
+function webOutbound(o: Outbound): Outbound {
+  const sent = [o.url, o.text].filter(Boolean).join("\n");
+  const findings = [...new Set(detect(sent, { level: "minimal" }).map((f) => f.category))];
+  const placeholders = (sent.match(/\[HIB[^\]\s]*\]/g) ?? []).length;
+  return { ...o, ...(findings.length ? { findings } : {}), ...(placeholders ? { placeholders } : {}) };
 }
 
 export class WorkspaceSessions {
@@ -297,7 +311,7 @@ export class WorkspaceSessions {
     const mcp = advisorKey ? { name: "hib", command: process.execPath, args: [ADVISOR_SCRIPT], env: { HIB_URL: this.daemonUrl, HIB_ADVISOR_KEY: advisorKey, HIB_SESSION: id } } : undefined;
     const sandbox = this.sandbox(this.cfg);
     await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox });
-    const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox };
+    const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox, approvedProtected: new Set() };
     this.live.set(id, l);
     return l;
   }
@@ -468,6 +482,9 @@ export class WorkspaceSessions {
     let tokIn = 0, tokOut = 0;
     const onAbort = () => l!.driver.interrupt();
     signal.addEventListener("abort", onAbort, { once: true });
+    // Git hooks/config and tool config, by content: whatever changes there this turn without your approval is put back.
+    const guarded = protectedSnapshot(root);
+    l.approvedProtected.clear();
 
     try {
       for await (const e of l.driver.turn(prompt)) {
@@ -496,6 +513,7 @@ export class WorkspaceSessions {
           }
           case "permission": {
             const call = restoreCall(e.call, vault);
+            if (e.call.outbound) call.outbound = webOutbound(e.call.outbound);
             if (policy && call.kind === "command" && call.command) {
               // Raw reads of data through the shell are refused outright; the agent is told to use Read instead.
               const why = rawDataCommand(call.command, root, dataFiles());
@@ -550,6 +568,13 @@ export class WorkspaceSessions {
       l.pending.clear();
       this.changed();
     }
+    const unapproved = protectedChanges(guarded, root).filter((c) => !l!.approvedProtected.has(c.path));
+    if (unapproved.length) {
+      const failed = revertProtected(guarded, unapproved);
+      const ev = { type: "protected_reverted" as const, changes: unapproved.map((c) => ({ ...c, path: c.path.startsWith(root + "/") ? c.path.slice(root.length + 1) : c.path })), failed };
+      this.record(sid, ev);
+      yield ev;
+    }
     const tail = restorer.flush();
     answer += tail;
     if (tail) yield { type: "text", delta: tail };
@@ -594,7 +619,10 @@ export class WorkspaceSessions {
    * pseudonymised copy. If that copy can't be made, the read is denied: it was approved on the promise of the copy.
    */
   private allowDecision(l: Live, call: ToolCall, input: unknown): Decision {
+    if (call.kind === "edit") for (const p of call.paths ?? (call.path ? [call.path] : [])) if (protectedPath(l.root, p)) l.approvedProtected.add(realTarget(l.root, p));
     if (input === undefined) return { behavior: "allow" };
+    // A web fetch or search leaves the machine: placeholders go out as placeholders, never as the real values.
+    if (call.kind === "web" && call.host === undefined) return { behavior: "allow", updatedInput: input };
     const real = restoreDeep(input, l.vault) as any;
     const key = this.engine.workspaces.policy(l.root) ? tabularTarget(call, real, l.root) : null;
     if (!key) return { behavior: "allow", updatedInput: real };

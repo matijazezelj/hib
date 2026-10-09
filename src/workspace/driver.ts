@@ -18,7 +18,17 @@ export interface ToolCall {
   paths?: string[]; // every file an edit touches (absolute or workspace-relative)
   command?: string;
   host?: string; // a sandboxed command reaching the network
+  outbound?: Outbound; // a web tool: what would leave the machine, and where to
   diff?: Diff;
+}
+
+/** A web fetch or search, shown in full before it's approved. */
+export interface Outbound {
+  host: string; // destination ("web search" for searches)
+  url?: string; // full URL, query string included
+  text?: string; // what else goes with it: the fetch prompt, or the search query
+  findings?: string[]; // guard categories found in url/text (secrets, identifiers)
+  placeholders?: number; // [HIB…] placeholders in it; they leave as placeholders, never as real values
 }
 
 export type AgentEvent =

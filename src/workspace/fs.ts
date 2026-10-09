@@ -1,5 +1,5 @@
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const SKIP = new Set([".git", "node_modules", "dist", "build", ".next", "target", ".venv", "venv", "__pycache__", ".turbo", ".cache"]);
 const MAX_FILES = 20_000;
@@ -12,16 +12,24 @@ export function safePath(root: string, rel: string): string {
   return existsSync(abs) ? realpathSync(abs) : abs;
 }
 
-/** `p` (absolute or relative to root) with `..`, `.`, repeated slashes and symlinks resolved; the missing tail is kept as is. */
+/**
+ * `p` (absolute or relative to root) with `..`, `.`, repeated slashes and symlinks resolved; the missing tail is kept as is.
+ * Dangling symlinks are followed too: writing through one creates its target, so the target is what the write touches.
+ */
 export function realTarget(root: string, p: string): string {
-  const realRoot = realpathSync(root);
-  let abs = isAbsolute(p) ? resolve(p) : resolve(realRoot, p);
-  let rest = "";
-  while (!existsSync(abs) && dirname(abs) !== abs) {
-    rest = join(abs.slice(dirname(abs).length + 1), rest);
-    abs = dirname(abs);
+  let abs = isAbsolute(p) ? resolve(p) : resolve(realpathSync(root), p);
+  for (let hops = 0; hops < 40; hops++) {
+    let at = abs;
+    let rest = "";
+    while (!existsSync(at) && dirname(at) !== at && !lstatSync(at, { throwIfNoEntry: false })?.isSymbolicLink()) {
+      rest = join(basename(at), rest);
+      at = dirname(at);
+    }
+    if (existsSync(at)) return join(realpathSync(at), rest);
+    if (dirname(at) === at) return abs;
+    abs = join(resolve(dirname(at), readlinkSync(at)), rest); // a dangling link: continue from where it points
   }
-  return join(realpathSync(abs), rest);
+  return abs; // a symlink loop; the write would fail anyway
 }
 
 /** True if `p` (absolute or relative to root) lands inside root once symlinks are resolved. */

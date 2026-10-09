@@ -6,6 +6,8 @@ import { Queue } from "./queue";
 
 const SECRET_READS = ["~/.hib/**", "~/.claude/**", "~/.claude.json", "~/.claude-*/**", "~/.codex/**", "~/.ssh/**", "~/.aws/**", "~/.gnupg/**", "~/.config/gh/**"].map((p) => `Read(${p})`);
 
+const GIT_WRITES = ["Edit(./.git/**)"]; // Edit rules cover every file-editing tool (Write, NotebookEdit)
+
 const KIND: Record<string, ToolKind> = {
   Read: "read", Write: "edit", Edit: "edit", NotebookEdit: "edit", Bash: "command",
   Grep: "search", Glob: "search", WebFetch: "web", WebSearch: "web",
@@ -21,7 +23,17 @@ function describe(id: string, name: string, input: any, cwd: string): ToolCall {
   else if (name === "SandboxNetworkAccess") Object.assign(call, { kind: "web", host: String(input?.host ?? ""), title: `Network: ${short(String(input?.host ?? "?"))}` });
   else if (name === "Grep" || name === "Glob") call.title = `${name} ${short(input.pattern ?? "")}${path ? ` in ${path}` : ""}`;
   else if (path) Object.assign(call, { path, title: `${name} ${path}` });
-  else if (input?.url || input?.query) call.title = `${name} ${short(input.url ?? input.query)}`;
+  else if (name === "WebFetch" && input?.url) {
+    const url = String(input.url);
+    let host = "";
+    try {
+      host = new URL(url).host;
+    } catch {}
+    Object.assign(call, { title: `WebFetch ${host || short(url)}`, outbound: { host: host || "(unparseable URL)", url, text: input.prompt ? String(input.prompt) : undefined } });
+  } else if (name === "WebSearch" && input?.query) {
+    const domains = [...(input.allowed_domains ?? [])].join(", ");
+    Object.assign(call, { title: `WebSearch ${short(String(input.query))}`, outbound: { host: domains ? `web search (${domains})` : "web search", text: String(input.query) } });
+  } else if (input?.url || input?.query) call.title = `${name} ${short(input.url ?? input.query)}`;
   const absPath = input?.file_path ?? input?.notebook_path;
   if (kind === "edit" && absPath) call.paths = [absPath];
   if (name === "Edit") call.diff = { path: path ?? "", before: input.old_string, after: input.new_string };
@@ -63,7 +75,10 @@ export class ClaudeDriver implements AgentDriver {
     if (opts.resume) args.push("--resume", opts.resume);
     if (opts.system) args.push("--append-system-prompt", opts.system);
     // Agents never read hib's or the CLIs' credentials, whatever else is allowed.
-    const permissions: Record<string, string[]> = { deny: SECRET_READS };
+    // Nor do they write git internals (hooks and config run outside any sandbox); Claude checks this itself too.
+    // Web tools send data off the machine: they always come to hib for approval, whatever allow rules or pre-approved
+    // sites the user's own Claude settings have (ask rules win over allow rules).
+    const permissions: Record<string, string[]> = { deny: [...SECRET_READS, ...GIT_WRITES], ask: ["WebFetch", "WebSearch"] };
     if (opts.askReads) {
       // Reads (and read-only Bash like `cat`) are normally auto-allowed; asking shows every file before its content leaves.
       permissions.ask = ["Read", "Grep", "Glob", "NotebookRead", "Bash", "Task", "Agent", "WebFetch", "WebSearch"];
@@ -146,7 +161,9 @@ export class ClaudeDriver implements AgentDriver {
                   ? `read:${call.path.includes("/") ? call.path.slice(0, call.path.lastIndexOf("/")) : "."}`
                   : r.tool_name === "SandboxNetworkAccess"
                     ? `net:${r.input?.host ?? ""}` // "always" opens that host only
-                    : r.tool_name;
+                    : r.tool_name === "WebFetch" && call.outbound
+                      ? `WebFetch:${call.outbound.host}` // and fetches from that host only
+                      : r.tool_name;
           q.push({ type: "permission", id: pid, call, ruleKey, input: r.input });
         } else this.send({ type: "control_response", response: { subtype: "error", request_id: m.request_id, error: `hib does not handle ${m.request?.subtype}` } });
         break;

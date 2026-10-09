@@ -18,6 +18,7 @@ interface Pending {
   title: string;
   ruleKey: string;
   command?: string;
+  outbound?: { host: string; url?: string; text?: string; findings?: string[]; placeholders?: number };
 }
 
 const HELP = [
@@ -155,11 +156,14 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
       }
       case "permission":
         flushLive();
-        setPending((p) => (p.some((x) => x.id === e.id) ? p : [...p, { id: e.id, title: e.call.title, ruleKey: e.ruleKey, command: e.call.command }]));
+        setPending((p) => (p.some((x) => x.id === e.id) ? p : [...p, { id: e.id, title: e.call.title, ruleKey: e.ruleKey, command: e.call.command, outbound: e.call.outbound }]));
         break;
       case "permission_answer":
         setPending((p) => p.filter((x) => x.id !== e.id));
         push({ text: `  ${e.choice === "deny" ? "✗ denied" : e.choice === "always" ? "✓ always allowed" : "✓ allowed"}`, color: e.choice === "deny" ? "red" : "green" });
+        break;
+      case "protected_reverted":
+        push({ text: `hib put back ${e.changes.length} unapproved change(s) to git hooks/config or tool config: ${e.changes.map((c: any) => `${c.path} (${c.change})`).join(", ")}${e.failed.length ? `; couldn't restore ${e.failed.join(", ")}` : ""}. If you made one yourself, redo it.`, color: "red" });
         break;
       case "guard":
         if (Object.keys(e.findings).length) push({ text: `guard ${e.action}: ${Object.entries(e.findings).map(([k, v]) => `${k}×${v}`).join(" ")}`, color: "yellow" });
@@ -421,7 +425,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
     }
   });
 
-  const rule = (k: string) => k.replace(/^(Bash|command):exact:.*/, "this exact command").replace(/^(Bash|command):/, "").replace(/^edit$/, "edits in this folder");
+  const rule = (k: string) => k.replace(/^net:(.*)/, "network access to $1").replace(/^WebFetch:(.*)/, "fetches from $1").replace(/^(Bash|command):exact:.*/, "this exact command").replace(/^(Bash|command):/, "").replace(/^edit$/, "edits in this folder");
 
   return (
     <>
@@ -447,6 +451,17 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
           <Text color="yellow">Allow {pending[0].title}?</Text>
           {pending[0].command && <Text>{pending[0].command}</Text>}
+          {pending[0].outbound && (
+            <>
+              <Text>
+                to <Text bold color="magenta">{pending[0].outbound.host}</Text>
+              </Text>
+              {pending[0].outbound.url && <Text>{pending[0].outbound.url}</Text>}
+              {pending[0].outbound.text && <Text dimColor>sends: {pending[0].outbound.text}</Text>}
+              {pending[0].outbound.findings && <Text color="red">guard: contains {pending[0].outbound.findings.join(", ")}</Text>}
+              {pending[0].outbound.placeholders ? <Text dimColor>{pending[0].outbound.placeholders} redacted value(s) go out as placeholders, not real values</Text> : null}
+            </>
+          )}
           <Text>
             <Text bold>y</Text> allow once  <Text bold>a</Text> always allow {rule(pending[0].ruleKey)}  <Text bold>n</Text> deny
             {pending.length > 1 ? <Text dimColor>  (+{pending.length - 1} more)</Text> : null}
