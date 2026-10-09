@@ -5,7 +5,7 @@ import type { VaultState } from "../guard/vault";
 import type { Sealer } from "../guard/seal";
 import { resolveCandidate, type Candidate } from "../router/route";
 import type { AgentDriver, AgentEvent, Decision, Outbound, Sandbox, ToolCall } from "./driver";
-import { REGISTRIES, sandboxFor } from "./sandbox";
+import { REGISTRIES, sandboxFor, secretPaths } from "./sandbox";
 import { insideRoot, realTarget } from "./fs";
 import { changes as protectedChanges, revert as revertProtected, snapshot as protectedSnapshot } from "./protect";
 import { detect } from "../guard/detectors";
@@ -97,7 +97,7 @@ export function protectedPath(root: string, p: string): boolean {
  * own daemon or credentials. A speed bump, not a sandbox: an approved script can still do anything you can.
  */
 const ASK_EVEN_IN_AUTO =
-  /\.hib\b|hib_token|\/hib\/session|localhost:\d|127\.0\.0\.1|\.ssh\b|\.aws\b|\.gnupg\b|\.config\/gh\b|\.claude|\.codex\b|(^|[\s;&|(`$])(sudo|su|doas|curl|wget|ssh|scp|sftp|rsync|nc|ncat|netcat|telnet|ftp|socat)\b|\bgit\s+(push|reset\s+--hard|clean|filter-branch|remote\s+(add|set-url))\b|\b(npm|bun|pnpm|yarn|cargo|twine|gem)\s+publish\b|\bgh\s+(pr|release|repo|api|gist|issue)\b|\brm\s+(-\w+\s+)*-\w*[rR]|\/dev\/(tcp|udp)\//;
+  /\.hib\b|hib_token|\/hib\/session|localhost:\d|127\.0\.0\.1|\.ssh\b|\.aws\b|\.gnupg\b|\.config\/gh\b|\.claude|\.codex\b|(^|[\s;&|(`$])(sudo|su|doas|curl|wget|ssh|scp|sftp|rsync|nc|ncat|netcat|telnet|ftp|socat)\b|\bgit\s+(push|reset\s+--hard|clean|filter-branch|remote\s+(add|set-url))\b|\b(npm|bun|pnpm|yarn|cargo|twine|gem|poetry|uv|flit|hatch)\b[^\n]*\b(publish|upload|push)\b|\bgh\s+(pr|release|repo|api|gist|issue)\b|\brm\s+(-\w+\s+)*-\w*[rR]|\/dev\/(tcp|udp)\//;
 
 const ADVISOR_SCRIPT = new URL("./advisor-mcp.ts", import.meta.url).pathname;
 const ADVISOR_NOTE =
@@ -303,14 +303,14 @@ export class WorkspaceSessions {
   private async open(id: string, root: string, c: Candidate, resume: string | undefined, vault: Vault, system?: string): Promise<Live> {
     const driver = this.drivers(c.provider);
     if (!driver) throw new Error(`provider ${c.provider} has no agent driver`);
-    const askReads = !!this.engine.workspaces.policy(root);
+    const askReads = !!this.engine.workspaces.effectivePolicy(root);
     // Sensitive folders: the agent learns the data rule up front, so it reaches for Read instead of `head`/`cat`.
     // The advisor tool exists only when switched on, outside sensitive folders, and with another provider to ask.
     const advisorKey = !askReads && this.advisorOn.has(id) && this.engine.router.advisorFor(c) ? crypto.randomUUID() : undefined;
     const sys = [system, this.notes.get(id), askReads ? DATA_RULE_NOTE : "", advisorKey ? ADVISOR_NOTE : ""].filter(Boolean).join("\n\n") || undefined;
     const mcp = advisorKey ? { name: "hib", command: process.execPath, args: [ADVISOR_SCRIPT], env: { HIB_URL: this.daemonUrl, HIB_ADVISOR_KEY: advisorKey, HIB_SESSION: id } } : undefined;
     const sandbox = this.sandbox(this.cfg);
-    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox });
+    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools });
     const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox, approvedProtected: new Set() };
     this.live.set(id, l);
     return l;
@@ -346,7 +346,7 @@ export class WorkspaceSessions {
     let row = input.isNew ? null : (this.db.query("SELECT * FROM conversations WHERE id = ? AND workspace = ?").get(id, root) as any);
     if (!input.isNew && !row) return yield { type: "error", message: `no session ${id} in this workspace` };
 
-    const policy = this.engine.workspaces.policy(root);
+    const policy = this.engine.workspaces.effectivePolicy(root);
     const chosen = input.model && input.model !== "hib/auto" ? input.model : undefined;
     let modelId = chosen ?? row?.agent_model ?? (policy ? pinnedModel(policy, this.cfg) : await this.defaultModel(root));
     if (policy && !onPinnedAccount(modelId, policy, this.cfg)) {
@@ -568,12 +568,20 @@ export class WorkspaceSessions {
       l.pending.clear();
       this.changed();
     }
-    const unapproved = protectedChanges(guarded, root).filter((c) => !l!.approvedProtected.has(c.path));
-    if (unapproved.length) {
-      const failed = revertProtected(guarded, unapproved);
-      const ev = { type: "protected_reverted" as const, changes: unapproved.map((c) => ({ ...c, path: c.path.startsWith(root + "/") ? c.path.slice(root.length + 1) : c.path })), failed };
-      this.record(sid, ev);
-      yield ev;
+    let protectedEv: Extract<WsEvent, { type: "protected_reverted" }> | undefined;
+    try {
+      const unapproved = protectedChanges(guarded, root).filter((c) => !l!.approvedProtected.has(c.path));
+      if (unapproved.length) {
+        const failed = revertProtected(guarded, unapproved);
+        protectedEv = { type: "protected_reverted", changes: unapproved.map((c) => ({ ...c, path: c.path.startsWith(root + "/") ? c.path.slice(root.length + 1) : c.path })), failed };
+      }
+    } catch (e: any) {
+      // The check itself must never be what lets a change through: say so loudly instead.
+      protectedEv = { type: "protected_reverted", changes: [], failed: [`the check failed (${String(e?.message ?? e).slice(0, 160)}); inspect .git/hooks, .git/config, .claude/, .codex/ and .mcp.json by hand`] };
+    }
+    if (protectedEv) {
+      this.record(sid, protectedEv);
+      yield protectedEv;
     }
     const tail = restorer.flush();
     answer += tail;
@@ -624,7 +632,7 @@ export class WorkspaceSessions {
     // A web fetch or search leaves the machine: placeholders go out as placeholders, never as the real values.
     if (call.kind === "web" && call.host === undefined) return { behavior: "allow", updatedInput: input };
     const real = restoreDeep(input, l.vault) as any;
-    const key = this.engine.workspaces.policy(l.root) ? tabularTarget(call, real, l.root) : null;
+    const key = this.engine.workspaces.effectivePolicy(l.root) ? tabularTarget(call, real, l.root) : null;
     if (!key) return { behavior: "allow", updatedInput: real };
     const src = isAbsolute(real[key]) ? real[key] : resolvePath(l.root, real[key]);
     try {
@@ -668,7 +676,8 @@ export class WorkspaceSessions {
       return paths.length > 0 && paths.every((p) => insideRoot(l.root, p) && !protectedPath(l.root, p));
     }
     if (call.kind === "command") return !!call.command && !ASK_EVEN_IN_AUTO.test(call.command);
-    if (call.kind === "read" || call.kind === "search") return !l.askReads;
+    // The CLI's file tools aren't sandboxed: reads outside the folder ask, even in auto mode.
+    if (call.kind === "read" || call.kind === "search") return !l.askReads && (!call.path || insideRoot(l.root, call.path));
     // WebFetch / WebSearch send text (and anything a prompt-injected page asks for) off the machine: always ask.
     return false;
   }
@@ -725,7 +734,7 @@ export class WorkspaceSessions {
     const history = this.history(sessionId);
     const task = history.filter((e) => e.type === "user").slice(-5).map((e) => e.text).join("\n---\n");
     const transcript = this.transcript(sessionId, 20_000);
-    const git = Bun.spawnSync(["git", "diff", "HEAD"], { cwd: l.root, stdout: "pipe", stderr: "pipe" });
+    const git = Bun.spawnSync(["git", "-c", "core.fsmonitor=false", "diff", "--no-ext-diff", "--no-textconv", "HEAD"], { cwd: l.root, stdout: "pipe", stderr: "pipe" });
     let diff = git.success ? git.stdout.toString() : "";
     if (diff.length > 40_000) diff = diff.slice(0, 40_000) + "\n… (diff truncated)";
     const plain = ADVISOR_PROMPT(task, transcript, diff, question);

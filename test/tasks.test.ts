@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseConfig } from "../src/config";
@@ -137,6 +137,22 @@ describe("background tasks", () => {
     expect(engine.workspaces.has(t.worktree)).toBe(false);
     expect(tasks.get(t.id).status).toBe("merged");
     expect(tasks.list()).toEqual([]);
+  });
+
+  test("hib's own task commit and merge never run the repo's hooks (an agent can edit husky-style hook files)", async () => {
+    const marker = join(wtDir, "hook-ran");
+    mkdirSync(join(root, ".hooks"));
+    writeFileSync(join(root, ".hooks/pre-commit"), `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
+    writeFileSync(join(root, ".hooks/post-merge"), `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
+    git(root, "add", "-A");
+    git(root, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "hooks");
+    git(root, "config", "core.hooksPath", ".hooks"); // like husky: hooks are files in the worktree
+    script.current = async (_t, d) => writeFileSync(join(d.started[0]!.cwd, "c.txt"), "c");
+    const t = await tasks.create({ root, prompt: "add c" });
+    await until(() => tasks.get(t.id).status === "done", "task done");
+    await tasks.merge(t.id);
+    expect(existsSync(join(root, "c.txt"))).toBe(true);
+    expect(existsSync(marker)).toBe(false);
   });
 
   test("a risky command waits for approval and notifies; answering lets it finish", async () => {

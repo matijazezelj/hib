@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { realTarget } from "../src/workspace/fs";
@@ -72,6 +72,28 @@ describe("protected files are checked by content after each turn", () => {
     expect(readFileSync(join(root, ".git/hooks/pre-commit.sample"), "utf8")).toBe("#!/bin/sh\n");
     expect(existsSync(join(outside, "hooks/pre-commit"))).toBe(true); // the outside target is left alone
     expect(changes(before, root)).toEqual([]);
+  });
+
+  test("an unreadable file, a fifo or an unreadable folder can't stop the check, and gets removed", () => {
+    const before = snapshot(root);
+    writeFileSync(join(root, ".claude/locked"), "x");
+    chmodSync(join(root, ".claude/locked"), 0o000);
+    Bun.spawnSync(["mkfifo", join(root, ".claude/pipe")]); // reading it would block forever
+    mkdirSync(join(root, ".claude/sealed"));
+    writeFileSync(join(root, ".claude/sealed/settings.json"), "{}");
+    chmodSync(join(root, ".claude/sealed"), 0o000);
+    writeFileSync(join(root, ".git/hooks/post-commit"), "evil");
+    const found = changes(before, root).map((c) => c.path);
+    for (const p of [".claude/locked", ".claude/pipe", ".claude/sealed", ".git/hooks/post-commit"]) expect(found).toContain(join(root, p));
+    revert(before, changes(before, root));
+    expect(changes(before, root)).toEqual([]);
+  });
+
+  test("too many files is reported, never a reason to stop looking", () => {
+    const before = snapshot(root);
+    mkdirSync(join(root, ".claude/flood"));
+    for (let i = 0; i < 20_100; i++) writeFileSync(join(root, ".claude/flood", String(i)), "");
+    expect(changes(before, root).map((c) => c.path)).toContain("(more protected files than hib checks)");
   });
 
   test("a worktree's hooks live in the main repo and are covered too", () => {

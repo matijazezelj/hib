@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, root TEXT, worktree TEXT, branch TEXT, base TEXT, session_id TEXT, title TEXT, model TEXT,
   status TEXT, note TEXT, created INTEGER, updated INTEGER
 );
+CREATE TABLE IF NOT EXISTS browser_sessions (hash TEXT PRIMARY KEY, created INTEGER); -- sha256 of a browser's session id
 CREATE TABLE IF NOT EXISTS arena (id TEXT PRIMARY KEY, ts INTEGER, class TEXT, run_a TEXT, run_b TEXT, text_b TEXT, winner TEXT);
 `;
 

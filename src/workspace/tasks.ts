@@ -110,7 +110,7 @@ export class Tasks {
     const prompt = input.prompt.trim();
     if (!prompt) throw new Error("describe the task");
     // A worktree lives outside the folder, so a sensitive folder's pin and read rules wouldn't follow it there.
-    if (this.engine.workspaces.policyFor(root)) throw new Error("background tasks are off in sensitive workspaces");
+    if (this.engine.workspaces.effectivePolicy(root)) throw new Error("background tasks are off in sensitive workspaces");
     // Unattended auto mode is only acceptable when the agent's commands are confined.
     if (!this.sessions.sandboxed()) throw new Error("background tasks need an OS sandbox for agent commands (macOS, or Linux with bubblewrap and socat installed)");
     if (this.byWorktree(root)) throw new Error("this folder is itself a background task; start tasks from the original folder");

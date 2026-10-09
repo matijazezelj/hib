@@ -8,7 +8,11 @@ _Last updated: 2026-10-09_
 ## Where it stands
 
 hib is usable day to day: a local daemon, a terminal agent (`hib`), a web workspace (`hib serve`), a multi-model chat, and an
-OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (223 tests, 2 of them Linux-only).
+OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (227 tests,
+2 of them Linux-only) on Ubuntu and macOS.
+
+A full security audit ran on 2026-10-09 (daemon surface, agent permissions, guard/egress, analyze/plugins/web). Its
+fix-first items are done (below). Everything it found that is still open is under Known issues, and in order under Next.
 
 ### Done
 - **Router.** OpenAI-compatible `/v1`. Classification uses rules first, then Haiku for anything ambiguous. Routes come from config with learned scores (Thompson sampling), and failover is driven by usage and rate limits. Also: advisor review on routes, arena, and work/personal accounts via `CLAUDE_CONFIG_DIR` / `CODEX_HOME`.
@@ -22,73 +26,99 @@ OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. 
   - Shared daemon: CLI and web follow the same live session.
   - Browser panels: file tree, git panel, and a browser terminal.
 - **Sensitive workspaces.**
-  - Pinned to one account, with no handoff, failover, advisor or arena.
-  - Secrets are blocked, and every read asks.
-  - Data files reach the agent pseudonymised, and raw shell reads of data are blocked.
-- **Analyze** (`hib analyze`, web panel). The model sees only the schema and writes `analyze(rows)`, which runs locally in a sandbox. Interpretation is optional. Includes column pseudonymisation and an offline GeoNames gazetteer for travel analysis.
-- **Agent sandbox** (`src/workspace/sandbox.ts`). It's on in every session.
-  - Claude runs with its Bash sandbox: `sandbox.enabled`, `failIfUnavailable`, `allowUnsandboxedCommands: false`, and `autoAllowBashIfSandboxed: false` so prompts still reach hib.
-  - Codex runs with a `default_permissions` profile that extends `:workspace` and sets `filesystem = { path = "deny" }`. Without one there is nothing to confine a script the agent writes and runs.
-  - Commands can't read `~/.hib`, CLI logins or credential stores, can't write outside the folder, and can't reach localhost (the daemon) or the network. A new host is a `SandboxNetworkAccess` prompt in Claude; Codex has no network.
-  - Codex runs its own binary from `~/.codex/packages`, so only `auth.json` is denied there.
+  - Pinned to one account, with no handoff, failover, advisor, arena, browser terminal or background tasks.
+  - Secrets are blocked, and every read asks (Claude). Data files reach the agent pseudonymised, and raw shell reads of data are blocked by a command check.
+  - The policy covers the whole tree (`Workspaces.effectivePolicy`): every folder inside a sensitive one, and any folder that contains one. A folder spanning two sensitive folders pinned to different accounts is refused. Used by sessions, the terminal, `/ws/tree`, tasks.
+  - It can only be tightened over HTTP; lifting it takes `hib workspace normal`, and the API won't forget a sensitive folder.
+- **Analyze** (`hib analyze`, web panel). The model sees only the schema and writes `analyze(rows)`, which runs locally. Interpretation is optional. Includes column pseudonymisation and an offline GeoNames gazetteer for travel analysis.
+  - macOS: Seatbelt (no network, no writes, no reads under `$HOME`).
+  - Linux with bwrap: bubblewrap from an empty root, only `/usr`, `/lib*`, `/bin`, `/sbin`, bun and `src/analyze` mounted read-only, all namespaces unshared, empty `/tmp`. CI installs bwrap so the Linux tests run.
+- **Agent sandbox** (`src/workspace/sandbox.ts`). On in every session.
+  - Claude: its Bash sandbox with `failIfUnavailable`, `allowUnsandboxedCommands: false`, and `autoAllowBashIfSandboxed: false` so prompts still reach hib.
+  - Codex: a `default_permissions` profile extending `:workspace` with `filesystem = { path = "deny" }`. Codex runs its own binary from `~/.codex/packages`, so only `auth.json` is denied there.
+  - Commands can't read `~/.hib`, CLI logins or credential stores (`secretPaths().commands`: also `.cargo` credentials, `.pypirc`, `.docker/config.json`, `.kube`, gcloud, azure), can't write outside the folder, and can't reach localhost or the network. A new host is a `SandboxNetworkAccess` prompt in Claude; Codex has no network.
+  - Claude's own Read tool (outside the sandbox) is denied the same paths plus `~/.npmrc`, `~/.yarnrc.yml`, gem credentials and whole CLI homes (`secretPaths().tools`, as `Read(//path)` rules).
   - Nested Seatbelt isn't allowed (`sandbox_apply: Operation not permitted`), so hib can't wrap a whole CLI itself.
-  - Checked end to end with real Claude and Codex sessions; the advisor MCP still reaches the daemon.
-  - Git: Claude's sandbox lets the agent commit, including in task worktrees, but blocks the main repo's `.git/config` and `.git/hooks`. Codex keeps `.git` read-only by design, so a Codex agent can't commit; hib's own end-of-turn commit covers tasks.
-  - Codex marks a request to run outside its sandbox only with a `reason` field. hib treats any request with one as "beyond the sandbox", which auto mode and "always" never approve. Approving one in Codex 0.160 still ran the command sandboxed.
-  - Test sandbox probes with repos outside `/tmp`: Codex's workspace profile can write anywhere under `/tmp`, which skews results.
-- **Browser login.** `/hib/session` sets the cookie only for a one-time code (15 min) that `POST /hib/login` mints with the token. `workspaceUrl()` mints one. Before, any local process could get the token from `/hib/session`.
-- **Auto mode** (`/auto`, off by default; needs the sandbox). Edits and sandboxed commands run without asking. New network hosts ask, except package registries. Risky commands (push, publish, sudo, rm -r, anything naming hib's daemon or credentials) still ask. Without an OS sandbox (Linux without bwrap, Windows) auto mode and background tasks are refused.
+  - Checked live with real Claude and Codex sessions; the advisor MCP still reaches the daemon.
+  - Git: Claude's sandbox lets the agent commit (worktrees too) but blocks the main repo's `.git/config` and `.git/hooks`. Codex keeps `.git` read-only, so Codex agents can't commit; hib's end-of-turn commit covers tasks.
+  - Codex marks a request to run outside its sandbox only with a `reason` field; hib treats it as "beyond the sandbox", which auto mode and "always" never approve.
+  - Test sandbox probes with repos outside `/tmp`: Codex's workspace profile can write anywhere under `/tmp`.
+- **Daemon auth.**
+  - The token is compared in constant time.
+  - Browser login: `POST /hib/login` (needs the token) mints a one-time code (15 min) for the link `hib serve` / `/web` prints. `POST /hib/session` trades it for a browser session id, stored as a sha256 in `browser_sessions` and valid 30 days. The page keeps it in `localStorage` (per origin, port included) and sends it as a bearer header; the terminal WebSocket passes it as `?session=`. No cookie: one on 127.0.0.1 would reach every other local server.
+  - The page's CSP (`img-src 'self' data:`, no frames, objects, media or forms) and the markdown renderer never load images, so restored values in model output can't leave through an image URL.
+- **Protected files** (`src/workspace/protect.ts`). Each turn snapshots git hooks and config (a worktree's common dir too), `.claude/`, `.codex/`, `.hib/` and `.mcp.json` by content. Changes you didn't approve are put back, and a `protected_reverted` event says what. Nothing an agent creates can stop the check: fifos, sockets and unreadable entries are recorded without being opened, too many files is itself a finding, and a failed check is reported, never silent. Claude also has an `Edit(./.git/**)` deny rule; only `Edit(...)` rules are honoured, and they cover Write too.
+- **Protected paths.** Judged on the resolved path, case-insensitively, following dangling symlinks too (a write through one creates its target) — `realTarget()` in `fs.ts`.
+- **Auto mode** (`/auto`, off by default; needs the sandbox). Edits in the folder and sandboxed commands run without asking. Reads and searches outside the folder ask. New network hosts ask, except package registries. WebFetch/WebSearch always ask. Risky commands (push, publishing in any spelling like `npm --tag x publish` or `twine upload`, sudo, rm -r, anything naming hib's daemon or credentials) still ask. "Always" for interpreters and wrappers covers only the exact command line.
+- **Web approvals.** Carry `outbound` (host, full URL, prompt or query, guard findings, placeholder count), shown in both UIs. Web calls get placeholders, not restored values. "Always" for WebFetch covers one host. Claude always asks hib for web tools via an `ask` rule; without it, user settings or Claude's pre-approved sites let WebFetch run unasked.
 - **Background tasks** (`hib task "…"`, `/bg` in the terminal and web).
-  - Each task is one agent session in its own git worktree, on branch `hib/task-<id>`, in auto mode. Worktrees live in `~/.local/share/hib/worktrees` (override with `HIB_WORKTREES`). That path avoids `.hib`/`.claude`, which auto mode and the CLI deny rules treat as credentials.
+  - Each task is one agent session in its own git worktree, on branch `hib/task-<id>`, in auto mode. Worktrees live in `~/.local/share/hib/worktrees` (override with `HIB_WORKTREES`), a path without `.hib`/`.claude`.
   - The worktree is registered as a workspace so sessions, the guard and the web UI work there, but it's hidden from workspace listings.
   - The model is chosen for the original folder, so `accounts.dirs` pins still apply.
-  - The agent gets a system note saying nobody is watching and that it should leave PROGRESS.md alone, so parallel tasks don't conflict on merge. Update PROGRESS.md after merging. hib commits whatever the agent leaves uncommitted at the end of each turn.
-  - Status: running, waiting (a risky command or a guard approval), done, failed, or interrupted (the daemon restarted). A macOS notification fires on done, failed and needs-approval.
-  - `hib tasks` lists them; `review`, `merge` (`--no-ff` into whatever the folder has checked out; a conflicting merge is aborted) and `discard` act on one, and `open` opens its session in the TUI. `/tasks` and `/task <id>` do the same on the web.
-  - Off in sensitive workspaces, because a worktree outside the folder wouldn't inherit the pin. A task whose origin later becomes sensitive refuses new turns.
-  - Code: `src/workspace/tasks.ts`, with tests in `test/tasks.test.ts`.
+  - The agent is told nobody is watching and to leave PROGRESS.md alone (parallel tasks would conflict); update PROGRESS.md after merging. hib commits what the agent leaves at the end of each turn.
+  - hib's own git calls run no repo code: task commits, merges and worktree setup run without hooks (`core.hooksPath=/dev/null`, `--no-verify`), since hook files can be ones the agent edited (husky, lefthook). Every git call hib makes on its own disables fsmonitor, and diffs disable external diff and textconv. Commits from the web git panel still run your hooks.
+  - Status: running, waiting, done, failed, interrupted. A macOS notification fires on done, failed and needs-approval.
+  - `hib tasks` lists them; `review`, `merge` (`--no-ff`; a conflicting merge is aborted) and `discard` act on one, and `open` opens its session. `/tasks` and `/task <id>` do the same on the web.
+  - Refused in sensitive workspaces and without an OS sandbox.
 - **Advisor tool** (`/advisor`, off by default). hib's MCP server gives the agent an `advisor` tool backed by the other provider, through the guard, logged.
-- **Web UI.** Dark-first redesign of chat, analyze, home and workspace. Slash commands in the web composer.
-- **Terminal.** Ink terminal agent and router chat with slash autocomplete, and `**bold**` rendering.
-- **Plugins.** Markdown plugins (skill, agent, route, guard, advisor) and code plugins pinned by SHA with trust.
-- **PR #1 (merged).** Protected paths are judged on the resolved path, case-insensitively. Auto mode asks for WebFetch/WebSearch. "Always" for interpreters and wrappers (`python`, `node`, `bash`, `env`, `xargs`, `sudo`…) covers only the exact command line. Analysis code runs under bubblewrap on Linux.
-- **PR #1 review follow-ups (2026-10-09).**
-  - Race between check and use for protected files: every turn snapshots git hooks/config (the common dir too, for worktrees), `.claude/`, `.codex/`, `.hib/` and `.mcp.json` by content. Unapproved changes are put back, and a `protected_reverted` event reports them (`src/workspace/protect.ts`). Claude also gets `Edit(./.git/**)` as a deny rule; only `Edit(...)` rules are honoured, and they cover Write too.
-  - `realTarget()` follows dangling symlinks, since a write through one creates its target. Tests cover dangling, nested and chained links, loops, paths that don't exist yet and a swapped hooks directory.
-  - Web approvals carry `outbound` (host, full URL, prompt or query, guard findings, placeholder count), and both UIs show it.
-    - Web calls get placeholders, not restored values, so a fetch can't leak what the guard redacted.
-    - "Always" for WebFetch covers one host.
-    - Claude always asks hib for WebFetch/WebSearch via an `ask` rule. Checked live: without it, the user's own settings or Claude's pre-approved sites let WebFetch run unasked.
-  - Analysis on Linux: bubblewrap starts from an empty root with only `/usr`, `/lib*`, `/bin`, `/sbin`, bun and `src/analyze` mounted, read-only. All namespaces are unshared, and `/tmp` is empty.
-  - README: approvals are a user-interaction safeguard; the OS sandbox is the boundary.
-- **Ready to publish.** The repo has an MIT LICENSE, and the README says hib drives the official CLIs on your own subscriptions and never extracts their logins.
+- **Web UI, terminal, plugins.** Dark-first web UI with slash commands; Ink terminal agent and router chat with slash autocomplete and `**bold**`; markdown plugins (skill, agent, route, guard, advisor) and code plugins pinned by SHA with trust.
+- **Ready to publish.** MIT LICENSE; the README says hib drives the official CLIs on your own subscriptions and never extracts their logins.
 - **PROGRESS.md.** Workspaces with this file at their root start every fresh session from it. In sensitive folders hib only points to it.
 
 ## Known issues
-- **Gaps in the sandbox.**
-  - The macOS keychain is reachable from inside it, so a command can read a CLI login stored there (`security find-generic-password`). With the network closed it can only go back to the model's own vendor, or to a host you approve.
-  - The CLIs' file tools (Read/Edit) aren't sandboxed; permission rules and hib's prompts hold them.
-- **One daemon token.** The token is still all-powerful for anything outside an agent sandbox. Agents can't read it now, but a narrower per-client token would shrink it further.
-- **`ls` came back empty in one auto-mode test** although the file existed. Command output display looks suspect; not investigated.
-- **Advisor needs a logged-in account of the other provider.** Without one, `/advisor` switches itself off with a note.
+Open findings from the 2026-10-09 audit, by area, plus older ones. Severity in brackets.
+
+- **Sensitive workspaces**
+  - [high] Codex ignores `askReads`: its `untrusted` policy runs `cat`/`head`/`grep` without asking, so data files reach the model raw (`codex-driver.ts`).
+  - [medium] The raw-data command check is regex-based: `cat cl*`, a symlink to a data file then Read of the link (`isDataFile` judges the name), or a script the agent wrote all get past it (`datarules.ts`).
+  - [medium] Placeholders are restored into approved shell commands, so `echo [HIB…-USER-3]` runs with the real name and the output goes back (`sessions.ts` `allowDecision`).
+- **Agent permissions**
+  - [medium] Codex file moves: the move destination isn't checked, only the source path (`codex-driver.ts` fileChange).
+  - [medium] Codex commands are judged on `commandActions[0]`, the first segment, instead of the full command.
+  - [low] Unknown Claude tools default to kind `other` with the bare tool name as rule key, so "always" skips path checks for e.g. MCP file tools.
+  - [low] hib doesn't pass `--permission-mode default`; user/project allow rules or PreToolUse hooks can decide a call before hib sees it (non-sensitive folders).
+  - [low] Codex `webSearch` isn't gated, only logged.
+  - [low] "Always" on a WebFetch host allows any URL/query to that host. An approved protected-file edit lets any content into that path for the rest of the turn.
+  - [low] A command running in the background can still swap a directory for a symlink between an Edit's approval and its write; the end-of-turn check catches it for protected files only.
+- **Guard and egress**
+  - [medium] The router's advisor gets the primary answer unguarded (`engine.ts` `ADVISOR_PROMPT(res.raw)`), even in agent mode.
+  - [medium] Text you edit in the guard's approval dialog isn't saved; later turns, handoffs and the advisor resend the original. Edited text also skips the sensitive-folder secret block and NER.
+  - [medium] Truncation before detection (handoff transcript, advisor diff, PROGRESS.md, classifier) can cut a PEM header and let the key body out.
+  - [medium] The classifier sends an excerpt before approval with a weaker guard (no plugin patterns, no machine identities).
+  - [medium] The `dirs` account pin and the approval don't hold across fallback for an explicit over-quota model, the advisor (other provider's default account) and failover/arena.
+  - [medium] Analyze: with several files the pin check uses only the first file's folder; `fix()` sends the error text unbounded.
+  - [low] Egress log has gaps: handoff transcript and PROGRESS.md content are only flags and counts; agent tool output isn't logged as egress.
+  - [low] Plaintext at rest: `messages`, `ws_events`, arena text keep originals; WAL/SHM files use the default umask.
+  - [low] Detectors slow down quadratically on long input (100k chars ≈ 2.6 s at paranoid).
+  - [low] Detector gaps: unprefixed tokens (`hvs.`, `hf_`, `shpat_`, Datadog, Okta), `scheme://user:pass@`, compressed IPv6, 100.64/8 and 169.254/16 as internal, IBANs, cards, phone numbers, names without NER.
+- **Daemon**
+  - [low] The advisor key and system prompt are on CLI command lines (visible in `ps`).
+  - [low] No `frame-ancestors` (a meta CSP can't set it; the HTML route can't set headers yet).
+  - [low] Git pathspec magic (`:(top)x`) gets past `safePath` in `/ws/git/diff` when the workspace is a subfolder of a bigger repo.
+- **Analyze and plugins**
+  - [high] Plugin update keeps trust when only a provider's imported helper files change (`plugins.ts` update diff covers only `*.provider.*`).
+  - [medium] Nothing on disk is re-checked against the trusted SHA when plugins load; local installs pin `sha="local"`.
+  - [medium] Markdown route plugins can route most prompts to another account at a lower guard level; markdown agent plugins can turn the advisor back on in sensitive folders and lower `level`.
+  - [medium] Without an OS sandbox (Windows, Linux without bwrap) analysis still runs and the UI still says "sandboxed". The macOS Seatbelt profile is allow-by-default: `/Volumes`, `/private/var`, `/private/tmp` stay readable, and process launching, Apple Events and mach lookups are allowed.
+  - [medium] Explain step: numeric identifying columns and derived values (lower-cased names, email local parts) go out raw; truncation happens before token substitution.
+  - [low] Headerless CSVs send the first data row as column names; async model code runs past the vm timeout (bounded by the kill timer); a symlink loop in a plugin repo crashes startup; plugin guard regexes aren't checked for catastrophic backtracking.
+- **Other**
+  - [low] The macOS keychain is reachable from inside the agent sandbox (`security find-generic-password`); with the network closed it can only go back to the model's vendor or an approved host. `~/.npmrc` stays readable to commands (npm needs it), so a registry token could be used by a script if a publish slips past the command check.
+  - The token is still all-powerful for anything outside an agent sandbox.
+  - `ls` came back empty in one auto-mode test although the file existed; not investigated.
+  - The advisor needs a logged-in account of the other provider; without one `/advisor` switches itself off.
 
 ## Next
-1. **Left over from the PR #1 review.**
-   - **Check the Linux analysis sandbox in CI.** The empty-root bubblewrap and its test that host files can't be seen are written but have only run on macOS, where they're skipped. CI now installs bwrap; confirm the Ubuntu job runs both Linux tests and passes.
-   - **macOS analysis Seatbelt has the same shape.** It's `(allow default)` with only `$HOME` denied, so `/Volumes`, `/private/var`, `/private/tmp` and other users' folders stay readable. Invert it like bubblewrap, or at least deny those. Test it outside a sandboxed Claude session, since nested Seatbelt fails there.
-   - **Codex web search isn't gated.** Codex runs `webSearch` items without asking, so hib only logs them.
-2. **Review feedback, P1 items** (a security review on 2026-10-09; the P0s, agent isolation and daemon auth, are done above):
-   - Sensitive workspaces: check that native CLI reads, subprocesses, hooks and MCP all respect the policy, now that the sandbox is there.
-   - Prompt injection from repo content and tool results.
-   - Where the regex/NER guard misses things.
-   - (P2) Whether the router's learned scores get enough real feedback.
-3. **Look into the empty `ls` output** in workspace sessions.
-4. **Background task polish.**
-   - A tasks panel in the web UI with review, merge and discard buttons. Today the web has only `/bg`, `/tasks` and `/task <id>`; review and merge need the CLI.
-   - Worktrees start without `node_modules`, so the agent installs dependencies itself.
-   - Tasks that branch from HEAD don't include the folder's uncommitted changes. hib warns about this.
+1. **Check CI after the push.** The server tests (browser sessions, forget refused) and the Linux bubblewrap tests can't run in a sandboxed Claude session (no local port binding, no nested Seatbelt). Confirm both CI jobs pass.
+2. **Sensitive workspaces on Codex** (high): refuse Codex for sensitive policies, or deny the data files in its permission profile. Then the regex data rule (deny data files in the sandbox instead) and placeholder restoring in commands.
+3. **Plugin trust** (high, medium): carry trust over only if every non-markdown file is unchanged; hash files at trust time and check before `import()`; route and agent plugins can't lower `level` or re-enable the advisor.
+4. **Guard and egress** (medium): guard the router advisor's input; save edited approval text; detect before truncating; give the classifier the full guard; keep the `dirs` pin across fallback, advisor and failover.
+5. **Codex permission gaps** (medium): check move destinations; judge the full command; gate or disable `webSearch`.
+6. **Analysis sandbox** (medium): refuse to run without an OS sandbox (or require a flag) and fix the labels; invert the macOS Seatbelt profile (test outside a sandboxed session).
+7. **Low-severity items** above, then the older items: the empty `ls` output, and background-task polish (a tasks panel with review/merge/discard in the web UI; worktrees start without `node_modules`; tasks don't include uncommitted changes, hib warns).
+8. **Review feedback, P2**: whether the router's learned scores get enough real feedback; prompt injection from repo content and tool results beyond what the sandbox and approvals cover.
 
 ## How to check it works
-- `bun test` and `bunx tsc --noEmit -p .`
+- `bun test` and `bunx tsc --noEmit -p .`. Inside a sandboxed Claude session, the analyze tests (nested Seatbelt) and the server tests (local port binding) fail for environmental reasons; CI runs them.
 - With a scratch home: `HIB_HOME=/tmp/hibhome hib daemon start`, then open the printed URL in a test folder. Change `port` in its config.toml first if your own daemon is running.
-- After changing web or daemon code, run `hib daemon stop`. The running daemon serves the old code.
+- After changing web or daemon code, run `hib daemon stop`. The running daemon serves the old code. Browsers then need a fresh link only if their 30-day session expired.

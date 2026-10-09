@@ -101,3 +101,24 @@ describe("codex approvals", () => {
     expect(e.ruleKey).toStartWith("command:exact:widen:");
   });
 });
+
+describe("sensitive policy reaches every folder an agent could open", () => {
+  test("subfolders inherit it, parents are held to it, and two different pins can't be mixed", async () => {
+    const { Workspaces } = await import("../src/workspace/registry");
+    const { memoryDb } = await import("../src/db");
+    const { parseConfig } = await import("../src/config");
+    const { realpathSync } = await import("node:fs");
+    const cfg = parseConfig(Bun.TOML.parse(`[models.claude]\nsonnet = "balanced"\n[providers.claude]\ndefault = "main"\n[providers.claude.accounts.main]\nenv = {}\n[providers.claude.accounts.work]\nenv = {}\n`) as any, tmpdir());
+    const ws = new Workspaces(memoryDb(), cfg);
+    const top = realpathSync(mkdtempSync(join(tmpdir(), "hib-pol-")));
+    for (const d of ["client/api", "other"]) mkdirSync(join(top, d), { recursive: true });
+    for (const d of ["", "client", "client/api", "other"]) ws.register(join(top, d));
+    ws.setPolicy(join(top, "client"), { sensitive: true, account: "claude@work" });
+    expect(ws.policy(join(top, "client/api"))).toBeNull(); // the exact-match lookup misses it…
+    expect(ws.effectivePolicy(join(top, "client/api"))?.account).toBe("claude@work"); // …the effective one doesn't
+    expect(ws.effectivePolicy(top)?.account).toBe("claude@work"); // a parent can read the sensitive child
+    expect(ws.effectivePolicy(join(top, "other"))).toBeNull();
+    ws.setPolicy(join(top, "other"), { sensitive: true, account: "claude@main" });
+    expect(() => ws.effectivePolicy(top)).toThrow(/different accounts/);
+  });
+});

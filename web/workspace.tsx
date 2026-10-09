@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { HibClient } from "../src/client";
+import { BROWSER_SESSION, HibClient } from "../src/client";
 import { Markdown } from "./markdown";
 import { ANALYZABLE, AnalyzePanel } from "./analyze";
 import { Icon } from "./icons";
@@ -165,7 +165,7 @@ function TerminalPane({ root }: { root: string }) {
     term.loadAddon(fit);
     term.open(ref.current!);
     fit.fit();
-    const sock = new WebSocket(`ws://${location.host}/ws/terminal?root=${encodeURIComponent(root)}`);
+    const sock = new WebSocket(`ws://${location.host}/ws/terminal?root=${encodeURIComponent(root)}&session=${encodeURIComponent(localStorage.getItem(BROWSER_SESSION) ?? "")}`);
     sock.binaryType = "arraybuffer";
     sock.onmessage = (m) => term.write(typeof m.data === "string" ? m.data : new Uint8Array(m.data));
     sock.onopen = () => sock.send(JSON.stringify({ resize: [term.cols, term.rows] }));

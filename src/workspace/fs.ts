@@ -46,13 +46,13 @@ async function run(cmd: string[], cwd: string): Promise<{ out: string; code: num
 }
 
 async function isGitRepo(root: string): Promise<boolean> {
-  return (await run(["git", "rev-parse", "--is-inside-work-tree"], root)).code === 0;
+  return (await run(["git", "-c", "core.fsmonitor=false", "rev-parse", "--is-inside-work-tree"], root)).code === 0;
 }
 
 /** Workspace file list, honouring .gitignore when the folder is a git repo. */
 export async function listFiles(root: string): Promise<string[]> {
   if (await isGitRepo(root)) {
-    const { out } = await run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], root);
+    const { out } = await run(["git", "-c", "core.fsmonitor=false", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], root);
     return out.split("\0").filter(Boolean).slice(0, MAX_FILES).sort();
   }
   const out: string[] = [];

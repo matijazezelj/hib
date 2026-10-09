@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { HibClient } from "../src/client";
+import { BROWSER_SESSION, HibClient } from "../src/client";
 import type { HibEvent } from "../src/engine";
 import { WorkspaceApp } from "./workspace";
 import { Markdown } from "./markdown";
@@ -69,7 +69,13 @@ function App() {
     const code = url.searchParams.get("login") ?? "";
     url.searchParams.delete("login");
     history.replaceState(null, "", url);
-    fetch(`/hib/session?code=${encodeURIComponent(code)}`).then(async (r) => (r.ok ? setInfo(await api.get("/hib/info")) : setLoggedOut(true)));
+    (async () => {
+      if (code) {
+        const r = await fetch("/hib/session", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
+        if (r.ok) localStorage.setItem(BROWSER_SESSION, ((await r.json()) as any).session);
+      }
+      setInfo(await api.get("/hib/info"));
+    })().catch(() => setLoggedOut(true));
   }, []);
   // /?ws=<folder> is a workspace; / lists workspaces; /?router is the multi-model chat.
   const params = new URLSearchParams(location.search);

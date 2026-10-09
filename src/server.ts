@@ -25,6 +25,7 @@ export function apiToken(home: string): string {
 }
 
 const LOGIN_TTL = 15 * 60_000;
+const BROWSER_SESSION_TTL = 30 * 24 * 3600_000;
 const json = (data: unknown, status = 200) => Response.json(data, { status });
 const sse = (body: ReadableStream) => new Response(body, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } });
 
@@ -82,17 +83,24 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
   const logins = new Map<string, number>(); // one-time browser login codes → expiry
 
   /**
-   * Defends against browsers: the Host check stops DNS rebinding and the Origin check plus SameSite cookie stop other sites.
-   * Against local processes the token is the boundary: the browser gets its cookie only for a one-time login code, which
-   * only a token holder can mint, so an agent sandboxed away from ~/.hib can't talk its way in.
+   * Defends against browsers: the Host check stops DNS rebinding and the Origin check stops other sites; there is no
+   * cookie for a cross-site request to carry. Against local processes the token is the boundary. The browser never gets
+   * the token: it trades a one-time login code (which only a token holder can mint) for its own session id, kept in
+   * localStorage. That is per origin, port included; a cookie on 127.0.0.1 would reach every other local server too.
    */
-  function authorized(req: Request): boolean {
+  function authorized(req: Request, viaQuery = false): boolean {
     if (!hosts.has(req.headers.get("host") ?? "")) return false;
     const origin = req.headers.get("origin");
     if (origin && !origins.has(origin)) return false;
-    const bearer = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-    const cookie = /(?:^|;\s*)hib_token=([^;]+)/.exec(req.headers.get("cookie") ?? "")?.[1];
-    return bearer === token || cookie === token;
+    // A WebSocket can't carry headers from the browser, so the terminal sends its session id in the URL.
+    const cred = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? (viaQuery ? q(req, "session") : "");
+    return !!cred && (same(cred, token) || browserSession(cred));
+  }
+  const same = (a: string, b: string) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  const sidHash = (sid: string) => new Bun.CryptoHasher("sha256").update(sid).digest("hex");
+  function browserSession(sid: string): boolean {
+    const row = engine.db.query("SELECT created FROM browser_sessions WHERE hash = ?").get(sidHash(sid)) as { created: number } | null;
+    return !!row && row.created > Date.now() - BROWSER_SESSION_TTL;
   }
 
   const guarded = (fn: (req: Request & { params: Record<string, string> }) => Response | Promise<Response>) => async (req: any) => {
@@ -148,7 +156,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
     idleTimeout: 255,
     websocket: terminalSocket,
     routes: {
-      "/ws/tree": ws(async (root) => json({ root, files: await listFiles(root), git: await git.status(root), policy: workspaces.policy(root) })),
+      "/ws/tree": ws(async (root) => json({ root, files: await listFiles(root), git: await git.status(root), policy: workspaces.effectivePolicy(root) })),
       "/ws/egress/:id": ws((root, req) => (sessionIn(root, req.params.id!) ? json(sessions.egress(req.params.id!)) : json({ error: { message: "not found" } }, 404))),
       "/ws/file": ws((root, req) => json(readFile(root, q(req, "path")))),
       "/ws/git/status": ws(async (root) => json(await git.status(root))),
@@ -160,7 +168,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           const b: any = await req.json();
           if (b.sessionId && !sessionIn(root, b.sessionId)) return json({ error: { message: "session not in this workspace" } }, 404);
           const task = tasks.byWorktree(root);
-          if (task && workspaces.policyFor(task.root)) return json({ error: { message: "the folder this task came from is now sensitive; discard the task" } }, 403);
+          if (task && workspaces.effectivePolicy(task.root)) return json({ error: { message: "the folder this task came from is now sensitive; discard the task" } }, 403);
           const r = sessions.startTurn({ sessionId: b.sessionId || undefined, root, model: b.model || undefined, text: String(b.text ?? ""), auto: typeof b.auto === "boolean" ? b.auto : undefined, advisor: typeof b.advisor === "boolean" ? b.advisor : undefined });
           return "error" in r ? json({ error: { message: r.error } }, 409) : json(r);
         }),
@@ -257,16 +265,22 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
         }),
       },
       "/ws/terminal": (req: Request, server: any) => {
-        if (!authorized(req)) return new Response("unauthorized", { status: 401 });
+        if (!authorized(req, true)) return new Response("unauthorized", { status: 401 });
         const root = workspaces.resolve(q(req, "root"));
         if (!root) return new Response("unknown workspace", { status: 404 });
-        if (workspaces.policy(root)) return new Response("the browser terminal is off in sensitive workspaces", { status: 403 });
+        if (workspaces.effectivePolicy(root)) return new Response("the browser terminal is off in sensitive workspaces", { status: 403 });
         return server.upgrade(req, { data: { kind: "terminal", cwd: root } }) ? undefined : new Response("upgrade failed", { status: 400 });
       },
       "/hib/workspaces": {
         GET: guarded(() => json(userWorkspaces())),
         POST: guarded(async (req) => json({ root: workspaces.register(String(((await req.json()) as any).root ?? "")) })),
-        DELETE: guarded((req) => (workspaces.forget(q(req, "root")), json({ ok: true }))),
+        DELETE: guarded((req) => {
+          // Forgetting a sensitive folder would drop its policy, and registering it again would bring it back unpinned.
+          const root = workspaces.resolve(q(req, "root"));
+          if (root && workspaces.policy(root)) return json({ error: { message: "this folder is sensitive; run `hib workspace normal` in it first" } }, 403);
+          workspaces.forget(q(req, "root"));
+          return json({ ok: true });
+        }),
       },
       "/hib/workspaces/policy": {
         POST: guarded(async (req) => {
@@ -325,14 +339,21 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           return json({ code });
         }),
       },
-      // Trades a login code for the web UI's session cookie; the code is burnt. SameSite=Strict means other sites can never send it.
-      "/hib/session": (req) => {
-        if (!hosts.has(req.headers.get("host") ?? "")) return new Response("bad host", { status: 400 });
-        const code = q(req, "code");
-        const exp = logins.get(code);
-        logins.delete(code);
-        if (!code || !exp || exp < Date.now()) return new Response(null, { status: authorized(req) ? 204 : 401 });
-        return new Response(null, { status: 204, headers: { "set-cookie": `hib_token=${token}; HttpOnly; SameSite=Strict; Path=/` } });
+      // Trades a login code for a browser session id (stored hashed, valid 30 days); the code is burnt.
+      "/hib/session": {
+        POST: async (req) => {
+          if (!hosts.has(req.headers.get("host") ?? "")) return new Response("bad host", { status: 400 });
+          const origin = req.headers.get("origin");
+          if (origin && !origins.has(origin)) return json({ error: { message: "unauthorized" } }, 401);
+          const code = String(((await req.json().catch(() => ({}))) as any).code ?? "");
+          const exp = logins.get(code);
+          logins.delete(code);
+          if (!code || !exp || exp < Date.now()) return json({ error: { message: "this login link is used up or expired" } }, 401);
+          const sid = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+          engine.db.run("DELETE FROM browser_sessions WHERE created < ?", [Date.now() - BROWSER_SESSION_TTL]);
+          engine.db.run("INSERT INTO browser_sessions(hash, created) VALUES (?, ?)", [sidHash(sid), Date.now()]);
+          return json({ session: sid });
+        },
       },
 
       "/v1/models": guarded(() => json({ object: "list", data: modelList().map((id) => ({ id, object: "model", owned_by: "hib" })) })),

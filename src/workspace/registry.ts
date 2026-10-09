@@ -56,6 +56,20 @@ export class Workspaces {
     return hits[0] ? { root: hits[0].root, policy: hits[0].policy! } : null;
   }
 
+  /**
+   * The policy that governs agents working in `root`. A sensitive folder's rules follow it into every subfolder, and
+   * a folder that contains a sensitive one is held to its rules too (an agent there can read the child). Two sensitive
+   * folders pinned to different accounts can't both be satisfied, so that's an error.
+   */
+  effectivePolicy(root: string): Policy | null {
+    const up = this.policyFor(root)?.policy;
+    const down = this.list().filter((w) => w.policy && w.root.startsWith(root + "/")).map((w) => w.policy!);
+    const all = [...(up ? [up] : []), ...down];
+    const accounts = new Set(all.map((p) => p.account));
+    if (accounts.size > 1) throw new Error(`${root} spans sensitive folders pinned to different accounts (${[...accounts].join(", ")}); open hib in one of them instead`);
+    return all[0] ?? null;
+  }
+
   setPolicy(dir: string, policy: Policy | null) {
     const root = this.resolve(dir);
     if (!root) throw new Error(`${dir} is not a registered workspace; run hib there first`);

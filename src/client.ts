@@ -23,12 +23,17 @@ async function* sseLines(r: Response): AsyncGenerator<any> {
   }
 }
 
+export const BROWSER_SESSION = "hib_session";
+
 export class HibClient {
   constructor(private base = "", private token?: string) {}
 
   private headers(): Record<string, string> {
     const h: Record<string, string> = { "content-type": "application/json" };
-    if (this.token) h.authorization = `Bearer ${this.token}`;
+    // In the browser: the session id from the login link. localStorage is per origin (port included), unlike cookies,
+    // which 127.0.0.1 shares with every other local port.
+    const token = this.token ?? (typeof localStorage !== "undefined" ? localStorage.getItem(BROWSER_SESSION) : null);
+    if (token) h.authorization = `Bearer ${token}`;
     return h;
   }
 

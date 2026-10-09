@@ -54,6 +54,7 @@ export interface StartOptions {
   askReads?: boolean; // sensitive workspaces: file reads need approval too
   mcp?: McpServer; // hib's own tools (the advisor), launched by the CLI
   sandbox?: Sandbox; // OS-level confinement for the agent's commands
+  denyReads?: string[]; // absolute paths the CLI's own file tools may never read (they run outside the sandbox)
 }
 
 /** What the agent's commands (and every process they start) may not touch, whatever is approved. */

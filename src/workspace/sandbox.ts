@@ -17,22 +17,31 @@ export function sandboxAvailable(): boolean {
 }
 
 /**
- * Paths no agent command may read, whatever is approved: hib's home (the daemon token, database, vault key), every
- * account's CLI login (the session's own included; commands never need it), and common credential stores.
+ * Credentials agents never read. `commands`: denied to every sandboxed command (and so to scripts the agent writes).
+ * `tools`: denied to the CLI's own file tools too, which run outside the sandbox; that list adds what commands still
+ * need to work (npm reads ~/.npmrc for its registry) and whole CLI homes (Codex runs its binary from CODEX_HOME).
  */
-export function sandboxFor(cfg: Config): Sandbox | undefined {
-  if (!sandboxAvailable()) return undefined;
+export function secretPaths(cfg: Config): { commands: string[]; tools: string[] } {
   const home = homedir();
   const expand = (p: string) => p.replace(/^~(?=$|\/)/, home);
-  // Codex runs its own binary from inside CODEX_HOME (packages/), so only its login file is hidden there.
   const codexHomes = [join(home, ".codex"), ...cfg.accounts.map((a) => a.env.CODEX_HOME).filter((p): p is string => !!p).map(expand)];
-  const paths = [
+  const commands = [
     hibHome(),
-    ...[".claude", ".claude.json", ".ssh", ".aws", ".gnupg", ".config/gh", ".netrc", ".git-credentials"].map((p) => join(home, p)),
+    ...[
+      ".claude", ".claude.json", ".ssh", ".aws", ".gnupg", ".config/gh", ".netrc", ".git-credentials",
+      ".cargo/credentials", ".cargo/credentials.toml", ".pypirc", ".docker/config.json", ".kube", ".config/gcloud", ".azure",
+    ].map((p) => join(home, p)),
     ...cfg.accounts.map((a) => a.env.CLAUDE_CONFIG_DIR).filter((p): p is string => !!p).map(expand),
     ...codexHomes.map((d) => join(d, "auth.json")),
   ];
-  return { denyRead: [...new Set(paths)].filter((p) => existsSync(p)) };
+  const tools = [...commands, ...codexHomes, join(home, ".npmrc"), join(home, ".yarnrc.yml"), join(home, ".gem/credentials")];
+  return { commands: [...new Set(commands)], tools: [...new Set(tools)] };
+}
+
+/** The sandbox for agent commands: hib's home, every account's CLI login and common credential stores are unreadable. */
+export function sandboxFor(cfg: Config): Sandbox | undefined {
+  if (!sandboxAvailable()) return undefined;
+  return { denyRead: secretPaths(cfg).commands.filter((p) => existsSync(p)) };
 }
 
 /** Package registries a sandboxed command may reach in auto mode; any other host asks, even in auto mode. */

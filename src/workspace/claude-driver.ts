@@ -78,7 +78,9 @@ export class ClaudeDriver implements AgentDriver {
     // Nor do they write git internals (hooks and config run outside any sandbox); Claude checks this itself too.
     // Web tools send data off the machine: they always come to hib for approval, whatever allow rules or pre-approved
     // sites the user's own Claude settings have (ask rules win over allow rules).
-    const permissions: Record<string, string[]> = { deny: [...SECRET_READS, ...GIT_WRITES], ask: ["WebFetch", "WebSearch"] };
+    // `//` makes a rule path absolute; each entry may be a file or a folder.
+    const denyReads = (opts.denyReads ?? []).flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]);
+    const permissions: Record<string, string[]> = { deny: [...SECRET_READS, ...denyReads, ...GIT_WRITES], ask: ["WebFetch", "WebSearch"] };
     if (opts.askReads) {
       // Reads (and read-only Bash like `cat`) are normally auto-allowed; asking shows every file before its content leaves.
       permissions.ask = ["Read", "Grep", "Glob", "NotebookRead", "Bash", "Task", "Agent", "WebFetch", "WebSearch"];
