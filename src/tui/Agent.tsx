@@ -138,7 +138,8 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
       case "mode":
         autoRef.current = e.auto;
         setAuto(e.auto);
-        push({ text: e.auto ? "auto mode: edits and commands run without asking (network, push, publish, sudo, rm -r still ask)" : "manual mode: every edit and command asks", color: e.auto ? "yellow" : undefined, dim: !e.auto });
+        if (e.why) push({ text: `auto mode unavailable: ${e.why}`, color: "yellow" });
+        else push({ text: e.auto ? "auto mode: sandboxed edits and commands run without asking (new network hosts, push, publish, sudo, rm -r still ask)" : "manual mode: every edit and command asks", color: e.auto ? "yellow" : undefined, dim: !e.auto });
         break;
       case "tool_call":
         if (seenCalls.current.has(e.call.id)) break; // same call re-announced with more detail
@@ -320,7 +321,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
           const t = await client.post(`/ws/task?${q}`, { text: arg, model });
           push({ text: `◆ task ${t.id.slice(2)} started on ${t.model} in ${t.branch} (auto mode); you'll get a notification`, color: "magenta" });
           if (t.dirty) push({ text: `  it starts from the last commit; your ${t.dirty} uncommitted change(s) aren't in it`, dim: true });
-          push({ text: `  /tasks to check on it · hib tasks review ${t.id.slice(2)} · ${workspaceUrl(url, t.worktree, t.session_id)}`, dim: true });
+          push({ text: `  /tasks to check on it · hib tasks review ${t.id.slice(2)} · ${await workspaceUrl(client, url, t.worktree, t.session_id)}`, dim: true });
         } catch (e: any) {
           push({ text: e.message, color: "red" });
         }
@@ -347,7 +348,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         return true;
       }
       case "web":
-        push({ text: workspaceUrl(url, root, sidRef.current), color: "cyan" });
+        push({ text: await workspaceUrl(client, url, root, sidRef.current), color: "cyan" });
         return true;
       case "usage":
         for (const u of await client.get("/hib/usage"))

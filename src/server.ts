@@ -24,6 +24,7 @@ export function apiToken(home: string): string {
   return readFileSync(file, "utf8").trim();
 }
 
+const LOGIN_TTL = 15 * 60_000;
 const json = (data: unknown, status = 200) => Response.json(data, { status });
 const sse = (body: ReadableStream) => new Response(body, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } });
 
@@ -78,10 +79,12 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
   const workspaces = engine.workspaces;
   const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
   const origins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`]);
+  const logins = new Map<string, number>(); // one-time browser login codes → expiry
 
   /**
    * Defends against browsers: the Host check stops DNS rebinding and the Origin check plus SameSite cookie stop other sites.
-   * Local processes are trusted: any of them can call /hib/session, just as they can read ~/.hib/token.
+   * Against local processes the token is the boundary: the browser gets its cookie only for a one-time login code, which
+   * only a token holder can mint, so an agent sandboxed away from ~/.hib can't talk its way in.
    */
   function authorized(req: Request): boolean {
     if (!hosts.has(req.headers.get("host") ?? "")) return false;
@@ -312,9 +315,23 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
 
       "/": index,
       "/favicon.ico": new Response(null, { status: 204 }),
-      // Sets the session cookie for the web UI. SameSite=Strict means other sites can never send it.
+      // A one-time code for a browser link; minting one needs the token.
+      "/hib/login": {
+        POST: guarded(() => {
+          const now = Date.now();
+          for (const [c, exp] of logins) if (exp < now) logins.delete(c);
+          const code = Buffer.from(crypto.getRandomValues(new Uint8Array(18))).toString("base64url");
+          logins.set(code, now + LOGIN_TTL);
+          return json({ code });
+        }),
+      },
+      // Trades a login code for the web UI's session cookie; the code is burnt. SameSite=Strict means other sites can never send it.
       "/hib/session": (req) => {
         if (!hosts.has(req.headers.get("host") ?? "")) return new Response("bad host", { status: 400 });
+        const code = q(req, "code");
+        const exp = logins.get(code);
+        logins.delete(code);
+        if (!code || !exp || exp < Date.now()) return new Response(null, { status: authorized(req) ? 204 : 401 });
         return new Response(null, { status: 204, headers: { "set-cookie": `hib_token=${token}; HttpOnly; SameSite=Strict; Path=/` } });
       },
 

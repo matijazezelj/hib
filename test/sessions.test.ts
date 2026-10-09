@@ -8,7 +8,7 @@ import { Engine } from "../src/engine";
 import { Sealer } from "../src/guard/seal";
 import { Registry } from "../src/providers/registry";
 import type { Provider } from "../src/providers/types";
-import type { AgentDriver, AgentEvent, Decision, StartOptions } from "../src/workspace/driver";
+import type { AgentDriver, AgentEvent, Decision, Sandbox, StartOptions } from "../src/workspace/driver";
 import { Queue } from "../src/workspace/queue";
 import { WorkspaceSessions, type WsEvent } from "../src/workspace/sessions";
 
@@ -73,6 +73,7 @@ class FakeDriver implements AgentDriver {
 }
 
 let advisorSaw: string[] = [];
+let sandbox: Sandbox | undefined;
 let root: string, sessions: WorkspaceSessions, script: { current: Script }, drivers: FakeDriver[], engine: Engine;
 
 beforeEach(async () => {
@@ -94,11 +95,18 @@ beforeEach(async () => {
   engine = new Engine(cfg, memoryDb(), new Registry([alpha, beta]), sealer, { skills: new Map(), agents: new Map(), routes: [], guardTerms: [], guardPatterns: [], askOn: [], advisor: [], providers: [], warnings: [] });
   script = { current: async () => {} };
   drivers = [];
-  sessions = new WorkspaceSessions(engine, sealer, () => {
-    const d = new FakeDriver(script);
-    drivers.push(d);
-    return d;
-  });
+  sandbox = { denyRead: ["/fake/.hib"] };
+  sessions = new WorkspaceSessions(
+    engine,
+    sealer,
+    () => {
+      const d = new FakeDriver(script);
+      drivers.push(d);
+      return d;
+    },
+    "",
+    () => sandbox,
+  );
 });
 
 /** Runs a turn, answering permissions with `choose` as they arrive. */
@@ -199,6 +207,43 @@ describe("workspace sessions", () => {
     }
     expect(prompted).toEqual(["push", "curl", "rm", "sudo", "hooks", "outside", "mcp", "token", "daemon"]);
     for (const id of ["edit", "test", "read"]) expect(drivers[0]!.decisions.get(id)!.behavior).toBe("allow");
+  });
+
+  test("the CLI starts sandboxed; in auto mode a new network host asks unless it's a package registry", async () => {
+    const net = (id: string, host: string): AgentEvent => ({ type: "permission", id, ruleKey: `net:${host}`, call: { id, name: "SandboxNetworkAccess", kind: "web", title: `Network: ${host}`, host }, input: { host } });
+    script.current = async (_t, d, q) => {
+      for (const [id, host] of [["npm", "registry.npmjs.org"], ["exfil", "attacker.example"]]) {
+        q.push(net(id!, host!));
+        await d.ask(id!);
+      }
+    };
+    const prompted: string[] = [];
+    let sid = "";
+    for await (const e of sessions.send({ root, model: "alpha/big", text: "go", auto: true })) {
+      if (e.type === "ws_session") (sid = e.id), expect(e.sandbox).toBe(true);
+      if (e.type === "permission") prompted.push(e.id), sessions.answer(sid, e.id, "deny");
+    }
+    expect(drivers[0]!.started[0]!.sandbox).toEqual({ denyRead: ["/fake/.hib"] });
+    expect(prompted).toEqual(["exfil"]);
+    expect(drivers[0]!.decisions.get("npm")!.behavior).toBe("allow");
+  });
+
+  test("without an OS sandbox auto mode stays off and says why", async () => {
+    sandbox = undefined;
+    script.current = async (_t, d, q) => {
+      q.push({ type: "permission", id: "p1", ruleKey: "Bash:bun test", call: { id: "c1", name: "Bash", kind: "command", title: "$ bun test", command: "bun test" }, input: {} });
+      await d.ask("p1");
+    };
+    const events: WsEvent[] = [];
+    let sid = "";
+    for await (const e of sessions.send({ root, model: "alpha/big", text: "go", auto: true })) {
+      events.push(e);
+      if (e.type === "ws_session") sid = e.id;
+      if (e.type === "permission") sessions.answer(sid, e.id, "deny");
+    }
+    expect(events.find((e) => e.type === "mode")).toMatchObject({ auto: false, why: expect.stringContaining("sandbox") });
+    expect(events.some((e) => e.type === "permission")).toBe(true); // asked instead of running
+    expect(sessions.snapshot(sid).auto).toBe(false);
   });
 
   test("manual is the default, and switching to auto approves what's already waiting", async () => {

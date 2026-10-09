@@ -17,6 +17,7 @@ export interface ToolCall {
   path?: string;
   paths?: string[]; // every file an edit touches (absolute or workspace-relative)
   command?: string;
+  host?: string; // a sandboxed command reaching the network
   diff?: Diff;
 }
 
@@ -42,6 +43,12 @@ export interface StartOptions {
   system?: string;
   askReads?: boolean; // sensitive workspaces: file reads need approval too
   mcp?: McpServer; // hib's own tools (the advisor), launched by the CLI
+  sandbox?: Sandbox; // OS-level confinement for the agent's commands
+}
+
+/** What the agent's commands (and every process they start) may not touch, whatever is approved. */
+export interface Sandbox {
+  denyRead: string[]; // absolute paths: hib's home, credentials, other accounts' logins
 }
 
 export interface McpServer {

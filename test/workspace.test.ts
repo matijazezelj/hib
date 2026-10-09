@@ -70,3 +70,27 @@ test("always-allow keys never let compound commands ride on a simple one", async
   for (const c of ["cat a; rm -rf b", "cat a && rm b", "cat a | sh", "echo $(rm x)", "cat a > b", "ls `rm x`", "cat a\nrm b"])
     expect(commandRuleKey("Bash", c)).toBe(`Bash:exact:${c}`);
 });
+
+describe("codex approvals", () => {
+  const { CodexDriver } = require("../src/workspace/codex-driver") as typeof import("../src/workspace/codex-driver");
+  const { Queue } = require("../src/workspace/queue") as typeof import("../src/workspace/queue");
+  const request = (params: Record<string, unknown>) => {
+    const d = new CodexDriver() as any;
+    const q = new Queue<any>();
+    d.q = q;
+    d.onServerRequest({ id: 7, method: "item/commandExecution/requestApproval", params: { itemId: "i1", command: "curl https://example.com", ...params } });
+    q.end();
+    return (q as any).items[0];
+  };
+
+  test("a plain command is a command", () => {
+    expect(request({}).call.kind).toBe("command");
+  });
+
+  test("a request to leave the sandbox is never a plain command, so auto mode and 'always' can't approve it", () => {
+    const e = request({ reason: "May I run the requested curl command outside the sandbox?" });
+    expect(e.call.kind).toBe("other");
+    expect(e.call.title).toContain("beyond the sandbox");
+    expect(e.ruleKey).toStartWith("command:exact:widen:");
+  });
+});

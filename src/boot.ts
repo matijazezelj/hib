@@ -61,8 +61,10 @@ export async function registerWorkspace(client: HibClient, dir: string): Promise
   return (await client.post<{ root: string }>("/hib/workspaces", { root: dir })).root;
 }
 
-export function workspaceUrl(url: string, root: string, sessionId?: string): string {
-  return `${url}/?ws=${encodeURIComponent(root)}${sessionId ? `&s=${sessionId}` : ""}`;
+/** A browser link that logs in once: it carries a one-time code (valid 15 minutes) for the session cookie. */
+export async function workspaceUrl(client: HibClient, url: string, root?: string, sessionId?: string): Promise<string> {
+  const { code } = await client.post<{ code: string }>("/hib/login", {});
+  return `${url}/?${root ? `ws=${encodeURIComponent(root)}&` : ""}${sessionId ? `s=${sessionId}&` : ""}login=${code}`;
 }
 
 /** Back-compat for router clients (`hib chat`, `hib ask`): the shared daemon. */

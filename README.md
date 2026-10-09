@@ -28,7 +28,7 @@ ln -s ~/work/personal/hib/src/cli.ts ~/.local/bin/hib   # any dir on your PATH; 
 ```sh
 cd ~/code/myproject
 hib                  # terminal coding agent for this folder
-hib serve            # the same folder in the browser: http://127.0.0.1:4141/?ws=…
+hib serve            # the same folder in the browser; prints a link that logs the browser in once
 hib --resume         # pick up a session in this folder, whether it started here or in the browser
 hib task "…"         # hand a task to a background agent in its own git worktree
 hib tasks            # check on background tasks; review, merge or discard one
@@ -47,13 +47,14 @@ Any OpenAI client can use the router: set `OPENAI_BASE_URL=http://127.0.0.1:4141
   - "Always" lasts for the session and is scoped to the program and subcommand, so `git status` doesn't cover `git push`.
   - Compound commands like `a; rm b` only ever match themselves.
   - "Always allow edits" only covers files inside the folder.
-- **Auto mode** (`/auto`, or the **Ask first** chip in the browser; off by default, per session). Edits inside the folder and commands run without asking. hib still asks for:
+- **Auto mode** (`/auto`, or the **Ask first** chip in the browser; off by default, per session). Edits inside the folder and sandboxed commands run without asking. hib still asks for:
+  - a command reaching a new network host (package registries like npm and PyPI excepted);
   - network tools, `git push`, publishing, `sudo`, `rm -r` and history rewrites;
   - commands that touch hib's daemon or credential folders;
   - edits to tool config;
   - reads in sensitive folders.
 
-  This is a speed bump, not a sandbox: a script the agent writes and runs can still do anything you can.
+  Auto mode needs the OS sandbox (below). Without one (Linux without bubblewrap and socat, or Windows) it stays off, and so do background tasks.
 - **Advisor** (`/advisor`, or the **Advisor** chip; off by default, never in sensitive folders). The agent gets an `advisor` tool, served by hib over MCP. It can consult a model from the other provider (Claude asks Codex, Codex asks Claude) before it starts, when stuck and before it says it's done.
   - The advisor sees the task, a session summary and the current diff, redacted by the guard with the session's placeholders.
   - Every consult shows in the timeline and the egress log.
@@ -180,7 +181,7 @@ The log stores the redacted text locally in `~/.hib/hib.db`, so anything the gua
   - Host header checks stop DNS rebinding.
   - Origin checks and a `SameSite=Strict` cookie stop other websites.
   - API clients use the token in `~/.hib/token`.
-  - Local processes are trusted.
+  - The browser gets its cookie only for a one-time login code in the link `hib serve` or `/web` prints, valid for 15 minutes. Minting a code needs the token.
 - **Files:** everything in `~/.hib` is `0600`.
   - `hib.db` holds conversations as originals, plus the audit log, which records counts, never values.
   - `vault.key` seals each conversation's token map with AES-256-GCM.
@@ -188,11 +189,20 @@ The log stores the redacted text locally in `~/.hib/hib.db`, so anything the gua
   - the folder boundary;
   - a one-time pre-scan for `.env` and key files;
   - per-action permission prompts.
-- **Credentials are off-limits.** Every workspace session, sensitive or not, is denied reads of `~/.hib`, `~/.claude*`, `~/.codex`, `~/.ssh`, `~/.aws`, `~/.gnupg` and `~/.config/gh`.
+- **Agent commands run in an OS sandbox.** It's the CLIs' own: Claude Code's Bash sandbox (Seatbelt on macOS, bubblewrap on Linux) and Codex's sandbox with a hib permission profile. It is on in every session, manual or auto, and it covers every process a command starts, including scripts the agent wrote. Inside it:
+  - writes stay in the folder (and temp dirs);
+  - the network is closed, so a command reaching a host asks first (Claude), or can't (Codex);
+  - the daemon on localhost can't be reached;
+  - these can't be read: `~/.hib` (the daemon token, database and vault key), every account's CLI login (`~/.claude*`, Codex's `auth.json`), `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.netrc` and `~/.git-credentials`.
+
+  hib's permission prompts still decide what runs. The sandbox limits what an approved command can do.
+- **What the sandbox doesn't cover:**
+  - The CLIs' own file tools (Read, Edit) aren't sandboxed. They are held to the folder by permission rules and hib's prompts instead.
+  - The macOS keychain stays reachable, so a command could ask for a login stored there. With the network closed, the only way out is back to the model's own vendor.
 - **Tool config needs approval every time.** "Always allow edits" never covers `.claude/`, `.codex/`, `.git/` or `.mcp.json` inside the folder, so an agent can't quietly widen its own permissions or plant a git hook.
 - **Policies can only be tightened over the API.** Lifting one takes `hib workspace normal` at the terminal, so the API token alone can't switch it off.
-- **Local processes are trusted.** Anything already running as your user can read `~/.hib`. hib raises the bar but doesn't sandbox your own account.
-- **Your own CLI config still applies:** your `settings.json` allow rules, MCP servers and `CLAUDE.md` / `AGENTS.md` load into agent sessions. Broad allow rules there bypass hib's prompts.
+- **Other local processes.** Anything else running as your user, outside an agent sandbox, can still read `~/.hib/token`. hib protects against its agents, not against your own account.
+- **Your own CLI config still applies:** your `settings.json` allow rules, MCP servers and `CLAUDE.md` / `AGENTS.md` load into agent sessions. Broad allow rules there bypass hib's prompts, and commands listed in your own `sandbox.excludedCommands` run outside the sandbox.
 - **Rendering:** model output is rendered as markdown without raw HTML.
 
 ## Accounts

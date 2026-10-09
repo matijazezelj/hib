@@ -89,8 +89,9 @@ async function main() {
       }
       if (here.ok) {
         const root = await b.registerWorkspace(client, here.root);
-        console.log(`  workspace:   ${b.workspaceUrl(url, root)}`);
-      } else console.log(`  ${here.why}; open ${url}/ for router chat`);
+        console.log(`  workspace:   ${await b.workspaceUrl(client, url, root)}`);
+      } else console.log(`  ${here.why}; open ${await b.workspaceUrl(client, url)} for router chat`);
+      console.log("  (the link logs your browser in once; run hib serve again for a fresh one)");
       if (running && here.ok) console.log(`(daemon already running at ${url}; this folder is now available there)`);
       return;
     }
@@ -286,7 +287,7 @@ async function taskCmd(prompt: string) {
   console.log(`task ${t.id} started on ${t.model}, in auto mode`);
   console.log(`  branch ${t.branch}, worktree ${t.worktree}`);
   if (t.dirty) console.log(`  note: it starts from the last commit; your ${t.dirty} uncommitted change(s) here aren't in it`);
-  console.log(`  watch it: ${b.workspaceUrl(url, t.worktree, t.session_id)}`);
+  console.log(`  watch it: ${await b.workspaceUrl(client, url, t.worktree, t.session_id)}`);
   console.log(`  then: hib tasks review ${t.id.slice(2)}  ·  hib tasks merge ${t.id.slice(2)}`);
 }
 
@@ -332,7 +333,7 @@ async function tasksCmd(sub = "list", id?: string) {
   }
   if (sub === "open") {
     const t = (await client.get(`/hib/tasks/${id}`)).task;
-    if (!process.stdout.isTTY) return console.log(b.workspaceUrl(url, t.worktree, t.session_id));
+    if (!process.stdout.isTTY) return console.log(await b.workspaceUrl(client, url, t.worktree, t.session_id));
     const { runAgent } = await import("./tui/Agent");
     return runAgent({ dir: t.worktree, resume: t.session_id });
   }

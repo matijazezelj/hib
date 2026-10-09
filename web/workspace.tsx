@@ -20,7 +20,7 @@ type Item =
   | { kind: "advice"; model: string; question: string; advice: string; ok: boolean; guard: string }
   | { kind: "approval"; id: string; redacted: string; reasons: string[]; original?: string };
 
-const AUTO_NOTE = "auto: edits in this folder and commands run without asking; network, push, publish, sudo and rm -r still ask";
+const AUTO_NOTE = "auto: edits in this folder and sandboxed commands run without asking; new network hosts, push, publish, sudo and rm -r still ask";
 
 const WS_SUGGESTIONS = [
   { title: "Explain this project", text: "Give me a short tour of this folder: what it does, how it's laid out, and where to start reading." },
@@ -72,6 +72,7 @@ function fold(items: Item[], e: any): Item[] {
       return at < 0 ? items : items.map((x, j) => (j === at ? { ...(x as any), pseudo: e.columns } : x));
     }
     case "mode":
+      if (e.why) return [...items, { kind: "note", text: `auto mode unavailable: ${e.why}`, tone: "warn" }];
       return [...items, { kind: "note", text: e.auto ? AUTO_NOTE : "manual: every edit and command asks first", tone: e.auto ? "warn" : undefined }];
     case "advisor_mode":
       return [...items, { kind: "note", text: e.on ? "advisor on: the agent can consult a model from the other provider (from your next message)" : `advisor off${e.why ? `: ${e.why}` : ""}` }];

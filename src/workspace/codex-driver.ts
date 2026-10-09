@@ -54,12 +54,18 @@ export class CodexDriver implements AgentDriver {
       const env = Object.entries(opts.mcp.env).map(([n, v]) => `${n}=${JSON.stringify(v)}`).join(", ");
       args.push("-c", `${k}.command=${JSON.stringify(opts.mcp.command)}`, "-c", `${k}.args=${JSON.stringify(opts.mcp.args)}`, "-c", `${k}.env={${env}}`, "-c", `${k}.tool_timeout_sec=600`, "-c", `${k}.default_tools_approval_mode="approve"`);
     }
+    if (opts.sandbox) {
+      // A permission profile on top of Codex's workspace sandbox (writes in the folder, no network) that also hides
+      // hib's home and credentials from commands. Replaces the thread's sandbox mode (the two can't both be set).
+      const deny = opts.sandbox.denyRead.map((p) => `${JSON.stringify(p)}="deny"`).join(", ");
+      args.push("-c", 'default_permissions="hib"', "-c", 'permissions.hib.extends=":workspace"', "-c", `permissions.hib.filesystem={${deny}}`);
+    }
     this.proc = Bun.spawn(args, { cwd: opts.cwd, env: accountEnv(opts.account), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     this.readLoop();
     new Response(this.proc.stderr as ReadableStream).text().catch(() => {}); // tracing logs; drained, not fatal
     await this.request("initialize", { clientInfo: { name: "hib", title: "hib", version: "0.1" }, capabilities: { experimentalApi: false, requestAttestation: false } });
     this.send({ method: "initialized" });
-    const params = { model: opts.model, cwd: opts.cwd, approvalPolicy: "untrusted", sandbox: "workspace-write", ...(opts.system ? { developerInstructions: opts.system } : {}) };
+    const params = { model: opts.model, cwd: opts.cwd, approvalPolicy: "untrusted", ...(opts.sandbox ? {} : { sandbox: "workspace-write" }), ...(opts.system ? { developerInstructions: opts.system } : {}) };
     const r = opts.resume ? await this.request("thread/resume", { ...params, threadId: opts.resume, excludeTurns: true }) : await this.request("thread/start", params);
     this.threadId = r.thread.id;
   }
@@ -100,11 +106,17 @@ export class CodexDriver implements AgentDriver {
     if (m.method === "item/commandExecution/requestApproval") {
       const cmd: string = m.params.commandActions?.[0]?.command ?? m.params.command ?? "";
       this.serverRequests.set(pid, m.id);
+      // A command asking for more than the sandbox gives (network, extra paths, running unsandboxed) is never a plain
+      // command: kind "other" keeps auto mode and "always" rules from approving it. Codex 0.160 marks such a request
+      // only with a `reason` ("May I run … outside the sandbox?"); plain approvals carry none.
+      const widens = ["reason", "additionalPermissions", "networkApprovalContext", "sandboxPermissions"].some((k) => m.params[k] != null && m.params[k] !== "use_default");
       this.q?.push({
         type: "permission",
         id: pid,
-        call: { id: m.params.itemId, name: "shell", kind: "command", title: `$ ${short(cmd)}`, command: cmd },
-        ruleKey: commandRuleKey("command", cmd),
+        call: widens
+          ? { id: m.params.itemId, name: "shell", kind: "other", title: `$ ${short(cmd)} (asks to go beyond the sandbox${m.params.reason ? `: ${short(m.params.reason, 80)}` : ""})`, command: cmd }
+          : { id: m.params.itemId, name: "shell", kind: "command", title: `$ ${short(cmd)}`, command: cmd },
+        ruleKey: widens ? `command:exact:widen:${cmd}` : commandRuleKey("command", cmd),
       });
     } else if (m.method === "item/fileChange/requestApproval") {
       this.serverRequests.set(pid, m.id);

@@ -17,6 +17,8 @@ function describe(id: string, name: string, input: any, cwd: string): ToolCall {
   const path = rel(input?.file_path ?? input?.notebook_path ?? input?.path);
   const call: ToolCall = { id, name, kind, title: name };
   if (name === "Bash") Object.assign(call, { command: input.command, title: `$ ${short(input.command ?? "")}` });
+  // A sandboxed command reaching a host for the first time.
+  else if (name === "SandboxNetworkAccess") Object.assign(call, { kind: "web", host: String(input?.host ?? ""), title: `Network: ${short(String(input?.host ?? "?"))}` });
   else if (name === "Grep" || name === "Glob") call.title = `${name} ${short(input.pattern ?? "")}${path ? ` in ${path}` : ""}`;
   else if (path) Object.assign(call, { path, title: `${name} ${path}` });
   else if (input?.url || input?.query) call.title = `${name} ${short(input.url ?? input.query)}`;
@@ -73,7 +75,13 @@ export class ClaudeDriver implements AgentDriver {
       args.push("--mcp-config", JSON.stringify({ mcpServers: { [name]: { type: "stdio", ...server } } }));
       permissions.allow = [`mcp__${name}`]; // hib's own tool: no prompt
     }
-    args.push("--settings", JSON.stringify({ permissions }));
+    // Claude Code's Bash sandbox (Seatbelt on macOS, bubblewrap on Linux) confines every command and whatever it starts:
+    // writes stay in the folder, the network is closed, and the denied paths can't be read. Approval still goes through hib
+    // (autoAllowBashIfSandboxed off), and a command can't ask to leave the sandbox (allowUnsandboxedCommands off).
+    const sandbox = opts.sandbox
+      ? { enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, filesystem: { denyRead: opts.sandbox.denyRead }, network: { allowedDomains: [] } }
+      : undefined;
+    args.push("--settings", JSON.stringify({ permissions, ...(sandbox ? { sandbox } : {}) }));
     this.proc = Bun.spawn(args, { cwd: opts.cwd, env: accountEnv(opts.account), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     this.readLoop();
   }
@@ -136,7 +144,9 @@ export class ClaudeDriver implements AgentDriver {
                 : // "always" for a read covers that directory only
                   r.tool_name === "Read" && call.path
                   ? `read:${call.path.includes("/") ? call.path.slice(0, call.path.lastIndexOf("/")) : "."}`
-                  : r.tool_name;
+                  : r.tool_name === "SandboxNetworkAccess"
+                    ? `net:${r.input?.host ?? ""}` // "always" opens that host only
+                    : r.tool_name;
           q.push({ type: "permission", id: pid, call, ruleKey, input: r.input });
         } else this.send({ type: "control_response", response: { subtype: "error", request_id: m.request_id, error: `hib does not handle ${m.request?.subtype}` } });
         break;

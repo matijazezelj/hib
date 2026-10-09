@@ -4,7 +4,8 @@ import { inspect, obfuscateText, StreamRestorer, tokenNote, Vault } from "../gua
 import type { VaultState } from "../guard/vault";
 import type { Sealer } from "../guard/seal";
 import { resolveCandidate, type Candidate } from "../router/route";
-import type { AgentDriver, AgentEvent, Decision, ToolCall } from "./driver";
+import type { AgentDriver, AgentEvent, Decision, Sandbox, ToolCall } from "./driver";
+import { REGISTRIES, sandboxFor } from "./sandbox";
 import { insideRoot } from "./fs";
 import { detect } from "../guard/detectors";
 import { onPinnedAccount, pinnedModel } from "./registry";
@@ -20,13 +21,13 @@ export type DriverFactory = (provider: string) => AgentDriver | null;
 
 /** Events sent to the web UI; tool data has tokens restored. */
 export type WsEvent =
-  | { type: "ws_session"; id: string; model: string; resumed: boolean }
+  | { type: "ws_session"; id: string; model: string; resumed: boolean; sandbox: boolean }
   | { type: "handoff"; from: string; to: string }
   | { type: "guard"; findings: Record<string, number>; action: string; reasons: string[] }
   | { type: "approval"; id: string; redacted: string; reasons: string[] }
   | { type: "turn_start"; text: string; model?: string }
   | { type: "permission_answer"; id: string; choice: string }
-  | { type: "mode"; auto: boolean }
+  | { type: "mode"; auto: boolean; why?: string }
   | { type: "advisor_mode"; on: boolean; why?: string }
   | { type: "advice"; model: string; account: string; question: string; advice: string; ok: boolean; chars: number; guard: string }
   | { type: "sent"; account: string; model: string; text: string; handoff: boolean; progress?: boolean; chars: number }
@@ -56,6 +57,7 @@ interface Live {
   pending: Map<string, { call: ToolCall; ruleKey: string; input?: unknown }>;
   askReads: boolean;
   advisorKey?: string; // set when this CLI was started with hib's advisor tool
+  sandboxed: boolean; // the agent's commands run in the CLI's OS sandbox
 }
 
 /** A data file: CSV/TSV always; JSON only when it loads as a table (an array of records), not config like package.json. */
@@ -129,7 +131,18 @@ export class WorkspaceSessions {
   private hubs = new Map<string, Hub>();
   private listeners = new Set<() => void>();
 
-  constructor(private engine: Engine, private sealer: Sealer, private drivers: DriverFactory, private daemonUrl = "") {}
+  constructor(
+    private engine: Engine,
+    private sealer: Sealer,
+    private drivers: DriverFactory,
+    private daemonUrl = "",
+    private sandbox: (cfg: Config) => Sandbox | undefined = sandboxFor,
+  ) {}
+
+  /** Whether agent commands can be confined here; auto mode and background tasks need it. */
+  sandboxed(): boolean {
+    return !!this.sandbox(this.cfg);
+  }
 
   private get cfg(): Config {
     return this.engine.cfg;
@@ -280,8 +293,9 @@ export class WorkspaceSessions {
     const advisorKey = !askReads && this.advisorOn.has(id) && this.engine.router.advisorFor(c) ? crypto.randomUUID() : undefined;
     const sys = [system, this.notes.get(id), askReads ? DATA_RULE_NOTE : "", advisorKey ? ADVISOR_NOTE : ""].filter(Boolean).join("\n\n") || undefined;
     const mcp = advisorKey ? { name: "hib", command: process.execPath, args: [ADVISOR_SCRIPT], env: { HIB_URL: this.daemonUrl, HIB_ADVISOR_KEY: advisorKey, HIB_SESSION: id } } : undefined;
-    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp });
-    const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey };
+    const sandbox = this.sandbox(this.cfg);
+    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox });
+    const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox };
     this.live.set(id, l);
     return l;
   }
@@ -404,7 +418,7 @@ export class WorkspaceSessions {
         yield { type: "handoff", from: row.agent_model, to: c.id };
       }
     }
-    yield { type: "ws_session", id: sid, model: c.id, resumed: !!l.nativeId };
+    yield { type: "ws_session", id: sid, model: c.id, resumed: !!l.nativeId, sandbox: l.sandboxed };
     this.db.run("UPDATE conversations SET agent_model = ?, updated = ?, vault = ? WHERE id = ?", [c.id, Date.now(), await this.sealer.seal(vault.state()), sid]);
     this.record(sid, { type: "user", text: input.text, model: c.id });
 
@@ -612,9 +626,13 @@ export class WorkspaceSessions {
 
   /**
    * Auto mode: edits inside the folder and commands run without asking, except edits to tool config and
-   * ASK_EVEN_IN_AUTO commands. In sensitive folders reads, searches and fetches keep asking.
+   * ASK_EVEN_IN_AUTO commands. In sensitive folders reads, searches and fetches keep asking. Commands are
+   * sandboxed (no writes outside the folder, no reads of hib or credentials), and a command reaching a host
+   * other than a package registry asks.
    */
   private autoModeCovers(l: Live, call: ToolCall): boolean {
+    if (!l.sandboxed) return false;
+    if (call.host !== undefined) return REGISTRIES.has(call.host);
     if (call.kind === "edit") {
       const paths = call.paths ?? (call.path ? [call.path] : []);
       return paths.length > 0 && paths.every((p) => insideRoot(l.root, p) && !protectedPath(l.root, p));
@@ -626,6 +644,10 @@ export class WorkspaceSessions {
 
   /** Switches a session between asking for every action (manual, the default) and auto mode; pending prompts it covers are approved. */
   setAuto(sessionId: string, on: boolean) {
+    if (on && !this.sandboxed()) {
+      this.auto.delete(sessionId);
+      return this.emit(sessionId, { type: "mode", auto: false, why: "auto mode needs an OS sandbox for agent commands (macOS, or Linux with bubblewrap and socat installed)" });
+    }
     if (on) this.auto.add(sessionId);
     else this.auto.delete(sessionId);
     this.emit(sessionId, { type: "mode", auto: on });

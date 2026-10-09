@@ -62,11 +62,24 @@ const SUGGESTIONS = [
 
 function App() {
   const [info, setInfo] = useState<any>(null);
+  const [loggedOut, setLoggedOut] = useState(false);
   useEffect(() => {
-    fetch("/hib/session").then(async () => setInfo(await api.get("/hib/info")));
+    // A link from hib carries a one-time login code; trade it for the cookie and drop it from the address bar.
+    const url = new URL(location.href);
+    const code = url.searchParams.get("login") ?? "";
+    url.searchParams.delete("login");
+    history.replaceState(null, "", url);
+    fetch(`/hib/session?code=${encodeURIComponent(code)}`).then(async (r) => (r.ok ? setInfo(await api.get("/hib/info")) : setLoggedOut(true)));
   }, []);
   // /?ws=<folder> is a workspace; / lists workspaces; /?router is the multi-model chat.
   const params = new URLSearchParams(location.search);
+  if (loggedOut)
+    return (
+      <div className="home">
+        <h1>hib</h1>
+        <p>This browser isn't logged in. Run <code>hib serve</code> (or <code>/web</code> in the terminal agent) and open the link it prints. Each link logs in once.</p>
+      </div>
+    );
   if (!info) return null;
   if (params.get("ws")) return <WorkspaceApp info={info} root={params.get("ws")!} />;
   if (!params.has("router") && info.workspaces?.length) return <Home info={info} />;

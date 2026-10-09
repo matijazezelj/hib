@@ -58,6 +58,8 @@ class FakeDriver implements AgentDriver {
   }
 }
 
+const FAKE_SANDBOX = () => ({ denyRead: ["/fake/.hib"] });
+
 const git = (cwd: string, ...args: string[]) => {
   const r = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
   if (!r.success) throw new Error(r.stderr.toString());
@@ -88,11 +90,17 @@ beforeEach(async () => {
   engine.workspaces.register(root);
   script = { current: async () => {} };
   drivers = [];
-  sessions = new WorkspaceSessions(engine, sealer, () => {
-    const d = new FakeDriver(script);
-    drivers.push(d);
-    return d;
-  });
+  sessions = new WorkspaceSessions(
+    engine,
+    sealer,
+    () => {
+      const d = new FakeDriver(script);
+      drivers.push(d);
+      return d;
+    },
+    "",
+    FAKE_SANDBOX,
+  );
   notes = [];
   tasks = new Tasks(engine, sessions, { dir: wtDir, notify: (title, body) => notes.push([title, body]) });
 });
@@ -168,6 +176,10 @@ describe("background tasks", () => {
 
     engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@main" });
     await expect(tasks.create({ root, prompt: "x" })).rejects.toThrow(/sensitive/);
+    engine.workspaces.setPolicy(root, null);
+
+    const unsandboxed = new Tasks(engine, new WorkspaceSessions(engine, await Sealer.open(mkdtempSync(join(tmpdir(), "hib-task3-"))), () => new FakeDriver(script), "", () => undefined), { dir: wtDir, notify: () => {} });
+    await expect(unsandboxed.create({ root, prompt: "x" })).rejects.toThrow(/sandbox/);
   });
 
   test("a task that fails to start leaves no worktree or branch behind", async () => {
@@ -183,7 +195,7 @@ describe("background tasks", () => {
     const t = await tasks.create({ root, prompt: "long" });
     await until(() => sessions.running(t.session_id), "running");
     const sealer = await Sealer.open(mkdtempSync(join(tmpdir(), "hib-task2-")));
-    const fresh = new WorkspaceSessions(engine, sealer, () => new FakeDriver(script));
+    const fresh = new WorkspaceSessions(engine, sealer, () => new FakeDriver(script), "", FAKE_SANDBOX);
     new Tasks(engine, fresh, { dir: wtDir, notify: () => {} });
     expect(tasks.get(t.id).status).toBe("interrupted");
     expect(fresh.snapshot(t.session_id).auto).toBe(true);
