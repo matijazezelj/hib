@@ -5,7 +5,7 @@ import type { VaultState } from "../guard/vault";
 import type { Sealer } from "../guard/seal";
 import { resolveCandidate, type Candidate } from "../router/route";
 import type { AgentDriver, AgentEvent, Decision, Outbound, Sandbox, ToolCall } from "./driver";
-import { REGISTRIES, sandboxFor, secretPaths } from "./sandbox";
+import { REGISTRIES, sandboxFor, sandboxProblem, secretPaths } from "./sandbox";
 import { insideRoot, realTarget } from "./fs";
 import { changes as protectedChanges, revert as revertProtected, snapshot as protectedSnapshot } from "./protect";
 import { detect } from "../guard/detectors";
@@ -771,7 +771,7 @@ export class WorkspaceSessions {
   setAuto(sessionId: string, on: boolean) {
     if (on && !this.sandboxed()) {
       this.auto.delete(sessionId);
-      return this.emit(sessionId, { type: "mode", auto: false, why: "auto mode needs an OS sandbox for agent commands (macOS, or Linux with bubblewrap and socat installed)" });
+      return this.emit(sessionId, { type: "mode", auto: false, why: `auto mode needs an OS sandbox for agent commands: ${sandboxProblem() ?? "not available"}` });
     }
     if (on) this.auto.add(sessionId);
     else this.auto.delete(sessionId);
