@@ -173,3 +173,43 @@ describe("policy", () => {
     expect(decide([], { ...cfg.routes.chat, ask: true }, cfg.guard).action).toBe("ask");
   });
 });
+
+describe("overlapping findings never leave part of a match in the clear", () => {
+  const sent = (text: string, opts: any) => new Vault("t0").obfuscate(text, { level: "standard", ...opts }).text;
+  const cases: [string, string, any, string][] = [
+    ["a term inside an email domain", "mail dana.horvat@northwind-logistics.io now", { terms: ["Northwind"] }, "dana.horvat"],
+    ["your username starting an email", "mail jdoe.backup@gmail.com now", { identities: ["jdoe"] }, "gmail.com"],
+    ["a plugin pattern inside an email", "mail ops-team@acme-corp.io now", { patterns: [{ category: "TEAM", regex: "ops-team" }] }, "acme-corp"],
+  ];
+  for (const [name, text, opts, leak] of cases)
+    test(name, () => {
+      const out = sent(text, opts);
+      expect(out).not.toContain(leak);
+      expect(out).toMatch(/^mail \[HIBt0-EMAIL-1\] now$/);
+    });
+
+  test("partial overlaps merge into one span; the round trip is exact", () => {
+    const text = "ref ab-12345-cd done";
+    const v = new Vault("t0");
+    const r = v.obfuscate(text, { level: "minimal", patterns: [{ category: "A", regex: "ab-12345" }, { category: "B", regex: "345-cd" }] });
+    expect(r.text).toBe("ref [HIBt0-A-1] done");
+    expect(r.findings[0]!.absorbed).toEqual(["B"]);
+    expect(v.restore(r.text)).toBe(text);
+  });
+
+  test("paranoid: a home path is hidden whole, labelled as a path", () => {
+    expect(sent("see /Users/jdoe/src/app.ts", { level: "paranoid" })).toBe("see [HIBt0-PATH-1]");
+  });
+
+  test("a secret keeps its label when it absorbs something wider", () => {
+    const f = detect("url postgres://app:s3cretpass@db.acme.io/main end", { level: "paranoid" });
+    expect(f.map((x) => x.category)).toEqual(["DB-URI"]);
+  });
+
+  test("ask rules still fire for a category that was absorbed", () => {
+    const g = { ...cfg.guard, askOn: ["TERM"] };
+    const f = detect("mail dana@northwind.io", { level: "standard", terms: ["Northwind"] });
+    expect(f.map((x) => x.category)).toEqual(["EMAIL"]);
+    expect(decide(f, cfg.routes.chat, g).action).toBe("ask");
+  });
+});

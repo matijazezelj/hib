@@ -9,6 +9,7 @@ export interface Finding {
   value: string;
   category: string; // token label, e.g. AWS-KEY, IP-INTERNAL, USER
   kind: Kind;
+  absorbed?: string[]; // categories of overlapping findings merged into this one, so policies still see them
 }
 
 interface Detector {
@@ -170,7 +171,12 @@ export interface DetectOptions {
   exempt?: [number, number][]; // spans to leave exactly as they are (e.g. table columns the user chose to keep)
 }
 
-/** Non-overlapping findings, earlier detectors (secrets, then terms) winning ties. */
+/**
+ * Non-overlapping findings. Overlapping ones merge into one span covering all of them, so no part of any match is left
+ * in the clear (a term or username inside an email address used to leave the rest of the address visible). The merged
+ * finding is labelled as a secret if one is involved (the earliest secret detector), otherwise as its widest member
+ * (EMAIL for a term inside an address); the other members' categories go in `absorbed`.
+ */
 export function detect(text: string, opts: DetectOptions): Finding[] {
   const raw: Finding[] = [];
   for (const d of SECRETS) raw.push(...run(text, d));
@@ -191,20 +197,41 @@ export function detect(text: string, opts: DetectOptions): Finding[] {
     for (const d of PARANOID.filter(use)) raw.push(...run(text, d));
     raw.push(...highEntropy(text));
   }
-  // Local NER goes last: on an overlap the first finding wins, and a name found inside an email address or a path must
-  // not displace the structured match (it would leave the rest of the address in the clear).
+  // Local NER goes last, so a name inside an email address or a path keeps the structured match's label.
   raw.push(...(opts.extra ?? []));
 
   // Existing hib placeholders (e.g. from a pseudonymised table) are already safe; nothing inside them is a finding.
   const tokens = [...text.matchAll(/\[?HIB[0-9a-f]{4}-[A-Z0-9-]+?-\d+\]?/g)].map((m) => [m.index!, m.index! + m[0].length] as const);
-  const taken: Finding[] = [];
-  for (const f of raw) {
-    if (tokens.some(([s, e]) => f.start < e && s < f.end)) continue;
-    if (opts.exempt?.some(([s, e]) => f.start < e && s < f.end)) continue;
-    if (taken.some((t) => f.start < t.end && t.start < f.end)) continue;
-    taken.push(f);
+  const kept = raw
+    .map((f, rank) => ({ f, rank }))
+    .filter(({ f }) => !tokens.some(([s, e]) => f.start < e && s < f.end) && !opts.exempt?.some(([s, e]) => f.start < e && s < f.end))
+    .sort((a, b) => a.f.start - b.f.start || a.rank - b.rank);
+  const out: Finding[] = [];
+  const label = (members: { f: Finding; rank: number }[]) => {
+    const secrets = members.filter((m) => m.f.kind === "secret");
+    const pool = secrets.length ? secrets : members;
+    return pool.reduce((a, b) => (b.f.end - b.f.start > a.f.end - a.f.start || (b.f.end - b.f.start === a.f.end - a.f.start && b.rank < a.rank) ? b : a)).f;
+  };
+  let group: { start: number; end: number; members: { f: Finding; rank: number }[] } | null = null;
+  const close = () => {
+    if (!group) return;
+    const { start, end, members } = group;
+    if (members.length === 1) return void out.push(members[0]!.f);
+    const best = label(members);
+    const absorbed = [...new Set(members.map((m) => m.f.category).filter((c) => c !== best.category))];
+    out.push({ ...best, start, end, value: text.slice(start, end), ...(absorbed.length ? { absorbed } : {}) });
+  };
+  for (const k of kept) {
+    if (group && k.f.start < group.end) {
+      group.end = Math.max(group.end, k.f.end);
+      group.members.push(k);
+    } else {
+      close();
+      group = { start: k.f.start, end: k.f.end, members: [k] };
+    }
   }
-  return taken.sort((a, b) => a.start - b.start);
+  close();
+  return out;
 }
 
 const LEVEL_ORDER: Level[] = ["minimal", "standard", "paranoid"];
