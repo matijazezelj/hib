@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
+import { isAbsolute } from "node:path";
 import type { Config } from "../config";
 
 /**
@@ -94,7 +95,8 @@ export class Workspaces {
 
   /** Resolves a client-supplied root to a registered workspace, or null. */
   resolve(dir: string | null | undefined): string | null {
-    if (!dir) return null;
+    // A relative path would be resolved against the daemon's working directory, not the caller's.
+    if (!dir || !isAbsolute(dir)) return null;
     try {
       const real = realpathSync(dir);
       return this.has(real) ? real : null;
@@ -104,6 +106,7 @@ export class Workspaces {
   }
 
   register(dir: string): string {
+    if (!isAbsolute(dir)) throw new Error(`${dir} is not an absolute path`);
     const e = eligible(dir);
     if (!e.ok) throw new Error(e.why);
     this.db.run("INSERT OR IGNORE INTO workspaces(root, added) VALUES (?, ?)", [e.root, Date.now()]);

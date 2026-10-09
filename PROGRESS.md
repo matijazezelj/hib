@@ -8,7 +8,7 @@ _Last updated: 2026-10-09_
 ## Where it stands
 
 hib is usable day to day: a local daemon, a terminal agent (`hib`), a web workspace (`hib serve`), a multi-model chat, and an
-OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (244 tests,
+OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (261 tests,
 2 of them Linux-only) on Ubuntu and macOS.
 
 A full security audit ran on 2026-10-09 (daemon surface, agent permissions, guard/egress, analyze/plugins/web). All of
@@ -28,7 +28,14 @@ Known issues and in order under Next.
   - Browser panels: file tree, git panel, and a browser terminal.
 - **Sensitive workspaces.**
   - Pinned to one Claude account (Codex accounts are refused: it runs cat/grep without asking, so reads couldn't be gated or pseudonymised; a policy set earlier refuses new turns). No handoff, failover, advisor, arena, browser terminal or background tasks.
-  - Secrets are blocked, and every read asks. Data files reach the agent only through Read, as a pseudonymised copy (a symlink is judged by its target). The sandbox denies every data file in the folder to commands, so globs, scripts and symlinks get nowhere; obvious tries are refused up front by `datarules.ts`. Commands keep placeholders unrestored.
+  - Secrets are blocked, and every read asks. Data files reach the agent only through Read, as a pseudonymised copy (a symlink is judged by its target). Commands keep placeholders unrestored.
+  - **Commands vs data files: OS-enforced** (`denyData()` in `sessions.ts`).
+    - macOS: the sandbox denies data files by pattern (`<root>/**/*.csv`, tsv, jsonl, ndjson, xls(x), parquet, sqlite, and every `*.json` except build config via `allowRead`).
+    - Checked live, through hib and with `claude -p`: any depth, upper-case names, symlinks, hard links, renames, copies, files created after start, and a Python glob loop are all refused, while `package.json` stays readable.
+    - Linux: the data files found at session start, with no depth cap. A folder that can't be listed completely (unreadable directory, over 50,000 entries) refuses the session. Glob support in Claude's Linux sandbox is unverified.
+    - Obvious tries are refused up front by `datarules.ts` (UX, not the boundary).
+    - Re-run `bun test/manual/sandbox-probe.ts` after a Claude Code upgrade.
+  - **Read/Grep vs data files: CLI-enforced, not OS-enforced.** Claude's file tools run outside the sandbox. The pseudonymised copy depends on Claude routing every Read/Grep through hib's permission prompt (`--permission-mode manual`, `ask` rules), and on hib's path checks (symlinks by target, case-insensitive). Not host-level containment.
   - Text you edit in a guard approval gets the secret block and name detection again.
   - Checked live: with a data file in the Claude sandbox's `denyRead`, Read still reaches hib and the redirect to the pseudonymised copy works (the sandbox doesn't apply to Claude's file tools).
   - When a policy is inherited (a parent of a sensitive folder, or a subfolder), the terminal banner and the web pill name the folder it comes from (`/ws/tree` returns `policyFrom`).
@@ -51,9 +58,10 @@ Known issues and in order under Next.
   - Test sandbox probes with repos outside `/tmp`: Codex's workspace profile can write anywhere under `/tmp`.
 - **Daemon auth.**
   - The token is compared in constant time.
-  - Browser login: `POST /hib/login` (needs the token) mints a one-time code (15 min) for the link `hib serve` / `/web` prints. `POST /hib/session` trades it for a browser session id, stored as a sha256 in `browser_sessions` and valid 30 days. The page keeps it in `localStorage` (per origin, port included) and sends it as a bearer header; the terminal WebSocket passes it as `?session=`. No cookie: one on 127.0.0.1 would reach every other local server.
+  - The registry refuses relative paths, and the CLI resolves `[dir]` itself: `hib workspace sensitive .` used to be resolved against the daemon's working directory, so it could protect (or `normal .` unprotect) the wrong folder.
+  - Browser login: `POST /hib/login` (needs the token) mints a one-time code (15 min) for the link `hib serve` / `/web` prints. `POST /hib/session` trades it for a browser session id, stored as a sha256 in `browser_sessions`. It ends after 12 idle hours and after 7 days at most. `DELETE /hib/session` signs one browser out (the home page's Sign out), and with the token signs out all of them (`hib logout`). The page keeps it in `localStorage` (per origin, port included) and sends it as a bearer header. The terminal WebSocket opens with a one-time ticket (`POST /ws/terminal/ticket`: 30 s, one folder), never the session id in a URL. No cookie: one on 127.0.0.1 would reach every other local server.
   - The page's CSP (`img-src 'self' data:`, no frames, objects, media or forms) and the markdown renderer never load images, so restored values in model output can't leave through an image URL.
-- **Protected files** (`src/workspace/protect.ts`). Each turn snapshots git hooks and config (a worktree's common dir too), `.claude/`, `.codex/`, `.hib/` and `.mcp.json` by content. Changes you didn't approve are put back, and a `protected_reverted` event says what. Nothing an agent creates can stop the check: fifos, sockets and unreadable entries are recorded without being opened, too many files is itself a finding, and a failed check is reported, never silent. Claude also has an `Edit(./.git/**)` deny rule; only `Edit(...)` rules are honoured, and they cover Write too.
+- **Protected files** (`src/workspace/protect.ts`). Defense in depth, not prevention: a file changed and used within one turn has already been used. The `Edit(./.git/**)` deny rules and the sandbox's write limits are the preventive layer. Each turn snapshots git hooks and config (a worktree's common dir too), `.claude/`, `.codex/`, `.hib/` and `.mcp.json` by content. Changes you didn't approve are put back, and a `protected_reverted` event says what. Nothing an agent creates can stop the check: fifos, sockets and unreadable entries are recorded without being opened, too many files is itself a finding, and a failed check is reported, never silent. Claude also has an `Edit(./.git/**)` deny rule; only `Edit(...)` rules are honoured, and they cover Write too.
 - **Protected paths.** Judged on the resolved path, case-insensitively, following dangling symlinks too (a write through one creates its target) — `realTarget()` in `fs.ts`.
 - **Auto mode** (`/auto`, off by default; needs the sandbox). Edits in the folder and sandboxed commands run without asking. Reads and searches outside the folder ask. New network hosts ask, except package registries. WebFetch/WebSearch always ask. Risky commands (push, publishing in any spelling like `npm --tag x publish` or `twine upload`, sudo, rm -r, anything naming hib's daemon or credentials) still ask. "Always" for interpreters and wrappers covers only the exact command line.
 - **Web approvals.** Carry `outbound` (host, full URL, prompt or query, guard findings, placeholder count), shown in both UIs. Web calls get placeholders, not restored values. "Always" for WebFetch covers one host. Claude always asks hib for web tools via an `ask` rule; without it, user settings or Claude's pre-approved sites let WebFetch run unasked.
@@ -67,6 +75,7 @@ Known issues and in order under Next.
   - `hib tasks` lists them; `review`, `merge` (`--no-ff`; a conflicting merge is aborted) and `discard` act on one, and `open` opens its session. `/tasks` and `/task <id>` do the same on the web.
   - Refused in sensitive workspaces and without an OS sandbox.
 - **Advisor tool** (`/advisor`, off by default). hib's MCP server gives the agent an `advisor` tool backed by the other provider, through the guard, logged.
+- **Overlapping findings merge.** When findings overlap (a term, your username or a plugin pattern inside an email address; a username inside a path; NER inside an email), they become one placeholder covering all of them, so no part of any match goes out in the clear. The label is the secret's if one is involved, otherwise the widest match's (EMAIL, PATH); the other categories are kept in `absorbed`, and ask-first rules still see them. Before, the first detector won and the rest of the address leaked (`dana.horvat@[TERM-1]-logistics.io`).
 - **Guard order and coverage.**
   - Text is guarded whole, then cut (handoff transcript, PROGRESS.md, the advisor's transcript and diff, the classifier excerpt), so a cut can't strip a key's BEGIN line. The classifier gets plugin patterns and machine identities too.
   - The router's advisor gets the primary answer through the guard (in agent mode it can quote files).
@@ -86,6 +95,7 @@ Known issues and in order under Next.
 Open findings from the 2026-10-09 audit (all low), and older ones.
 
 - **Guard and egress**
+  - [medium] Name detection has no measured precision/recall. The lowercase-name miss from the `clients.csv` experiment has fixes but no benchmark proving it closed, so there are no guarantees about catching every person's name in free text.
   - [low] Egress log gaps: handoff transcript and PROGRESS.md content are logged only as flags and counts; agent tool output isn't logged as egress.
   - [low] Plaintext at rest: `messages`, `ws_events` and arena text keep originals; WAL/SHM files use the default umask.
   - [low] Detectors slow down quadratically on long input (100k chars ≈ 2.6 s at paranoid).
@@ -97,18 +107,22 @@ Open findings from the 2026-10-09 audit (all low), and older ones.
   - [low] A background command can swap a directory for a symlink between an Edit's approval and its write; the end-of-turn check catches it for protected files only.
   - [low] Grep on a folder (not a single data file) in a sensitive workspace can return raw rows; it asks first and says so.
 - **Daemon**
+  - [medium] A browser session still carries the daemon's whole authority (workspaces, approvals, terminal tickets) for up to 7 days. Separating the terminal and approvals from ordinary UI calls would need scoped sessions.
   - [low] The advisor key and system prompt are on CLI command lines (visible in `ps`).
   - [low] No `frame-ancestors` (a meta CSP can't set it; the HTML route can't set headers yet).
   - [low] Git pathspec magic (`:(top)x`) gets past `safePath` in `/ws/git/diff` when the workspace is a subfolder of a bigger repo.
 - **Analyze and plugins**
+  - [medium] Plugin fingerprints prove the files are the ones you trusted; they don't isolate trusted code, and a process outside the agent sandbox could swap a file between the check and the import.
   - [low] Headerless CSVs send the first data row as column names; async model code runs past the vm timeout (bounded by the kill timer); plugin guard regexes aren't checked for catastrophic backtracking.
 - **Other**
+  - [low] Linux sensitive sessions walk the whole folder at start, `node_modules` included (skipping it would leave data files there readable), and check every JSON file's content. A large dependency tree is slow, or over 50,000 entries refuses the session.
   - [low] The macOS keychain is reachable from inside the agent sandbox (`security find-generic-password`); with the network closed it can only go back to the model's vendor or an approved host. `~/.npmrc` stays readable to commands (npm needs it), so a registry token could be used by a script if a publish slips past the command check.
   - The token is still all-powerful for anything outside an agent sandbox.
   - `ls` came back empty in one auto-mode test although the file existed; not investigated.
   - The advisor needs a logged-in account of the other provider; without one `/advisor` switches itself off.
 
 ## Next
+0. **Measure name detection.** A labeled fixture set: synthetic names in lowercase, mixed case and other scripts, the `clients.csv` shape, and names inside free text. A test that reports precision and recall for regex + NER and fails below a threshold. Then decide on **query-aware column minimization** for `hib ask -f` / analyze: send only the columns the question needs.
 1. **Push and check CI.** Several things can't run in a sandboxed Claude session and are checked only by CI (or `bun test` on your machine): the server tests (browser sessions, forget refused), the Linux bubblewrap tests, and the macOS analysis Seatbelt profile (the "sandboxed run" tests). Confirm both jobs pass. If the macOS "sandboxed run" tests fail with EPERM on `tsconfig.json` or `package.json`, bun walked up to the repo root (now under the `/Users` deny): add literal allows for those two files in `seatbelt()`, don't re-allow the repo.
 2. **Low-severity items** above, roughly in order: gate Codex `webSearch` (verify the key first); egress log of handoff/PROGRESS content; detector gaps and speed; `frame-ancestors` via a header; pathspec literals; command-line secrets via env; plaintext at rest.
 3. **Older items**: the empty `ls` output; background-task polish (a tasks panel with review/merge/discard in the web UI; worktrees start without `node_modules`; tasks don't include uncommitted changes, hib warns).
@@ -117,4 +131,4 @@ Open findings from the 2026-10-09 audit (all low), and older ones.
 ## How to check it works
 - `bun test` and `bunx tsc --noEmit -p .`. Inside a sandboxed Claude session, the analyze tests (nested Seatbelt) and the server tests (local port binding) fail for environmental reasons; CI runs them.
 - With a scratch home: `HIB_HOME=/tmp/hibhome hib daemon start`, then open the printed URL in a test folder. Change `port` in its config.toml first if your own daemon is running.
-- After changing web or daemon code, run `hib daemon stop`. The running daemon serves the old code. Browsers then need a fresh link only if their 30-day session expired.
+- After changing web or daemon code, run `hib daemon stop`. The running daemon serves the old code. Browsers need a fresh link (`/web` or `hib serve`) after 12 idle hours or 7 days.

@@ -50,6 +50,43 @@ describe("browser login", () => {
   });
 });
 
+describe("browser sessions end and can be revoked", () => {
+  const login = async () => ((await (await fetch(`${base}/hib/login`, { method: "POST", headers: { authorization: `Bearer ${TOKEN}` } })).json()) as any).code as string;
+  const newSession = async () => ((await (await fetch(`${base}/hib/session`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: await login() }) })).json()) as any).session as string;
+  const info = (sid: string) => fetch(`${base}/hib/info`, { headers: { authorization: `Bearer ${sid}` } }).then((r) => r.status);
+  const hash = (sid: string) => new Bun.CryptoHasher("sha256").update(sid).digest("hex");
+
+  test("after 12 idle hours, and after 7 days however busy", async () => {
+    const idle = await newSession();
+    engine.db.run("UPDATE browser_sessions SET last_used = ? WHERE hash = ?", [Date.now() - 13 * 3600_000, hash(idle)]);
+    expect(await info(idle)).toBe(401);
+    const old = await newSession();
+    engine.db.run("UPDATE browser_sessions SET created = ? WHERE hash = ?", [Date.now() - 8 * 24 * 3600_000, hash(old)]);
+    expect(await info(old)).toBe(401);
+  });
+
+  test("sign-out ends this browser only; the token signs every browser out", async () => {
+    const [a, b] = [await newSession(), await newSession()];
+    await fetch(`${base}/hib/session`, { method: "DELETE", headers: { authorization: `Bearer ${a}` } });
+    expect([await info(a), await info(b)]).toEqual([401, 200]);
+    await fetch(`${base}/hib/session`, { method: "DELETE", headers: { authorization: `Bearer ${TOKEN}` } });
+    expect(await info(b)).toBe(401);
+  });
+
+  test("the terminal opens with a one-time ticket for one folder, never a session in the URL", async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "hib-term-")));
+    const h = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
+    await fetch(`${base}/hib/workspaces`, { method: "POST", headers: h, body: JSON.stringify({ root: dir }) });
+    const sid = await newSession();
+    const root = encodeURIComponent(dir);
+    const ws = (query: string) => fetch(`${base}/ws/terminal?root=${root}&${query}`, { headers: { upgrade: "websocket", connection: "Upgrade", "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==", "sec-websocket-version": "13" } }).then((r) => r.status);
+    expect(await ws(`session=${sid}`)).toBe(401);
+    const ticket = ((await (await fetch(`${base}/ws/terminal/ticket?root=${root}`, { method: "POST", headers: { authorization: `Bearer ${sid}` } })).json()) as any).ticket;
+    expect(await ws(`ticket=${ticket}`)).toBe(101);
+    expect(await ws(`ticket=${ticket}`)).toBe(401); // burnt
+  });
+});
+
 describe("sensitive folders over HTTP", () => {
   test("forgetting one (which would drop its policy) is refused", async () => {
     const dir = realpathSync(mkdtempSync(join(tmpdir(), "hib-sens-")));

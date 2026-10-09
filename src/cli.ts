@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { hibHome } from "./config";
 import * as plugins from "./plugins";
@@ -19,6 +20,7 @@ const HELP = `hib — harness in a box
                               away, or open the task's session to answer prompts / continue it
   hib chat [--resume [id]]    multi-model router chat in the terminal
   hib daemon status|stop      the shared background daemon (logs: ~/.hib/daemon.log)
+  hib logout                  sign every browser out (a new hib serve / /web link signs back in)
   hib workspace list|forget [dir]   folders agents may work in
   hib workspace sensitive --account claude@work [--model m] [dir]
                               pin a folder to one account: no handoff/failover/advisor/arena,
@@ -121,11 +123,19 @@ async function main() {
       } else throw new Error(`unknown daemon command ${sub}`);
       return;
     }
+    case "logout": {
+      const { connect } = await import("./boot");
+      const { client } = await connect();
+      await client.del("/hib/session");
+      console.log("every browser is signed out; open a new link from `hib serve` or /web to sign back in");
+      return;
+    }
     case "workspace": {
       const b = await import("./boot");
       const { client } = await b.ensureDaemon();
       const sub = rest[0] ?? "list";
-      const dir = rest[1] ?? process.cwd();
+      // Resolved here: the daemon would resolve a relative path against its own working directory.
+      const dir = resolve(rest[1] ?? process.cwd());
       if (sub === "forget") {
         await client.del(`/hib/workspaces?root=${encodeURIComponent(dir)}`);
         console.log("forgotten");

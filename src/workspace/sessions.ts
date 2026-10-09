@@ -74,26 +74,54 @@ function isDataFile(path: string): boolean {
   }
 }
 
-/** Data files under root (absolute, real paths), for a sensitive session's sandbox to deny to commands. */
-function dataFilesIn(root: string, limit = 5000): string[] {
+const DATA_EXTS = ["csv", "tsv", "jsonl", "ndjson", "xls", "xlsx", "parquet", "sqlite", "sqlite3"];
+// JSON that build tools read. Every other .json in a sensitive folder is denied to commands, table or not; Read still
+// reaches it (pseudonymised when it's a table).
+const CONFIG_JSON = [
+  "package.json", "package-lock.json", "tsconfig*.json", "jsconfig*.json", "composer.json", "deno.json", "biome.json",
+  "turbo.json", "nx.json", "lerna.json", ".eslintrc*.json", ".prettierrc*.json", "vercel.json", "renovate.json", "angular.json",
+];
+
+/**
+ * A sensitive session's sandbox: commands can't read data files in the folder. On macOS that's patterns Seatbelt checks
+ * on every open (any depth, any case, files created later, symlinks and hard links judged by target). Elsewhere it's the
+ * files found now, and a folder that can't be listed completely is refused rather than half protected.
+ */
+export function denyData(base: Sandbox, dir: string, platform = process.platform): Sandbox {
+  const root = realpathSync(dir); // Seatbelt matches resolved paths (/tmp is /private/tmp)
+  if (platform === "darwin")
+    return {
+      denyRead: [...base.denyRead, ...DATA_EXTS.map((x) => `${root}/**/*.${x}`), `${root}/**/*.json`],
+      allowRead: [...CONFIG_JSON.map((n) => `${root}/**/${n}`), `${root}/**/node_modules/**/*.json`],
+    };
+  return { denyRead: [...base.denyRead, ...dataFilesIn(root)] };
+}
+
+/** Data files under root (absolute, real paths). Throws when the folder can't be listed completely. */
+function dataFilesIn(root: string, limit = 50_000): string[] {
   const out: string[] = [];
-  const walk = (dir: string, depth: number) => {
-    if (depth > 6 || out.length >= limit) return;
-    let names: string[] = [];
+  const seen = new Set<string>();
+  let visited = 0;
+  const walk = (dir: string) => {
+    let real: string, names: string[];
     try {
+      real = realpathSync(dir);
       names = readdirSync(dir);
-    } catch {
-      return;
+    } catch (e: any) {
+      throw new Error(`can't list ${dir} (${e?.code ?? e})`);
     }
+    if (seen.has(real)) return;
+    seen.add(real);
     for (const n of names) {
-      if (n === "node_modules" || n === ".git") continue;
+      if (++visited > limit) throw new Error(`more than ${limit.toLocaleString()} files`);
+      if (n === ".git") continue;
       const p = join(dir, n);
       const st = statSync(p, { throwIfNoEntry: false });
-      if (st?.isDirectory()) walk(p, depth + 1);
+      if (st?.isDirectory()) walk(p);
       else if (st?.isFile() && isDataFile(p)) out.push(realTarget(root, p));
     }
   };
-  walk(root, 0);
+  walk(root);
   return out;
 }
 
@@ -342,9 +370,16 @@ export class WorkspaceSessions {
     const sys = [system, this.notes.get(id), askReads ? DATA_RULE_NOTE : "", advisorKey ? ADVISOR_NOTE : ""].filter(Boolean).join("\n\n") || undefined;
     const mcp = advisorKey ? { name: "hib", command: process.execPath, args: [ADVISOR_SCRIPT], env: { HIB_URL: this.daemonUrl, HIB_ADVISOR_KEY: advisorKey, HIB_SESSION: id } } : undefined;
     const base = this.sandbox(this.cfg);
-    // Sensitive folders: no command reads a data file at all, however it's spelled (globs, scripts, symlinks). The Read
-    // tool still works on them, and gets a pseudonymised copy.
-    const sandbox = base && askReads ? { denyRead: [...base.denyRead, ...dataFilesIn(root)] } : base;
+    // Sensitive folders: commands can't read data files (enforced by the OS sandbox). Claude's Read tool runs outside it,
+    // so it's hib's permission handling, not the sandbox, that gives Read a pseudonymised copy.
+    let sandbox = base;
+    if (base && askReads) {
+      try {
+        sandbox = denyData(base, root);
+      } catch (e: any) {
+        throw new Error(`hib won't start a sensitive session it can't fully protect: ${e.message}`);
+      }
+    }
     await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools });
     const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox, approvedProtected: new Set() };
     this.live.set(id, l);

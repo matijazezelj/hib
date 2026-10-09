@@ -59,7 +59,8 @@ export interface StartOptions {
 
 /** What the agent's commands (and every process they start) may not touch, whatever is approved. */
 export interface Sandbox {
-  denyRead: string[]; // absolute paths: hib's home, credentials, other accounts' logins
+  denyRead: string[]; // absolute paths or globs: hib's home, credentials, other accounts' logins, data files
+  allowRead?: string[]; // globs that win over denyRead (config JSON in a sensitive folder)
 }
 
 export interface McpServer {

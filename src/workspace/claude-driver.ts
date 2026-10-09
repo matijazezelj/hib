@@ -99,7 +99,7 @@ export class ClaudeDriver implements AgentDriver {
     // writes stay in the folder, the network is closed, and the denied paths can't be read. Approval still goes through hib
     // (autoAllowBashIfSandboxed off), and a command can't ask to leave the sandbox (allowUnsandboxedCommands off).
     const sandbox = opts.sandbox
-      ? { enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, filesystem: { denyRead: opts.sandbox.denyRead }, network: { allowedDomains: [] } }
+      ? { enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, filesystem: { denyRead: opts.sandbox.denyRead, ...(opts.sandbox.allowRead ? { allowRead: opts.sandbox.allowRead } : {}) }, network: { allowedDomains: [] } }
       : undefined;
     args.push("--settings", JSON.stringify({ permissions, ...(sandbox ? { sandbox } : {}) }));
     this.proc = Bun.spawn(args, { cwd: opts.cwd, env: accountEnv(opts.account), stdin: "pipe", stdout: "pipe", stderr: "pipe" });

@@ -10,7 +10,7 @@ import { Registry } from "../src/providers/registry";
 import type { Provider } from "../src/providers/types";
 import type { AgentDriver, AgentEvent, Decision, Sandbox, StartOptions } from "../src/workspace/driver";
 import { Queue } from "../src/workspace/queue";
-import { WorkspaceSessions, type WsEvent } from "../src/workspace/sessions";
+import { denyData, WorkspaceSessions, type WsEvent } from "../src/workspace/sessions";
 
 const TOML = `
 [models.alpha]
@@ -520,7 +520,7 @@ test("sensitive: commands can't read data files at all, a symlink to one is stil
     await d.ask("b1");
   };
   await turn("check ProjectFalcon in notes.txt", undefined, () => "allow", "hib/auto");
-  expect(drivers[0]!.started[0]!.sandbox!.denyRead).toContain(realpathSync(join(root, "users.csv")));
+  expect(drivers[0]!.started[0]!.sandbox).toEqual(denyData({ denyRead: ["/fake/.hib"] }, root));
   const read = drivers[0]!.decisions.get("r1") as any;
   expect(read.updatedInput.file_path).not.toBe(join(root, "notes.txt"));
   const { readFileSync } = await import("node:fs");
@@ -664,5 +664,34 @@ describe("PROGRESS.md", () => {
     await turn("go on", first.sid, undefined, "alpha@work/big");
     expect(seen[1]).toContain("<transcript>");
     expect(seen[1]).not.toContain("ProjectFalcon");
+  });
+});
+
+describe("sensitive data denial", () => {
+  const base = { denyRead: ["/fake/.hib"] };
+
+  test("macOS: patterns, so depth, count and files created later don't matter; config JSON stays readable", () => {
+    const real = realpathSync(root);
+    const s = denyData(base, root, "darwin");
+    expect(s.denyRead).toEqual(expect.arrayContaining(["/fake/.hib", `${real}/**/*.csv`, `${real}/**/*.xlsx`, `${real}/**/*.json`]));
+    expect(s.allowRead).toEqual(expect.arrayContaining([`${real}/**/package.json`, `${real}/**/tsconfig*.json`]));
+    expect(s.denyRead.some((p) => !p.includes("*") && p !== "/fake/.hib")).toBe(false); // nothing enumerated
+  });
+
+  test("elsewhere: every data file at any depth, and a folder it can't list completely is refused", async () => {
+    const { mkdirSync, writeFileSync, chmodSync } = await import("node:fs");
+    const deep = join(root, ...Array.from({ length: 12 }, (_, i) => `d${i}`));
+    mkdirSync(deep, { recursive: true });
+    writeFileSync(join(deep, "deep.csv"), "user\nx\n");
+    writeFileSync(join(root, "a.txt"), "hi");
+    expect(denyData(base, root, "linux").denyRead).toContain(join(realpathSync(deep), "deep.csv"));
+    const locked = join(root, "locked");
+    mkdirSync(locked);
+    chmodSync(locked, 0o000);
+    try {
+      expect(() => denyData(base, root, "linux")).toThrow("can't list");
+    } finally {
+      chmodSync(locked, 0o700);
+    }
   });
 });

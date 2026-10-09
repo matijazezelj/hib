@@ -535,11 +535,21 @@ function AuditPanel({ audit }: { audit: any[] }) {
   );
 }
 
+/** Revokes this browser's session on the daemon, then forgets it here. */
+async function signOut() {
+  await api.del("/hib/session").catch(() => {});
+  localStorage.removeItem(BROWSER_SESSION);
+  location.reload();
+}
+
 function Home({ info }: { info: any }) {
   return (
     <div className="home">
       <h1><span className="brand-mark"><Icon name="shield" size={13} /></span> hib</h1>
-      <p>Your workspaces and chat. Everything sensitive is redacted on this machine before it reaches a model.</p>
+      <p>
+        Your workspaces and chat. Everything sensitive is redacted on this machine before it reaches a model.{" "}
+        <a href="#" onClick={(e) => (e.preventDefault(), signOut())}>Sign out</a>
+      </p>
       <div className="section-title">Workspaces</div>
       <div className="ws-cards">
         {info.workspaces.map((w: string) => (

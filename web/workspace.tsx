@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { BROWSER_SESSION, HibClient } from "../src/client";
+import { HibClient } from "../src/client";
 import { Markdown } from "./markdown";
 import { ANALYZABLE, AnalyzePanel } from "./analyze";
 import { Icon } from "./icons";
@@ -165,21 +165,32 @@ function TerminalPane({ root }: { root: string }) {
     term.loadAddon(fit);
     term.open(ref.current!);
     fit.fit();
-    const sock = new WebSocket(`ws://${location.host}/ws/terminal?root=${encodeURIComponent(root)}&session=${encodeURIComponent(localStorage.getItem(BROWSER_SESSION) ?? "")}`);
-    sock.binaryType = "arraybuffer";
-    sock.onmessage = (m) => term.write(typeof m.data === "string" ? m.data : new Uint8Array(m.data));
-    sock.onopen = () => sock.send(JSON.stringify({ resize: [term.cols, term.rows] }));
-    sock.onclose = () => term.write("\r\n[terminal closed]\r\n");
-    const d = term.onData((s) => sock.readyState === 1 && sock.send(s));
+    let sock: WebSocket | undefined;
+    let closed = false;
+    const send = (data: string) => sock?.readyState === 1 && sock.send(data);
+    // The socket opens with a one-time ticket (a browser WebSocket can't send the session header).
+    api
+      .post(`/ws/terminal/ticket?root=${encodeURIComponent(root)}`, {})
+      .then(({ ticket }) => {
+        if (closed) return;
+        sock = new WebSocket(`ws://${location.host}/ws/terminal?root=${encodeURIComponent(root)}&ticket=${encodeURIComponent(ticket)}`);
+        sock.binaryType = "arraybuffer";
+        sock.onmessage = (m) => term.write(typeof m.data === "string" ? m.data : new Uint8Array(m.data));
+        sock.onopen = () => send(JSON.stringify({ resize: [term.cols, term.rows] }));
+        sock.onclose = () => term.write("\r\n[terminal closed]\r\n");
+      })
+      .catch((e) => term.write(`\r\n[terminal unavailable: ${e.message}]\r\n`));
+    const d = term.onData((s) => send(s));
     const ro = new ResizeObserver(() => {
       fit.fit();
-      if (sock.readyState === 1) sock.send(JSON.stringify({ resize: [term.cols, term.rows] }));
+      send(JSON.stringify({ resize: [term.cols, term.rows] }));
     });
     ro.observe(ref.current!);
     return () => {
+      closed = true;
       ro.disconnect();
       d.dispose();
-      sock.close();
+      sock?.close();
       term.dispose();
     };
   }, []);

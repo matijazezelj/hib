@@ -170,3 +170,16 @@ test("claude: 'always' for an MCP or unknown tool covers only that exact call (n
   expect(keyFor("mcp__fs__write_file", { path: "a" })).not.toBe(keyFor("mcp__fs__write_file", { path: "b" }));
   expect(keyFor("Grep", { pattern: "x" })).toBe("Grep"); // known tools keep their usual scope
 });
+
+test("the registry refuses relative paths: the daemon's working directory isn't the caller's", async () => {
+  const { Workspaces } = await import("../src/workspace/registry");
+  const { memoryDb } = await import("../src/db");
+  const { parseConfig } = await import("../src/config");
+  const { realpathSync } = await import("node:fs");
+  const reg = new Workspaces(memoryDb(), parseConfig({} as any, tmpdir()));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "hib-rel-")));
+  reg.register(dir);
+  expect(() => reg.register(".")).toThrow("absolute");
+  expect(reg.resolve(".")).toBeNull();
+  expect(reg.resolve(dir)).toBe(dir);
+});

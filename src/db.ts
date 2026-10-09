@@ -70,6 +70,9 @@ function migrate(db: Database) {
   try {
     db.exec("ALTER TABLE workspaces ADD COLUMN policy TEXT");
   } catch {}
+  try {
+    db.exec("ALTER TABLE browser_sessions ADD COLUMN last_used INTEGER");
+  } catch {}
 }
 
 export function memoryDb(): Database {

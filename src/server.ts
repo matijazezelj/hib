@@ -25,7 +25,10 @@ export function apiToken(home: string): string {
 }
 
 const LOGIN_TTL = 15 * 60_000;
-const BROWSER_SESSION_TTL = 30 * 24 * 3600_000;
+// A browser session ends after 12 idle hours, and after 7 days whatever happens; a new `/web` link starts another.
+const BROWSER_SESSION_IDLE = 12 * 3600_000;
+const BROWSER_SESSION_MAX = 7 * 24 * 3600_000;
+const TERMINAL_TICKET_TTL = 30_000;
 const json = (data: unknown, status = 200) => Response.json(data, { status });
 const sse = (body: ReadableStream) => new Response(body, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } });
 
@@ -81,6 +84,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
   const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
   const origins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`]);
   const logins = new Map<string, number>(); // one-time browser login codes → expiry
+  const tickets = new Map<string, { root: string; exp: number }>(); // one-time browser terminal tickets
 
   /**
    * Defends against browsers: the Host check stops DNS rebinding and the Origin check stops other sites; there is no
@@ -88,19 +92,24 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
    * the token: it trades a one-time login code (which only a token holder can mint) for its own session id, kept in
    * localStorage. That is per origin, port included; a cookie on 127.0.0.1 would reach every other local server too.
    */
-  function authorized(req: Request, viaQuery = false): boolean {
-    if (!hosts.has(req.headers.get("host") ?? "")) return false;
+  const sameSite = (req: Request) => {
     const origin = req.headers.get("origin");
-    if (origin && !origins.has(origin)) return false;
-    // A WebSocket can't carry headers from the browser, so the terminal sends its session id in the URL.
-    const cred = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? (viaQuery ? q(req, "session") : "");
+    return hosts.has(req.headers.get("host") ?? "") && (!origin || origins.has(origin));
+  };
+  function authorized(req: Request): boolean {
+    if (!sameSite(req)) return false;
+    const cred = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
     return !!cred && (same(cred, token) || browserSession(cred));
   }
   const same = (a: string, b: string) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
   const sidHash = (sid: string) => new Bun.CryptoHasher("sha256").update(sid).digest("hex");
   function browserSession(sid: string): boolean {
-    const row = engine.db.query("SELECT created FROM browser_sessions WHERE hash = ?").get(sidHash(sid)) as { created: number } | null;
-    return !!row && row.created > Date.now() - BROWSER_SESSION_TTL;
+    const h = sidHash(sid);
+    const row = engine.db.query("SELECT created, last_used FROM browser_sessions WHERE hash = ?").get(h) as { created: number; last_used: number | null } | null;
+    const now = Date.now();
+    if (!row || row.created < now - BROWSER_SESSION_MAX || (row.last_used ?? row.created) < now - BROWSER_SESSION_IDLE) return false;
+    if (now - (row.last_used ?? 0) > 60_000) engine.db.run("UPDATE browser_sessions SET last_used = ? WHERE hash = ?", [now, h]);
+    return true;
   }
 
   const guarded = (fn: (req: Request & { params: Record<string, string> }) => Response | Promise<Response>) => async (req: any) => {
@@ -269,10 +278,22 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           return json({ ok: true });
         }),
       },
+      // A browser WebSocket can't send headers, so the terminal opens with a ticket: single use, 30 seconds, one folder.
+      // No long-lived credential ends up in a URL.
+      "/ws/terminal/ticket": {
+        POST: ws((root) => {
+          const now = Date.now();
+          for (const [t, v] of tickets) if (v.exp < now) tickets.delete(t);
+          const ticket = Buffer.from(crypto.getRandomValues(new Uint8Array(24))).toString("base64url");
+          tickets.set(ticket, { root, exp: now + TERMINAL_TICKET_TTL });
+          return json({ ticket });
+        }),
+      },
       "/ws/terminal": (req: Request, server: any) => {
-        if (!authorized(req, true)) return new Response("unauthorized", { status: 401 });
+        const t = tickets.get(q(req, "ticket"));
+        tickets.delete(q(req, "ticket"));
         const root = workspaces.resolve(q(req, "root"));
-        if (!root) return new Response("unknown workspace", { status: 404 });
+        if (!sameSite(req) || !t || t.exp < Date.now() || !root || t.root !== root) return new Response("unauthorized", { status: 401 });
         if (workspaces.effectivePolicy(root)) return new Response("the browser terminal is off in sensitive workspaces", { status: 403 });
         return server.upgrade(req, { data: { kind: "terminal", cwd: root } }) ? undefined : new Response("upgrade failed", { status: 400 });
       },
@@ -344,8 +365,15 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           return json({ code });
         }),
       },
-      // Trades a login code for a browser session id (stored hashed, valid 30 days); the code is burnt.
+      // Trades a login code for a browser session id (stored hashed); the code is burnt. DELETE signs this browser out,
+      // and with the daemon token (`hib web logout`) signs out every browser.
       "/hib/session": {
+        DELETE: guarded((req) => {
+          const cred = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
+          if (same(cred, token)) engine.db.run("DELETE FROM browser_sessions");
+          else engine.db.run("DELETE FROM browser_sessions WHERE hash = ?", [sidHash(cred)]);
+          return json({ ok: true });
+        }),
         POST: async (req) => {
           if (!hosts.has(req.headers.get("host") ?? "")) return new Response("bad host", { status: 400 });
           const origin = req.headers.get("origin");
@@ -355,8 +383,9 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           logins.delete(code);
           if (!code || !exp || exp < Date.now()) return json({ error: { message: "this login link is used up or expired" } }, 401);
           const sid = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
-          engine.db.run("DELETE FROM browser_sessions WHERE created < ?", [Date.now() - BROWSER_SESSION_TTL]);
-          engine.db.run("INSERT INTO browser_sessions(hash, created) VALUES (?, ?)", [sidHash(sid), Date.now()]);
+          const now = Date.now();
+          engine.db.run("DELETE FROM browser_sessions WHERE created < ? OR coalesce(last_used, created) < ?", [now - BROWSER_SESSION_MAX, now - BROWSER_SESSION_IDLE]);
+          engine.db.run("INSERT INTO browser_sessions(hash, created, last_used) VALUES (?, ?, ?)", [sidHash(sid), now, now]);
           return json({ session: sid });
         },
       },
