@@ -12,16 +12,22 @@ export function safePath(root: string, rel: string): string {
   return existsSync(abs) ? realpathSync(abs) : abs;
 }
 
-/** True if `p` (absolute or relative to root) lands inside root once symlinks are resolved. */
-export function insideRoot(root: string, p: string): boolean {
+/** `p` (absolute or relative to root) with `..`, `.`, repeated slashes and symlinks resolved; the missing tail is kept as is. */
+export function realTarget(root: string, p: string): string {
   const realRoot = realpathSync(root);
-  let abs = isAbsolute(p) ? p : resolve(realRoot, p);
+  let abs = isAbsolute(p) ? resolve(p) : resolve(realRoot, p);
   let rest = "";
   while (!existsSync(abs) && dirname(abs) !== abs) {
     rest = join(abs.slice(dirname(abs).length + 1), rest);
     abs = dirname(abs);
   }
-  const real = join(realpathSync(abs), rest);
+  return join(realpathSync(abs), rest);
+}
+
+/** True if `p` (absolute or relative to root) lands inside root once symlinks are resolved. */
+export function insideRoot(root: string, p: string): boolean {
+  const realRoot = realpathSync(root);
+  const real = realTarget(root, p);
   return real === realRoot || real.startsWith(realRoot + sep);
 }
 

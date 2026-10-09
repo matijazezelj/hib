@@ -6,12 +6,12 @@ import type { Sealer } from "../guard/seal";
 import { resolveCandidate, type Candidate } from "../router/route";
 import type { AgentDriver, AgentEvent, Decision, Sandbox, ToolCall } from "./driver";
 import { REGISTRIES, sandboxFor } from "./sandbox";
-import { insideRoot } from "./fs";
+import { insideRoot, realTarget } from "./fs";
 import { detect } from "../guard/detectors";
 import { onPinnedAccount, pinnedModel } from "./registry";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, isAbsolute, join, resolve as resolvePath } from "node:path";
+import { basename, sep, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { loadTable, TABLE_FILE } from "../analyze/table";
 import { columnsToHide, pseudonymize } from "../analyze/pseudo";
 import { DATA_RULE_NOTE, rawDataCommand } from "./datarules";
@@ -80,10 +80,12 @@ function tabularTarget(call: ToolCall, input: unknown, root: string): "file_path
   return null;
 }
 
-const PROTECTED = new Set([".claude", ".codex", ".git", ".hib", ".mcp.json"]);
-function protectedPath(root: string, p: string): boolean {
-  const rel = p.startsWith(root + "/") ? p.slice(root.length + 1) : p.replace(/^\.\//, "");
-  return PROTECTED.has(rel.split("/")[0] ?? "");
+const PROTECTED = new Set([".claude", ".codex", ".git", ".hib", ".mcp.json"]); // lower-case: compared case-insensitively
+/** Tool config and git internals. Judged on the resolved path (`a/../.git`, `//.git`, symlinks) and case-insensitively (APFS). */
+export function protectedPath(root: string, p: string): boolean {
+  const rel = relative(realpathSync(root), realTarget(root, p));
+  if (rel === "" || rel.startsWith("..")) return false; // outside the folder: insideRoot decides
+  return PROTECTED.has((rel.split(sep)[0] ?? "").toLowerCase());
 }
 
 /**
@@ -626,7 +628,7 @@ export class WorkspaceSessions {
 
   /**
    * Auto mode: edits inside the folder and commands run without asking, except edits to tool config and
-   * ASK_EVEN_IN_AUTO commands. In sensitive folders reads, searches and fetches keep asking. Commands are
+   * ASK_EVEN_IN_AUTO commands. Reads and searches run unasked (but ask in sensitive folders); web fetches and searches always ask. Commands are
    * sandboxed (no writes outside the folder, no reads of hib or credentials), and a command reaching a host
    * other than a package registry asks.
    */
@@ -638,7 +640,8 @@ export class WorkspaceSessions {
       return paths.length > 0 && paths.every((p) => insideRoot(l.root, p) && !protectedPath(l.root, p));
     }
     if (call.kind === "command") return !!call.command && !ASK_EVEN_IN_AUTO.test(call.command);
-    if (call.kind === "read" || call.kind === "search" || call.kind === "web") return !l.askReads;
+    if (call.kind === "read" || call.kind === "search") return !l.askReads;
+    // WebFetch / WebSearch send text (and anything a prompt-injected page asks for) off the machine: always ask.
     return false;
   }
 

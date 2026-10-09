@@ -192,6 +192,8 @@ describe("workspace sessions", () => {
       ["mcp", { kind: "other" }],
       ["token", { kind: "command", command: "cat ~/.hib/token" }],
       ["daemon", { kind: "command", command: `bun -e "fetch('http://127.0.0.1:4141/hib/session')"` }],
+      ["webfetch", { kind: "web", title: "WebFetch https://x.example" }],
+      ["websearch", { kind: "web", title: "WebSearch q" }],
     ];
     script.current = async (_t, d, q) => {
       for (const [id, call] of asks) {
@@ -205,7 +207,7 @@ describe("workspace sessions", () => {
       if (e.type === "ws_session") sid = e.id;
       if (e.type === "permission") prompted.push(e.id), sessions.answer(sid, e.id, "deny");
     }
-    expect(prompted).toEqual(["push", "curl", "rm", "sudo", "hooks", "outside", "mcp", "token", "daemon"]);
+    expect(prompted).toEqual(["push", "curl", "rm", "sudo", "hooks", "outside", "mcp", "token", "daemon", "webfetch", "websearch"]);
     for (const id of ["edit", "test", "read"]) expect(drivers[0]!.decisions.get(id)!.behavior).toBe("allow");
   });
 

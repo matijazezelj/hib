@@ -7,7 +7,7 @@ export interface RunResult {
   ok: boolean;
   result?: unknown;
   error?: string;
-  sandbox: "macos-sandbox" | "process-only";
+  sandbox: "macos-sandbox" | "linux-bwrap" | "process-only";
 }
 
 const RUNNER = join(import.meta.dir, "runner.ts");
@@ -32,11 +32,26 @@ function seatbelt(): string {
   ].join("");
 }
 
+/**
+ * Linux: bubblewrap with the filesystem read-only, $HOME replaced by an empty tmpfs (hib's own files and the bun binary
+ * are bound back read-only), no network, and its own PID namespace. Same promises as the Seatbelt profile.
+ */
+export function bwrapArgv(cmd: string[], home = homedir()): string[] {
+  const keep = [REPO, dirname(realpathSync(process.execPath))].filter((p) => p === home || p.startsWith(home + "/"));
+  return [
+    "bwrap", "--die-with-parent", "--unshare-net", "--unshare-pid", "--unshare-ipc",
+    "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", home,
+    ...keep.flatMap((p) => ["--ro-bind", p, p]),
+    "--chdir", "/", ...cmd,
+  ];
+}
+
 /** Runs model-written code against the table locally, isolated from the network and your files. */
 export async function runAnalysis(code: string, table: Table, timeoutMs = 20_000, geo?: { data: string; helper: string }): Promise<RunResult> {
   const mac = process.platform === "darwin" && !!Bun.which("sandbox-exec");
   const cmd = [process.execPath, RUNNER];
-  const argv = mac ? ["sandbox-exec", "-p", seatbelt(), ...cmd] : cmd;
+  const bwrap = !mac && process.platform === "linux" && !!Bun.which("bwrap");
+  const argv = mac ? ["sandbox-exec", "-p", seatbelt(), ...cmd] : bwrap ? bwrapArgv(cmd) : cmd;
   const p = Bun.spawn(argv, {
     cwd: "/",
     env: { PATH: "/usr/bin:/bin", HOME: "/nonexistent", TMPDIR: "/nonexistent" },
@@ -48,7 +63,7 @@ export async function runAnalysis(code: string, table: Table, timeoutMs = 20_000
   const [out, err] = [await new Response(p.stdout).text(), await new Response(p.stderr).text()];
   clearTimeout(killer);
   await p.exited;
-  const sandbox = mac ? "macos-sandbox" : "process-only";
+  const sandbox = mac ? "macos-sandbox" : bwrap ? "linux-bwrap" : "process-only";
   try {
     return { ...JSON.parse(out), sandbox };
   } catch {

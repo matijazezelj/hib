@@ -71,6 +71,13 @@ test("always-allow keys never let compound commands ride on a simple one", async
     expect(commandRuleKey("Bash", c)).toBe(`Bash:exact:${c}`);
 });
 
+test("always-allow for interpreters and wrappers covers only the exact command line", async () => {
+  const { commandRuleKey } = await import("../src/workspace/driver");
+  for (const c of ["python x.py", "python3 -c 'import os'", "/usr/bin/python3.12 y.py", "node a.js", "bash run.sh", "env sh", "xargs rm", "find . -delete", "awk 'BEGIN{system(\"id\")}'", "sudo ls"])
+    expect(commandRuleKey("Bash", c)).toBe(`Bash:exact:${c.trim()}`);
+  expect(commandRuleKey("Bash", "python x.py")).not.toBe(commandRuleKey("Bash", "python -c 'x'"));
+});
+
 describe("codex approvals", () => {
   const { CodexDriver } = require("../src/workspace/codex-driver") as typeof import("../src/workspace/codex-driver");
   const { Queue } = require("../src/workspace/queue") as typeof import("../src/workspace/queue");

@@ -74,9 +74,14 @@ export interface AgentDriver {
  * Key for "always allow" rules. A plain command is keyed by its program; anything compound
  * (pipes, chains, substitutions, redirects) only matches itself, so `cat x; rm -rf y` never rides on "cat".
  */
+const RUNS_ARBITRARY = /^(python[\d.]*|pypy\d*|node|nodejs|bun|bunx|deno|npx|ruby|perl|php|lua|tclsh|osascript|sh|bash|zsh|dash|ksh|fish|env|xargs|find|awk|gawk|sed|nice|nohup|time|timeout|watch|command|exec|eval|source|busybox|sudo|doas)$/;
+
 export function commandRuleKey(prefix: string, command: string): string {
   const cmd = command.trim();
   if (/[;&|`$<>\n\\]|\(/.test(cmd)) return `${prefix}:exact:${cmd}`;
+  // Interpreters and wrappers run whatever their arguments say ("python -c …", "env sh", "xargs rm"), so a program-level
+  // rule would cover arbitrary code: "always" for these matches only the exact command line.
+  if (RUNS_ARBITRARY.test(cmd.split(/\s+/)[0]?.replace(/^.*\//, "") ?? "")) return `${prefix}:exact:${cmd}`;
   // Program plus subcommand ("git status", "bun test"), so allowing one subcommand never covers "git push".
   const [prog, sub] = cmd.split(/\s+/);
   return `${prefix}:${prog ?? ""}${sub && /^[a-z][\w:-]*$/i.test(sub) ? ` ${sub}` : ""}`;
