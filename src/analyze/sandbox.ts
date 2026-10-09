@@ -76,7 +76,7 @@ function linuxPathKind(p: string): PathKind {
 /** Runs model-written code against the table locally, isolated from the network and your files. */
 export async function runAnalysis(code: string, table: Table, timeoutMs = 20_000, geo?: { data: string; helper: string }): Promise<RunResult> {
   const mac = process.platform === "darwin" && !!Bun.which("sandbox-exec");
-  const cmd = [process.execPath, RUNNER];
+  const cmd = [realpathSync(process.execPath), RUNNER]; // the real path: Seatbelt's exec rule allows exactly this one
   const bwrap = !mac && process.platform === "linux" && !!Bun.which("bwrap");
   // Model-written code never runs with only a JavaScript context between it and your files and network.
   if (!mac && !bwrap)

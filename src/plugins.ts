@@ -53,13 +53,16 @@ function parseFrontmatter(text: string): { meta: Record<string, any>; body: stri
   return { meta: (Bun.YAML.parse(m[1]!) as any) ?? {}, body: m[2]!.trim() };
 }
 
-/** Files in a plugin, symlinks included as entries but never followed (a link to `.` or `/` can't loop or wander). */
-function walk(dir: string, out: string[] = []): string[] {
+/**
+ * Files in a plugin, symlinks included as entries but never followed (a link to `.` or `/` can't loop or wander).
+ * Dependencies are skipped when looking for the plugin's own files, but counted for trust (`deps`).
+ */
+function walk(dir: string, out: string[] = [], deps = false): string[] {
   for (const n of readdirSync(dir)) {
-    if (n === ".git") continue;
+    if (n === ".git" || (n === "node_modules" && !deps)) continue;
     const p = join(dir, n);
     const st = lstatSync(p);
-    if (st.isDirectory()) walk(p, out);
+    if (st.isDirectory()) walk(p, out, deps);
     else out.push(p);
   }
   return out;
@@ -72,7 +75,7 @@ function walk(dir: string, out: string[] = []): string[] {
  */
 export function fingerprint(dir: string): string {
   const h = new Bun.CryptoHasher("sha256");
-  for (const p of walk(dir).sort()) {
+  for (const p of walk(dir, [], true).sort()) {
     const st = lstatSync(p);
     h.update(relative(dir, p)).update("\0");
     h.update(st.isSymbolicLink() ? `link:${readlinkSync(p)}` : st.isFile() ? readFileSync(p) : `special:${st.mode}`).update("\0");

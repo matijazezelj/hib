@@ -121,6 +121,11 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
   const sessions = new WorkspaceSessions(engine, engine.sealer, (p) => (p === "claude" ? new ClaudeDriver() : p === "codex" ? new CodexDriver() : null), `http://127.0.0.1:${port}`);
   const tasks = new Tasks(engine, sessions, { dir: defaultWorktreeDir() });
   // Task worktrees are registered so their sessions run like any workspace, but they aren't folders the user opened.
+  // A folder's sensitive policy and, when it's inherited, the sensitive folder it comes from (so the UI can say so).
+  const policyOf = (root: string) => {
+    const p = workspaces.effectivePolicyWithSource(root);
+    return { policy: p?.policy ?? null, policyFrom: p && p.from !== root ? p.from : null };
+  };
   const userWorkspaces = () => {
     const hidden = tasks.worktrees();
     return workspaces.list().filter((w) => !hidden.has(w.root));
@@ -156,7 +161,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
     idleTimeout: 255,
     websocket: terminalSocket,
     routes: {
-      "/ws/tree": ws(async (root) => json({ root, files: await listFiles(root), git: await git.status(root), policy: workspaces.effectivePolicy(root) })),
+      "/ws/tree": ws(async (root) => json({ root, files: await listFiles(root), git: await git.status(root), ...policyOf(root) })),
       "/ws/egress/:id": ws((root, req) => (sessionIn(root, req.params.id!) ? json(sessions.egress(req.params.id!)) : json({ error: { message: "not found" } }, 404))),
       "/ws/file": ws((root, req) => json(readFile(root, q(req, "path")))),
       "/ws/git/status": ws(async (root) => json(await git.status(root))),

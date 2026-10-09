@@ -62,10 +62,15 @@ export class Workspaces {
    * folders pinned to different accounts can't both be satisfied, so that's an error.
    */
   effectivePolicy(root: string): Policy | null {
-    const up = this.policyFor(root)?.policy;
-    const down = this.list().filter((w) => w.policy && w.root.startsWith(root + "/")).map((w) => w.policy!);
-    const all = [...(up ? [up] : []), ...down];
-    const accounts = new Set(all.map((p) => p.account));
+    return this.effectivePolicyWithSource(root)?.policy ?? null;
+  }
+
+  /** As `effectivePolicy`, plus the sensitive folder the policy comes from (it may be a parent or a subfolder). */
+  effectivePolicyWithSource(root: string): { policy: Policy; from: string } | null {
+    const up = this.policyFor(root);
+    const down = this.list().filter((w) => w.policy && w.root.startsWith(root + "/")).map((w) => ({ policy: w.policy!, from: w.root }));
+    const all = [...(up ? [{ policy: up.policy, from: up.root }] : []), ...down];
+    const accounts = new Set(all.map((p) => p.policy.account));
     if (accounts.size > 1) throw new Error(`${root} spans sensitive folders pinned to different accounts (${[...accounts].join(", ")}); open hib in one of them instead`);
     return all[0] ?? null;
   }

@@ -30,6 +30,8 @@ Known issues and in order under Next.
   - Pinned to one Claude account (Codex accounts are refused: it runs cat/grep without asking, so reads couldn't be gated or pseudonymised; a policy set earlier refuses new turns). No handoff, failover, advisor, arena, browser terminal or background tasks.
   - Secrets are blocked, and every read asks. Data files reach the agent only through Read, as a pseudonymised copy (a symlink is judged by its target). The sandbox denies every data file in the folder to commands, so globs, scripts and symlinks get nowhere; obvious tries are refused up front by `datarules.ts`. Commands keep placeholders unrestored.
   - Text you edit in a guard approval gets the secret block and name detection again.
+  - Checked live: with a data file in the Claude sandbox's `denyRead`, Read still reaches hib and the redirect to the pseudonymised copy works (the sandbox doesn't apply to Claude's file tools).
+  - When a policy is inherited (a parent of a sensitive folder, or a subfolder), the terminal banner and the web pill name the folder it comes from (`/ws/tree` returns `policyFrom`).
   - The policy covers the whole tree (`Workspaces.effectivePolicy`): every folder inside a sensitive one, and any folder that contains one. A folder spanning two sensitive folders pinned to different accounts is refused. Used by sessions, the terminal, `/ws/tree`, tasks.
   - It can only be tightened over HTTP; lifting it takes `hib workspace normal`, and the API won't forget a sensitive folder.
 - **Analyze** (`hib analyze`, web panel). The model sees only the schema and writes `analyze(rows)`, which runs locally. Interpretation is optional. Includes column pseudonymisation and an offline GeoNames gazetteer for travel analysis.
@@ -107,7 +109,7 @@ Open findings from the 2026-10-09 audit (all low, plus one remaining part of a m
   - The advisor needs a logged-in account of the other provider; without one `/advisor` switches itself off.
 
 ## Next
-1. **Push and check CI.** Several things can't run in a sandboxed Claude session and are checked only by CI (or `bun test` on your machine): the server tests (browser sessions, forget refused), the Linux bubblewrap tests, and the macOS analysis Seatbelt profile (the "sandboxed run" tests). Confirm both jobs pass.
+1. **Push and check CI.** Several things can't run in a sandboxed Claude session and are checked only by CI (or `bun test` on your machine): the server tests (browser sessions, forget refused), the Linux bubblewrap tests, and the macOS analysis Seatbelt profile (the "sandboxed run" tests). Confirm both jobs pass. If the macOS "sandboxed run" tests fail with EPERM on `tsconfig.json` or `package.json`, bun walked up to the repo root (now under the `/Users` deny): add literal allows for those two files in `seatbelt()`, don't re-allow the repo.
 2. **Approval vs failover**: ask again (or don't fail over) when the model that would receive the text isn't the one the approval named.
 3. **Low-severity items** above, roughly in order: Claude `--permission-mode default` and unknown-tool rule keys; gate Codex `webSearch`; egress log of handoff/PROGRESS content; detector gaps and speed; `frame-ancestors` via a header; pathspec literals; command-line secrets via env; plaintext at rest.
 4. **Older items**: the empty `ls` output; background-task polish (a tasks panel with review/merge/discard in the web UI; worktrees start without `node_modules`; tasks don't include uncommitted changes, hib warns).

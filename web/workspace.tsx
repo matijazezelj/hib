@@ -191,7 +191,7 @@ function TerminalPane({ root }: { root: string }) {
 export function WorkspaceApp({ info, root }: { info: any; root: string }) {
   const q = `root=${encodeURIComponent(root)}`;
   const [tab, setTab] = useState<"files" | "changes" | "sessions" | "egress">("files");
-  const [policy, setPolicy] = useState<{ account: string; model?: string } | null>(null);
+  const [policy, setPolicy] = useState<{ account: string; model?: string; from?: string } | null>(null);
   const [egress, setEgress] = useState<any[]>([]);
   const [files, setFiles] = useState<string[]>([]);
   const [gitState, setGit] = useState<any>(null);
@@ -221,7 +221,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     if (t) {
       setFiles(t.files);
       setGit(t.git);
-      setPolicy(t.policy);
+      setPolicy(t.policy ? { ...t.policy, from: t.policyFrom ?? undefined } : null);
     }
     if (sidRef.current) setEgress(await api.get(`/ws/egress/${sidRef.current}?${q}`).catch(() => []));
     setSessions(await api.get(`/ws/sessions?${q}`).catch(() => []));
@@ -426,8 +426,8 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
         <span className="crumb" title={root}><Icon name="folder" size={14} /> {root.split("/").slice(-2).join("/")}</span>
         {gitState?.branch && <span className="chip mono"><Icon name="route" size={11} /> {gitState.branch.split("...")[0]}</span>}
         {policy && (
-          <span className="sensitive-pill" title="Only this account sees this folder. No handoff, failover, advisor, arena or browser terminal; secrets are blocked; every read asks; data files reach the agent pseudonymised.">
-            <Icon name="lock" size={12} /> Sensitive · {policy.account}
+          <span className="sensitive-pill" title={`${policy.from ? `Inherited from ${policy.from}. ` : ""}Only this account sees this folder. No handoff, failover, advisor, arena or browser terminal; secrets are blocked; every read asks; data files reach the agent pseudonymised.`}>
+            <Icon name="lock" size={12} /> Sensitive · {policy.account}{policy.from ? ` · via ${policy.from.split("/").pop()}` : ""}
           </span>
         )}
         <span style={{ flex: 1 }} />

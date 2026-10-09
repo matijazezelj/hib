@@ -241,7 +241,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
       if (t.policy) modelIds.current = modelIds.current.filter((m) => m.startsWith(t.policy.account + "/"));
       if (!t.policy) return;
       setPolicy(t.policy);
-      push({ text: `sensitive workspace: only ${t.policy.account} sees this folder; every read asks; secrets are blocked`, color: "yellow" });
+      push({ text: `sensitive workspace${t.policyFrom ? ` (because of ${t.policyFrom})` : ""}: only ${t.policy.account} sees this folder; every read asks; secrets are blocked`, color: "yellow" });
     }).catch(() => {});
     if (initial === true) openPicker();
     else if (initial) attach(initial).catch((e) => push({ text: String(e.message), color: "red" }));
