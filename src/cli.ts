@@ -466,7 +466,7 @@ async function analyzeCmd(files: string[], question: string) {
     console.log(`\n${dim("── code to run locally ──")}\n${plan.code}\n${dim("──")}${plan.note ? `\n${dim(plan.note)}` : ""}`);
     if (!(await confirm("Run this locally (sandboxed: no network, no file access)?"))) return console.log("not run");
     const r = await client.post("/hib/analyze/run", { id: plan.id });
-    console.log(dim(`\nran in ${r.ms} ms · ${r.sandbox === "macos-sandbox" ? "macOS sandbox" : r.sandbox === "linux-bwrap" ? "bubblewrap sandbox" : "isolated process (no OS sandbox; install bubblewrap on Linux)"}\n`));
+    console.log(dim(`\nran in ${r.ms} ms · ${r.sandbox === "macos-sandbox" ? "macOS sandbox" : r.sandbox === "linux-bwrap" ? "bubblewrap sandbox" : "not run: no OS sandbox"}\n`));
     if (r.ok) {
       printResult(r.result);
       break;

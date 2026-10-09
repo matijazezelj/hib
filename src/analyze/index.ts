@@ -32,6 +32,7 @@ export interface Job {
   usedModel?: string;
   last?: RunResult & { ms: number };
   vault?: Vault; // tokens for identifying values echoed in the result, restored in the interpretation
+  pinDir: string; // the folder whose sensitive policy (if any) decides which account may see this analysis
   created: number;
 }
 
@@ -50,8 +51,7 @@ function profileText(p: Profile): string {
 }
 
 /** The result as it would be sent for interpretation: compact JSON, capped. */
-function resultText(result: unknown, max = 6000): string {
-  const s = JSON.stringify(result, null, 1) ?? "null";
+function cut(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + `\n… (${s.length - max} more characters not sent)` : s;
 }
 
@@ -96,11 +96,15 @@ export class Analyzer {
     const table = loadTables(paths);
     const prof = profile(table, paths.length > 1 ? `${paths.length} files (${paths.map((p) => p.split("/").pop()).join(", ")})` : path, input.share ?? []);
     const prompt = `${profileText(prof)}\n\nQuestion: ${input.question}`;
-    const r = await this.ask([{ role: "system", content: this.system() }, { role: "user", content: prompt }], input.model, dirname(path));
+    // With several files, any one from a sensitive folder pins the whole analysis; two different pins can't both hold.
+    const pinned = [...new Map(paths.map((p) => this.engine.workspaces.policyFor(dirname(p))).filter((x) => !!x).map((x) => [x!.policy.account, x!.root])).entries()];
+    if (pinned.length > 1) throw new Error(`these files come from sensitive folders pinned to different accounts (${pinned.map(([a]) => a).join(", ")}); analyse them separately`);
+    const pinDir = pinned[0]?.[1] ?? dirname(path);
+    const r = await this.ask([{ role: "system", content: this.system() }, { role: "user", content: prompt }], input.model, pinDir);
     const { code, note } = extractCode(r.text);
     const id = `an_${crypto.randomUUID().slice(0, 12)}`;
     for (const [k, j] of this.jobs) if (Date.now() - j.created > 3600_000) this.jobs.delete(k);
-    this.jobs.set(id, { id, path, question: input.question, model: input.model, table, profile: prof, code, note, usedModel: r.model, created: Date.now() });
+    this.jobs.set(id, { id, path, question: input.question, model: input.model, table, profile: prof, code, note, usedModel: r.model, pinDir, created: Date.now() });
     return { id, sent: prompt, profile: prof, code, note, model: r.model, raw: code ? undefined : r.text };
   }
 
@@ -121,26 +125,44 @@ export class Analyzer {
   async fix(id: string) {
     const j = this.get(id);
     if (!j.code || !j.last?.error) throw new Error("nothing to fix");
-    const prompt = `${profileText(j.profile)}\n\nQuestion: ${j.question}\n\nYour previous code:\n\`\`\`js\n${j.code}\n\`\`\`\nIt failed with: ${j.last.error}\nWrite a corrected version.`;
-    const r = await this.ask([{ role: "system", content: this.system() }, { role: "user", content: prompt }], j.model ?? j.usedModel, dirname(j.path));
+    // Model-written code can put data in its error (`throw new Error(JSON.stringify(rows))`): identifying values become
+    // tokens, and only the start of the message goes.
+    j.vault ??= new Vault();
+    const error = cut(this.tokenized(j, j.last.error), 1500);
+    const prompt = `${profileText(j.profile)}\n\nQuestion: ${j.question}\n\nYour previous code:\n\`\`\`js\n${j.code}\n\`\`\`\nIt failed with: ${error}\nWrite a corrected version.`;
+    const r = await this.ask([{ role: "system", content: this.system() }, { role: "user", content: prompt }], j.model ?? j.usedModel, j.pinDir);
     const { code, note } = extractCode(r.text);
     if (code) [j.code, j.note] = [code, note];
     return { id, sent: prompt, code: j.code, note: j.note, model: r.model };
   }
 
   /**
-   * Values from identifying columns that appear in the result, longest first: the model wrote the code, so its
-   * output may echo IPs, user agents or names back. They are tokenized before interpretation and restored after.
+   * Values from identifying columns that appear in `text`, longest first: the model wrote the code, so its output may
+   * echo IPs, user agents or names back. Numbers count too (an employee id), and so do the forms code derives most
+   * often (lower case, an email's local part); matching ignores case. They are tokenized before anything is sent.
    */
-  private identifyingValues(j: Job): [string, string][] {
-    const out = JSON.stringify(j.last?.result ?? null);
+  private identifyingValues(j: Job, text: string): [string, string][] {
+    const hay = text.toLowerCase();
     const pairs = new Map<string, string>();
     for (const c of j.profile.columns.filter((c) => c.identifying))
       for (const r of j.table.rows) {
         const v = r[c.name];
-        if (typeof v === "string" && v.length >= 3 && out.includes(JSON.stringify(v).slice(1, -1))) pairs.set(v, c.name);
+        if (v === null || v === undefined || typeof v === "object") continue;
+        const s = String(v);
+        const forms = [s, ...(s.includes("@") ? [s.slice(0, s.indexOf("@"))] : [])];
+        for (const f of forms) if (f.length >= 3 && hay.includes(JSON.stringify(f).slice(1, -1).toLowerCase())) pairs.set(f, c.name);
       }
     return [...pairs].sort((a, b) => b[0].length - a[0].length);
+  }
+
+  /** `text` with every identifying value it contains replaced by a stable token (case-insensitive). */
+  private tokenized(j: Job, text: string): string {
+    let out = text;
+    for (const [value, col] of this.identifyingValues(j, text)) {
+      const needle = JSON.stringify(value).slice(1, -1).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      out = out.replace(new RegExp(needle, "gi"), `[${j.vault!.token(categoryFor(col), value)}]`);
+    }
+    return out;
   }
 
   /** Exactly what interpretation sends: question, code and result, with identifying values as stable tokens. */
@@ -148,14 +170,15 @@ export class Analyzer {
     const j = this.get(id);
     if (!j.last?.ok) throw new Error("run the analysis successfully first");
     j.vault ??= new Vault();
-    let result = resultText(j.last.result);
-    for (const [value, col] of this.identifyingValues(j)) result = result.split(JSON.stringify(value).slice(1, -1)).join(`[${j.vault.token(categoryFor(col), value)}]`);
+    // Tokenized whole, then cut: a cut first could leave a value's prefix behind, untokenized.
+    const result = cut(this.tokenized(j, JSON.stringify(j.last.result, null, 1) ?? "null"), 6000);
     return `Question: ${j.question}\n\nAnalysis code:\n\`\`\`js\n${j.code}\n\`\`\`\n\nResult:\n${result}`;
   }
 
   /** Identifying columns whose values appear in the result (they are sent as tokens, never as values). */
   leaks(id: string): string[] {
-    return [...new Set(this.identifyingValues(this.get(id)).map(([, col]) => col))];
+    const j = this.get(id);
+    return [...new Set(this.identifyingValues(j, JSON.stringify(j.last?.result ?? null)).map(([, col]) => col))];
   }
 
   /** Sends the question, code and result (not the table) for interpretation. The guard still runs on it. */
@@ -168,7 +191,7 @@ export class Analyzer {
         { role: "user", content },
       ],
       j.model ?? j.usedModel,
-      dirname(j.path),
+      j.pinDir,
     );
     return { answer: j.vault!.restore(r.text), model: r.model, sent: content };
   }

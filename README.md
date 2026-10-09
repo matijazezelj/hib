@@ -84,20 +84,22 @@ hib workspace egress                            # what left the machine in the l
 hib workspace normal                            # lift it
 ```
 
-A sensitive folder is seen by exactly one vendor account. The policy is stored in hib's database, not in the repo, so an agent working in the folder can't edit it. While it's on:
+A sensitive folder is seen by exactly one vendor account, and it must be a Claude account. The policy is stored in hib's database, not in the repo, so an agent working in the folder can't edit it. While it's on:
 - **One account only.** Models on other accounts or vendors are refused, in the workspace and in router requests whose working directory is inside the folder.
 - **Nothing that copies data elsewhere:** no handoff, failover, advisor, arena, or classifier call.
 - **Reads need approval.** Every file read, search, Bash command and subagent asks first, so you see each file before its contents go out. "Always" for a read covers only that directory.
 - **Secrets are blocked** in prompts outright, not just tokenized.
 - **Data stays pseudonymised.** Data files (CSV/TSV, table-shaped JSON) reach the agent only through the Read tool, which hands it a pseudonymised copy.
-  - Shell commands that read them raw are denied automatically, with a message pointing the agent to Read. That covers `head`/`cat`/`awk` on a data file, inline `python -c`/`node -e`/heredocs, and scripts run from outside the folder.
+  - The agent's commands can't read data files at all: the sandbox denies them every data file in the folder, so globs, scripts and symlinks get nowhere either. Commands that obviously try (`head`/`cat`/`awk` on a data file, inline `python -c`/`node -e`) are refused up front, with a message pointing the agent to Read.
+  - A symlink to a data file is judged by its target, so it gets the pseudonymised copy too.
+  - Commands keep `[HIB…]` placeholders as they are; restored, `echo` would print the real values back to the model.
   - The agent is told this rule up front. Listing and counting (`ls`, `wc`, `find`) still work.
 - **Repo config is ignored.** Claude sessions load only your user settings, never the repo's `.claude/` settings or hooks, and no MCP servers. A cloned repo can't add allow rules or run hooks.
 - **No browser terminal** (the server refuses it).
 - **Egress log.** Each turn records the redacted prompt and the account it went to, plus every tool call. View it in the *Egress* tab, with `/egress` in the terminal, or with `hib workspace egress`.
 
 Limits:
-- Codex runs read-only commands like `cat` and `grep` without asking, so reads can't be gated on a Codex account. Prefer a Claude account for sensitive folders.
+- Codex accounts can't be pinned: Codex runs read-only commands like `cat` and `grep` without asking, so reads couldn't be gated or pseudonymised.
 - Router chat that isn't tied to a folder isn't covered, so don't paste sensitive content into `hib chat`.
 - Check each subscription's own data settings (training opt-out, retention) and your employer's rules. hib can't change those.
 
@@ -113,9 +115,10 @@ hib ask -f users.csv "which 3 people in Engineering earn the most?"
 - `--share department` adds the real distinct values of a non-identifying column, so the model can filter on them.
 - The model writes an `analyze(rows)` function. You see it and approve it, and it runs **on your machine**:
   - in a separate process, with no `eval` or imports;
-  - on macOS, inside a Seatbelt sandbox with no network, no file writes and no reads of your home folder;
+  - on macOS, inside a Seatbelt sandbox with no network, no file writes, no starting other programs or Apple Events, and no reads of home folders, temp folders or mounted volumes;
   - on Linux with `bwrap` installed, inside bubblewrap starting from an empty root. Only the system libraries, bun and hib's runner are mounted, read-only. There's no network, and none of `/etc`, `/home`, `/run`, `/var` or `/tmp`, so no host files or agent sockets are in reach;
-  - without `bwrap` on Linux, in a separate process with a restricted JavaScript context only.
+  - without an OS sandbox (Linux without `bwrap`, Windows), it doesn't run at all.
+- The interpretation step and error fixes never carry identifying values: they become tokens wherever they appear in the result or error, upper-cased or as an email's local part too, before anything is cut to size.
 - The result stays local. Sending the question, code and result for interpretation is a separate step, and you see exactly what would be sent first.
 - If the code fails, only the error message is sent back for a fix.
 - In the browser, open a CSV, TSV or JSON file in a workspace and press **Analyze**.

@@ -11,24 +11,31 @@ export interface RunResult {
 }
 
 const RUNNER = join(import.meta.dir, "runner.ts");
-const REPO = join(import.meta.dir, "..", "..");
 
 /**
- * macOS Seatbelt profile: no network, no file writes, no reads under $HOME except hib itself
- * (the runner and its modules). Later rules win, so the allow carves hib out of the deny.
+ * macOS Seatbelt profile: no network, no file writes, and no reads of anyone's home folder, temp folders or mounted
+ * volumes, except hib itself (the runner and its modules) and bun. No starting other programs either, which also
+ * rules out reaching outside through `open` (LaunchServices) or `osascript`, and no Apple Events. Later rules win,
+ * so the allows carve hib and bun out of the denies.
  */
-function seatbelt(): string {
+export function seatbelt(): string {
   const q = (p: string) => JSON.stringify(p);
+  const bun = realpathSync(process.execPath);
   return [
     "(version 1)",
     "(allow default)",
     "(deny network*)",
     "(deny file-write*)",
     '(allow file-write* (literal "/dev/null"))',
-    `(deny file-read* (subpath ${q(homedir())}))`,
-    `(allow file-read* (subpath ${q(REPO)}))`,
+    ...[homedir(), "/Users", "/Volumes", "/private/tmp", "/private/var/folders", "/private/var/root", "/Library/Keychains"].map((p) => `(deny file-read* (subpath ${q(p)}))`),
+    // Resolving the runner's path needs stat on its folders; metadata says a file exists, never what's in it.
+    "(allow file-read-metadata)",
+    "(deny process-exec*)",
+    `(allow process-exec* (literal ${q(bun)}))`,
+    "(deny appleevent-send)",
+    `(allow file-read* (subpath ${q(dirname(RUNNER))}))`,
     // Bun may live under $HOME (~/.bun when installed with the official script).
-    `(allow file-read* (subpath ${q(dirname(realpathSync(process.execPath)))}))`,
+    `(allow file-read* (subpath ${q(dirname(bun))}))`,
   ].join("");
 }
 
@@ -71,7 +78,10 @@ export async function runAnalysis(code: string, table: Table, timeoutMs = 20_000
   const mac = process.platform === "darwin" && !!Bun.which("sandbox-exec");
   const cmd = [process.execPath, RUNNER];
   const bwrap = !mac && process.platform === "linux" && !!Bun.which("bwrap");
-  const argv = mac ? ["sandbox-exec", "-p", seatbelt(), ...cmd] : bwrap ? bwrapArgv(cmd) : cmd;
+  // Model-written code never runs with only a JavaScript context between it and your files and network.
+  if (!mac && !bwrap)
+    return { ok: false, sandbox: "process-only", error: "no OS sandbox on this machine, so the code was not run. On Linux install bubblewrap (bwrap); Windows isn't supported." };
+  const argv = mac ? ["sandbox-exec", "-p", seatbelt(), ...cmd] : bwrapArgv(cmd);
   const p = Bun.spawn(argv, {
     cwd: "/",
     env: { PATH: "/usr/bin:/bin", HOME: "/nonexistent", TMPDIR: "/nonexistent" },

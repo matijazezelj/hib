@@ -364,6 +364,40 @@ describe("tables and the sensitive pin", () => {
     expect(r.of("advisor")).toEqual([]);
     expect(sent.every((s) => s.provider === "alpha")).toBe(true);
   });
+  test("analysis tokenizes identifying values however the code reshaped them, in results and in errors", async () => {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { Analyzer } = await import("../src/analyze");
+    const p = join(mkdtempSync(join(tmpdir(), "hib-reshape-")), "u.csv");
+    writeFileSync(p, "username,email,salary\njsmith,john.smith@acme.io,72000\nmjones,mary.jones@acme.io,81000\n");
+    alpha.current = () => [{ type: "text", delta: "```js\nfunction analyze(rows) { return 1 }\n```" }];
+    const a = new Analyzer(engine);
+    const plan = await a.plan({ path: p, question: "who?", model: "alpha/fast" });
+    const job = (a as any).jobs.get(plan.id);
+    job.last = { ok: true, sandbox: "macos-sandbox", ms: 1, result: [{ who: "JSMITH", local: "john.smith" }] }; // upper-cased, email local part
+    const preview = a.explainPreview(plan.id);
+    expect(preview.toLowerCase()).not.toContain("jsmith");
+    expect(preview).not.toContain("john.smith");
+    job.last = { ok: false, sandbox: "macos-sandbox", ms: 1, error: `Error: ${JSON.stringify([{ username: "mjones", email: "mary.jones@acme.io" }])}` };
+    alpha.current = () => [{ type: "text", delta: "```js\nfunction analyze(rows) { return 2 }\n```" }];
+    const before = sent.length;
+    await a.fix(plan.id);
+    const wire = JSON.stringify(sent.slice(before));
+    expect(wire).not.toContain("mjones");
+    expect(wire).not.toContain("mary.jones");
+  });
+
+  test("files from sensitive folders pinned to different accounts can't be analysed together", async () => {
+    const { mkdtempSync, realpathSync } = await import("node:fs");
+    const { Analyzer } = await import("../src/analyze");
+    const [d1, d2] = [realpathSync(mkdtempSync(join(tmpdir(), "hib-s1-"))), realpathSync(mkdtempSync(join(tmpdir(), "hib-s2-")))];
+    for (const [d, acct] of [[d1, "alpha@work"], [d2, "alpha@main"]] as const) {
+      engine.workspaces.register(d);
+      engine.workspaces.setPolicy(d, { sensitive: true, account: acct });
+    }
+    await expect(new Analyzer(engine).plan({ path: await csvIn(d1), paths: [await csvIn(d1), await csvIn(d2)], question: "x" })).rejects.toThrow(/different accounts/);
+    expect(sent.length).toBe(0);
+  });
+
   test("analysis warns when a result carries identifying values back out", async () => {
     const { mkdtempSync } = await import("node:fs");
     const { Analyzer } = await import("../src/analyze");

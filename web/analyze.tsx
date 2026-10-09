@@ -203,7 +203,7 @@ export function AnalyzePanel({ root, path, models, onClose }: { root: string; pa
         )}
 
         {run && (
-          <Step n={3} title="Result" state={run.ok && stage > 3 ? "done" : "active"} aside={<span className="muted">{run.ms} ms · {run.sandbox === "macos-sandbox" ? "macOS sandbox" : "isolated process"}</span>}>
+          <Step n={3} title="Result" state={run.ok && stage > 3 ? "done" : "active"} aside={<span className="muted">{run.ms} ms · {run.sandbox === "macos-sandbox" ? "macOS sandbox" : run.sandbox === "linux-bwrap" ? "bubblewrap sandbox" : "not run: no OS sandbox"}</span>}>
             {run.ok ? (
               <>
                 <ResultView result={run.result} />
