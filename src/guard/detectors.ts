@@ -178,7 +178,6 @@ export function detect(text: string, opts: DetectOptions): Finding[] {
     if (!t.trim()) continue;
     raw.push(...run(text, { category: "TERM", kind: "term", re: new RegExp(`(?<![\\w])${escapeRe(t)}(?![\\w])`, "gi") }));
   }
-  raw.push(...(opts.extra ?? []));
   for (const p of opts.patterns ?? []) {
     const flags = (p.flags ?? "").includes("g") ? p.flags! : (p.flags ?? "") + "g";
     raw.push(...run(text, { category: p.category, kind: "term", re: new RegExp(p.regex, flags) }));
@@ -192,6 +191,9 @@ export function detect(text: string, opts: DetectOptions): Finding[] {
     for (const d of PARANOID.filter(use)) raw.push(...run(text, d));
     raw.push(...highEntropy(text));
   }
+  // Local NER goes last: on an overlap the first finding wins, and a name found inside an email address or a path must
+  // not displace the structured match (it would leave the rest of the address in the clear).
+  raw.push(...(opts.extra ?? []));
 
   // Existing hib placeholders (e.g. from a pseudonymised table) are already safe; nothing inside them is a finding.
   const tokens = [...text.matchAll(/\[?HIB[0-9a-f]{4}-[A-Z0-9-]+?-\d+\]?/g)].map((m) => [m.index!, m.index! + m[0].length] as const);

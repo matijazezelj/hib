@@ -353,6 +353,7 @@ async function nerCmd(sub: string) {
   const { join } = await import("node:path");
   const { NerModel, nerFindings, NER_MODEL, NER_REVISION } = await import("./guard/ner");
   const { loadConfig } = await import("./config");
+  loadConfig(); // first run: creates ~/.hib (0700) and config.toml before the model download and setNerFlag need them
   const model = new NerModel(join(hibHome(), "models"));
   if (sub === "off") {
     setNerFlag(false);
@@ -364,7 +365,7 @@ async function nerCmd(sub: string) {
     return console.log(`name detection: ${on ? "on" : "off"}; model ${ok ? "installed" : "not installed"} (${NER_MODEL}@${NER_REVISION.slice(0, 8)})`);
   }
   if (sub !== "setup") throw new Error("usage: hib guard ner setup|status|off");
-  console.log(`downloading ${NER_MODEL} @ ${NER_REVISION.slice(0, 8)} into ${join(hibHome(), "models")} (once, ~300 MB)…`);
+  console.log(`downloading ${NER_MODEL} @ ${NER_REVISION.slice(0, 8)} into ${join(hibHome(), "models")} (once, ~180 MB)…`);
   const t0 = Date.now();
   await model.load(true);
   const sample = "Ask Marija Horvat from Podravka d.d. whether Ivan Kovačević is still in Zagreb; the build uses Redis and Postgres.";
