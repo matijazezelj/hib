@@ -34,6 +34,7 @@ Known issues and in order under Next.
     - Checked live, through hib and with `claude -p`: any depth, upper-case names, symlinks, hard links, renames, copies, files created after start, and a Python glob loop are all refused, while `package.json` stays readable.
     - Linux: the data files found at session start, with no depth cap. A folder that can't be listed completely (unreadable directory, over 50,000 entries) refuses the session. Glob support in Claude's Linux sandbox is unverified.
     - Obvious tries are refused up front by `datarules.ts` (UX, not the boundary).
+    - No working OS sandbox (`sandboxProblem()`, e.g. Ubuntu's `kernel.apparmor_restrict_unprivileged_userns=1`): the session refuses to start, with the reason.
     - Re-run `bun test/manual/sandbox-probe.ts` after a Claude Code upgrade.
   - **Read/Grep vs data files: CLI-enforced, not OS-enforced.** Claude's file tools run outside the sandbox. The pseudonymised copy depends on Claude routing every Read/Grep through hib's permission prompt (`--permission-mode manual`, `ask` rules), and on hib's path checks (symlinks by target, case-insensitive). Not host-level containment.
   - Text you edit in a guard approval gets the secret block and name detection again.
@@ -115,6 +116,8 @@ Open findings from the 2026-10-09 audit (all low), and older ones.
   - [medium] Plugin fingerprints prove the files are the ones you trusted; they don't isolate trusted code, and a process outside the agent sandbox could swap a file between the check and the import.
   - [low] Headerless CSVs send the first data row as column names; async model code runs past the vm timeout (bounded by the kill timer); plugin guard regexes aren't checked for catastrophic backtracking.
 - **Other**
+  - [low] The sandbox check is per host, not per CLI: a kernel that blocks Claude Code's sandbox also turns off auto mode and tasks for Codex, whose sandbox may work there. `sandboxFor` could become provider-aware.
+  - [low] Credential paths are denied to commands only if they exist when the session starts; a CLI you log into mid-session is covered from the next session.
   - [low] Linux sensitive sessions walk the whole folder at start, `node_modules` included (skipping it would leave data files there readable), and check every JSON file's content. A large dependency tree is slow, or over 50,000 entries refuses the session.
   - [low] The macOS keychain is reachable from inside the agent sandbox (`security find-generic-password`); with the network closed it can only go back to the model's vendor or an approved host. `~/.npmrc` stays readable to commands (npm needs it), so a registry token could be used by a script if a publish slips past the command check.
   - The token is still all-powerful for anything outside an agent sandbox.

@@ -10,10 +10,33 @@ import type { Sandbox } from "./driver";
  * background tasks are off.
  */
 export function sandboxAvailable(): boolean {
-  if (process.platform === "darwin") return !!Bun.which("sandbox-exec");
+  return sandboxProblem() === null;
+}
+
+let problem: string | null | undefined;
+
+/**
+ * Why agent commands can't be sandboxed here, or null when they can. The Linux check is a real probe, not just "are the
+ * binaries installed": on Ubuntu 24.04+ (kernel.apparmor_restrict_unprivileged_userns=1) bubblewrap starts but Claude
+ * Code's helper can't create its nested user namespace, so every Bash command would die with an apply-seccomp error.
+ */
+export function sandboxProblem(): string | null {
+  if (problem !== undefined) return problem;
+  if (process.platform === "darwin") return (problem = Bun.which("sandbox-exec") ? null : "sandbox-exec not found");
+  if (process.platform !== "linux") return (problem = "no OS sandbox on this platform");
   // Claude Code's Linux sandbox needs both; with failIfUnavailable a missing one would stop every session from starting.
-  if (process.platform === "linux") return !!Bun.which("bwrap") && !!Bun.which("socat");
-  return false;
+  if (!Bun.which("bwrap") || !Bun.which("socat")) return (problem = "bubblewrap and socat are not both installed");
+  if (!Bun.which("unshare")) return (problem = null); // can't probe; trust the install
+  const r = Bun.spawnSync(
+    ["bwrap", "--unshare-user", "--unshare-pid", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "unshare", "--user", "--map-root-user", "true"],
+    { stdout: "ignore", stderr: "ignore", timeout: 5000 },
+  );
+  return (problem = r.exitCode === 0 ? null : "this kernel blocks the nested user namespace the sandbox needs (Ubuntu: kernel.apparmor_restrict_unprivileged_userns=1)");
+}
+
+/** For tests: forget the cached probe result. */
+export function resetSandboxProbe() {
+  problem = undefined;
 }
 
 /**

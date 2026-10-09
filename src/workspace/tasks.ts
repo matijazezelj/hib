@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { Engine } from "../engine";
 import * as git from "./git";
+import { sandboxProblem } from "./sandbox";
 import type { WorkspaceSessions, WsEvent } from "./sessions";
 
 export type TaskStatus = "running" | "waiting" | "done" | "failed" | "interrupted" | "merged" | "discarded";
@@ -112,7 +113,7 @@ export class Tasks {
     // A worktree lives outside the folder, so a sensitive folder's pin and read rules wouldn't follow it there.
     if (this.engine.workspaces.effectivePolicy(root)) throw new Error("background tasks are off in sensitive workspaces");
     // Unattended auto mode is only acceptable when the agent's commands are confined.
-    if (!this.sessions.sandboxed()) throw new Error("background tasks need an OS sandbox for agent commands (macOS, or Linux with bubblewrap and socat installed)");
+    if (!this.sessions.sandboxed()) throw new Error(`background tasks need an OS sandbox for agent commands: ${sandboxProblem() ?? "not available"}`);
     if (this.byWorktree(root)) throw new Error("this folder is itself a background task; start tasks from the original folder");
     const h = await git.head(root);
     if (realpathSync(h.top) !== root) throw new Error(`run tasks from the repository's top folder (${h.top})`);

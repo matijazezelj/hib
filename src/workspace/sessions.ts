@@ -5,7 +5,7 @@ import type { VaultState } from "../guard/vault";
 import type { Sealer } from "../guard/seal";
 import { resolveCandidate, type Candidate } from "../router/route";
 import type { AgentDriver, AgentEvent, Decision, Outbound, Sandbox, ToolCall } from "./driver";
-import { REGISTRIES, sandboxFor, secretPaths } from "./sandbox";
+import { REGISTRIES, sandboxFor, sandboxProblem, secretPaths } from "./sandbox";
 import { insideRoot, realTarget } from "./fs";
 import { changes as protectedChanges, revert as revertProtected, snapshot as protectedSnapshot } from "./protect";
 import { detect } from "../guard/detectors";
@@ -372,6 +372,9 @@ export class WorkspaceSessions {
     const base = this.sandbox(this.cfg);
     // Sensitive folders: commands can't read data files (enforced by the OS sandbox). Claude's Read tool runs outside it,
     // so it's hib's permission handling, not the sandbox, that gives Read a pseudonymised copy.
+    // Without the sandbox nothing but the up-front command check and your approval would keep a script from a data
+    // file, so a sensitive session doesn't start at all.
+    if (askReads && !base) throw new Error(`hib won't start a sensitive session without the OS sandbox that keeps commands away from data files: ${sandboxProblem() ?? "no OS sandbox is available"}`);
     let sandbox = base;
     if (base && askReads) {
       try {
@@ -771,7 +774,7 @@ export class WorkspaceSessions {
   setAuto(sessionId: string, on: boolean) {
     if (on && !this.sandboxed()) {
       this.auto.delete(sessionId);
-      return this.emit(sessionId, { type: "mode", auto: false, why: "auto mode needs an OS sandbox for agent commands (macOS, or Linux with bubblewrap and socat installed)" });
+      return this.emit(sessionId, { type: "mode", auto: false, why: `auto mode needs an OS sandbox for agent commands: ${sandboxProblem() ?? "not available"}` });
     }
     if (on) this.auto.add(sessionId);
     else this.auto.delete(sessionId);

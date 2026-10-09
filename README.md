@@ -10,7 +10,7 @@ hib drives the official CLIs on your own subscriptions, as you'd run them yourse
 
 - [Bun](https://bun.sh) ≥ 1.4 (`brew install oven-sh/bun/bun`)
 - At least one of these, installed and logged in:
-  - [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`)
+  - [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`), a current release: 2.1.295 works; 2.1.251 rejects `--permission-prompts`
   - [Codex CLI](https://github.com/openai/codex) (`codex`)
 - `git`
 - macOS or Linux
@@ -57,7 +57,7 @@ Any OpenAI client can use the router: set `OPENAI_BASE_URL=http://127.0.0.1:4141
   - edits to tool config;
   - reads in sensitive folders.
 
-  Auto mode needs the OS sandbox (below). Without one (Linux without bubblewrap and socat, or Windows) it stays off, and so do background tasks.
+  Auto mode needs the OS sandbox (below). Without one (Linux without bubblewrap and socat, a kernel that blocks the nested user namespace the sandbox needs, or Windows) it stays off, and so do background tasks, and hib says why. On Ubuntu 24.04+ the cause is usually `kernel.apparmor_restrict_unprivileged_userns=1`: bubblewrap starts but Claude Code's sandbox helper can't, so every command would fail.
 - **Advisor** (`/advisor`, or the **Advisor** chip; off by default, never in sensitive folders). The agent gets an `advisor` tool, served by hib over MCP. It can consult a model from the other provider (Claude asks Codex, Codex asks Claude) before it starts, when stuck and before it says it's done.
   - The advisor sees the task, a session summary and the current diff, redacted by the guard with the session's placeholders.
   - Every consult shows in the timeline and the egress log.
@@ -93,6 +93,7 @@ A sensitive folder is seen by exactly one vendor account, and it must be a Claud
   - The agent's commands can't read data files; the OS sandbox enforces it.
     - On macOS the sandbox denies data files by pattern (`*.csv`, `*.tsv`, `*.xlsx`, `*.parquet`, `*.sqlite`… and every `*.json` except build config like `package.json` and `tsconfig*.json`). That covers any depth, any case, files created later, symlinks, hard links, renames and copies.
     - On Linux it denies the data files found when the session starts. A folder hib can't list completely is refused rather than half protected.
+    - Without a working OS sandbox (Linux without bubblewrap, or a kernel that blocks it), a sensitive session doesn't start, and hib says why.
     - Commands that obviously try (`head`/`cat`/`awk` on a data file, inline `python -c`/`node -e`) are refused up front, with a message pointing the agent to Read.
     - `bun test/manual/sandbox-probe.ts` rechecks this against your installed Claude Code; run it after an upgrade.
   - Claude's Read and Grep tools aren't in that sandbox. hib's permission handling is what makes Read return a pseudonymised copy, so that part relies on Claude sending every file read through hib.

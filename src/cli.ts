@@ -410,7 +410,10 @@ async function egressCmd(which?: string) {
 /** y/N question. A fresh readline per question: returning out of `for await (… of console)` closes stdin for good. */
 async function confirm(q: string): Promise<boolean> {
   if (values.yes) return true;
-  if (!process.stdin.isTTY) return false;
+  if (!process.stdin.isTTY) {
+    console.log("not confirmed: no terminal to ask in. Pass --yes to proceed.");
+    return false;
+  }
   const { createInterface } = await import("node:readline");
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
