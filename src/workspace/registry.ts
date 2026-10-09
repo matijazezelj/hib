@@ -76,6 +76,7 @@ export class Workspaces {
     if (policy) {
       if (!/^[a-z0-9_-]+@[A-Za-z0-9_-]+$/.test(policy.account) || !this.cfg.accounts.some((a) => a.id === policy.account))
         throw new Error(`unknown account ${policy.account}; known: ${this.cfg.accounts.map((a) => a.id).join(", ")}`);
+      if (!supportsSensitive(policy.account)) throw new Error(SENSITIVE_NEEDS_CLAUDE);
       if (policy.model && !policy.model.startsWith(policy.account + "/")) throw new Error(`model must be on ${policy.account}, e.g. ${policy.account}/sonnet`);
     }
     this.db.run("UPDATE workspaces SET policy = ? WHERE root = ?", [policy ? JSON.stringify(policy) : null, root]);
@@ -112,6 +113,13 @@ export class Workspaces {
     if (i >= 0) this.cfg.guard.agentDirs.splice(i, 1);
   }
 }
+
+/**
+ * Only Claude can keep a sensitive folder's promises: every read asks (Codex runs cat/head/grep without asking) and
+ * data files are swapped for pseudonymised copies (that hooks Claude's Read tool, which Codex doesn't have).
+ */
+export const supportsSensitive = (account: string) => !account.startsWith("codex@");
+export const SENSITIVE_NEEDS_CLAUDE = "sensitive folders need a Claude account: Codex runs read commands like cat and grep without asking, so reads can't be gated or pseudonymised there";
 
 /** True if a model id ("claude@work/sonnet", "claude/sonnet") runs on the pinned account. */
 export function onPinnedAccount(modelId: string, policy: Policy, cfg: Config): boolean {

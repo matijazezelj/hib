@@ -122,3 +122,13 @@ describe("sensitive policy reaches every folder an agent could open", () => {
     expect(() => ws.effectivePolicy(top)).toThrow(/different accounts/);
   });
 });
+
+test("a sensitive folder can't be pinned to Codex (it runs cat/grep without asking)", async () => {
+  const { Workspaces } = await import("../src/workspace/registry");
+  const { memoryDb } = await import("../src/db");
+  const { parseConfig } = await import("../src/config");
+  const cfg = parseConfig(Bun.TOML.parse(`[models.codex]\nm = "fast"\n[providers.codex]\ndefault = "main"\n[providers.codex.accounts.main]\nenv = {}\n`) as any, tmpdir());
+  const ws = new Workspaces(memoryDb(), cfg);
+  const dir = ws.register(mkdtempSync(join(tmpdir(), "hib-cx-")));
+  expect(() => ws.setPolicy(dir, { sensitive: true, account: "codex@main" })).toThrow(/Claude account/);
+});

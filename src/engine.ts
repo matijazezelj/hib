@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import type { Config, Mode, TaskClass } from "./config";
 import { inspect, obfuscateText, runNer, StreamRestorer, tokenNote, Vault, type NerResult } from "./guard";
 import { NerModel, type Infer } from "./guard/ner";
-import type { Finding } from "./guard/detectors";
+import { stricterLevel, type Finding } from "./guard/detectors";
 import { join } from "node:path";
 import type { VaultState } from "./guard/vault";
 import type { Sealer } from "./guard/seal";
@@ -319,9 +319,11 @@ export class Engine {
 
     if (sensitive) explicit ??= pinnedModel(sensitive.policy, this.cfg, cls);
     const plan = await this.router.plan(cls, { explicit, mode: input.mode, cwd: input.cwd });
+    // An agent plugin can make the guard stricter, never looser; and the sensitive/solo rules apply after it, so no
+    // plugin turns the advisor back on where it must stay off.
+    if (agent) plan.route = { ...plan.route, level: stricterLevel(agent.level, plan.route.level), advisor: agent.advisor ?? plan.route.advisor };
     if (sensitive || input.solo) plan.route = { ...plan.route, advisor: false };
     if (input.solo) plan.ordered = plan.ordered.slice(0, 1);
-    if (agent) plan.route = { ...plan.route, level: agent.level ?? plan.route.level, advisor: agent.advisor ?? plan.route.advisor };
     if (!plan.ordered.length) return yield { type: "error", message: `no usable model for ${cls}: ${plan.skipped.map((s) => `${s.id} (${s.why})`).join(", ")}` };
 
     // guard

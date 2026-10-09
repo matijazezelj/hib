@@ -204,3 +204,9 @@ export function detect(text: string, opts: DetectOptions): Finding[] {
   }
   return taken.sort((a, b) => a.start - b.start);
 }
+
+const LEVEL_ORDER: Level[] = ["minimal", "standard", "paranoid"];
+/** The stricter of two guard levels; plugins may raise a route's level, never lower it. */
+export function stricterLevel(a: Level | undefined, b: Level): Level {
+  return a && LEVEL_ORDER.indexOf(a) > LEVEL_ORDER.indexOf(b) ? a : b;
+}

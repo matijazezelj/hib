@@ -132,14 +132,12 @@ async function main() {
       } else if (sub === "sensitive") {
         if (!values.account) {
           const info = await client.get("/hib/info");
-          const accounts = [...new Set((info.models as string[]).filter((m) => /^(claude|codex)@/.test(m)).map((m) => m.split("/")[0]))];
+          const accounts = [...new Set((info.models as string[]).filter((m) => /^claude@/.test(m)).map((m) => m.split("/")[0]))];
           throw new Error(`choose the one account this folder may use: --account ${accounts.join(" | ")}`);
         }
         const root = await b.registerWorkspace(client, dir);
         await client.post("/hib/workspaces/policy", { root, policy: { account: values.account, model: values.model } });
         console.log(`${root} is sensitive: only ${values.account} sees it; no handoff, failover, advisor, arena or browser terminal; secrets blocked; every read asks.`);
-        if (String(values.account).startsWith("codex@"))
-          console.log("note: Codex runs read-only commands like cat/ls/grep without asking, so reads can't be gated there. Prefer a Claude account for sensitive folders.");
       } else if (sub === "normal") {
         // Written straight to the database: the HTTP API refuses to lift a policy.
         const { openDb } = await import("./db");

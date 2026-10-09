@@ -9,7 +9,7 @@ import { REGISTRIES, sandboxFor, secretPaths } from "./sandbox";
 import { insideRoot, realTarget } from "./fs";
 import { changes as protectedChanges, revert as revertProtected, snapshot as protectedSnapshot } from "./protect";
 import { detect } from "../guard/detectors";
-import { onPinnedAccount, pinnedModel } from "./registry";
+import { onPinnedAccount, pinnedModel, SENSITIVE_NEEDS_CLAUDE, supportsSensitive } from "./registry";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, sep, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
@@ -349,6 +349,7 @@ export class WorkspaceSessions {
     const policy = this.engine.workspaces.effectivePolicy(root);
     const chosen = input.model && input.model !== "hib/auto" ? input.model : undefined;
     let modelId = chosen ?? row?.agent_model ?? (policy ? pinnedModel(policy, this.cfg) : await this.defaultModel(root));
+    if (policy && !supportsSensitive(policy.account)) return yield { type: "error", message: SENSITIVE_NEEDS_CLAUDE }; // a policy set before this rule
     if (policy && !onPinnedAccount(modelId, policy, this.cfg)) {
       // A sensitive folder only ever talks to its pinned account.
       if (chosen) return yield { type: "error", message: `this workspace is sensitive and pinned to ${policy.account}; ${chosen} is not allowed` };

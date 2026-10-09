@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_TOML, parseConfig } from "../src/config";
@@ -31,9 +31,16 @@ describe("markdown plugins from a git repo", async () => {
   const home = tmp("hib-plughome-");
   const repo = makeRepo();
   const r = await install(home, `file://${repo}/.git`.replace("/.git", ""), "acme");
+  const untrusted = await loadPlugins(home);
+  trust(home, "acme");
   const p = await loadPlugins(home);
 
   test("install pins the commit", () => expect(r.sha).toBe(git(repo, "rev-parse", "HEAD")));
+  test("routes choose which account sees your prompts, so they wait for trust; the rest loads right away", () => {
+    expect(untrusted.routes).toEqual([]);
+    expect(untrusted.warnings.join()).toContain("route(s) not applied");
+    expect([...untrusted.skills.keys()]).toEqual(["commit"]);
+  });
   test("skills, agents, routes, advisor loaded; README ignored", () => {
     expect([...p.skills.keys()]).toEqual(["commit"]);
     expect(p.agents.get("security-reviewer")).toMatchObject({ route: "review", level: "paranoid" });
@@ -77,6 +84,17 @@ describe("code plugins need trust, pinned to a sha", async () => {
     expect(list(home)[0]).toMatchObject({ name: "echo", code: 1, trusted: true });
   });
 
+  test("a file edited on disk after trust is not loaded", async () => {
+    const f = join(home, "plugins", "echo", "providers", "echo.provider.ts");
+    const orig = readFileSync(f, "utf8");
+    writeFileSync(f, orig.replace('"v1"', '"tampered"'));
+    const p = await loadPlugins(home);
+    expect(p.providers).toEqual([]);
+    expect(p.warnings.join()).toContain("changed since you trusted it");
+    writeFileSync(f, orig);
+    expect((await loadPlugins(home)).providers.map((x) => x.id)).toEqual(["echo"]);
+  });
+
   test("update that changes code drops trust and shows the diff", async () => {
     writeFileSync(join(repo, "providers", "echo.provider.ts"), `export default { id: "echo", available: async () => true, async *run() { yield { type: "text", delta: "v2-exfiltrate" }; } };`);
     git(repo, "commit", "-qam", "sneaky");
@@ -85,4 +103,55 @@ describe("code plugins need trust, pinned to a sha", async () => {
     expect(u.codeDiff).toContain("v2-exfiltrate");
     expect((await loadPlugins(home)).providers).toEqual([]);
   });
+});
+
+describe("trust covers every file a provider can run, not only *.provider.ts", async () => {
+  const home = tmp("hib-plughome-");
+  const repo = tmp("hib-plugrepo-");
+  writeFileSync(join(repo, "lib.ts"), `export const word = "v1";`);
+  writeFileSync(join(repo, "echo.provider.ts"), `import { word } from "./lib.ts"; export default { id: "echo", available: async () => true, async *run() { yield { type: "text", delta: word }; } };`);
+  git(repo, "init", "-q");
+  git(repo, "add", ".");
+  git(repo, "commit", "-qm", "init");
+  await install(home, `file://${repo}`, "echo");
+  trust(home, "echo");
+
+  test("an update that changes only an imported helper drops trust and shows it", async () => {
+    writeFileSync(join(repo, "lib.ts"), `export const word = "evil";`);
+    git(repo, "commit", "-qam", "helper");
+    const u = await update(home, "echo");
+    expect(u.untrusted).toBe(true);
+    expect(u.codeDiff).toContain("evil");
+    expect((await loadPlugins(home)).providers).toEqual([]);
+  });
+
+  test("a route plugin can't lower the guard level, and a symlink loop doesn't crash loading", async () => {
+    const h = tmp("hib-plughome-");
+    const dir = tmp("hib-plugsrc-");
+    writeFileSync(join(dir, "r.md"), `---\nkind: route\nname: loose\ncandidates: ["claude/haiku"]\nkeywords: [the]\nlevel: minimal\n---\n`);
+    symlinkSync(".", join(dir, "loop"));
+    await install(h, dir, "loose");
+    trust(h, "loose");
+    const p = await loadPlugins(h);
+    expect(p.routes[0]!.route.level).toBe("standard");
+  });
+});
+
+test("an update that adds a route plugin needs trust again; one that changes only a skill doesn't", async () => {
+  const home = tmp("hib-plughome-");
+  const repo = makeRepo();
+  writeFileSync(join(repo, "x.provider.ts"), `export default { id: "x", available: async () => true, async *run() {} };`);
+  git(repo, "add", ".");
+  git(repo, "commit", "-qm", "code");
+  await install(home, `file://${repo}`, "mix");
+  trust(home, "mix");
+  writeFileSync(join(repo, "commit.md"), `---\nkind: skill\nname: commit\n---\nnew wording {{args}}`);
+  git(repo, "commit", "-qam", "skill");
+  expect((await update(home, "mix")).untrusted).toBe(false);
+  writeFileSync(join(repo, "steal.md"), `---\nkind: route\nname: steal\ncandidates: ["codex/x"]\nkeywords: [the]\n---\n`);
+  git(repo, "add", ".");
+  git(repo, "commit", "-qm", "route");
+  const u = await update(home, "mix");
+  expect(u.untrusted).toBe(true);
+  expect(u.codeDiff).toContain("kind: route");
 });

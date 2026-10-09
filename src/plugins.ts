@@ -1,7 +1,7 @@
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
 import type { Config, Mode, Route } from "./config";
-import type { Level } from "./guard/detectors";
+import { stricterLevel, type Level } from "./guard/detectors";
 import type { Provider } from "./providers/types";
 
 export interface Skill { name: string; description?: string; template: string; model?: string; mode?: Mode; plugin: string }
@@ -25,7 +25,8 @@ export interface Plugins {
 interface LockEntry {
   source: string;
   sha?: string; // pinned commit for git sources
-  trustedSha?: string; // code runs only while this equals sha
+  trustedSha?: string; // the commit you trusted
+  trustedHash?: string; // fingerprint of the files you trusted; code and routes load only while the files on disk still match
   installed: number;
 }
 type Lock = Record<string, LockEntry>;
@@ -52,15 +53,34 @@ function parseFrontmatter(text: string): { meta: Record<string, any>; body: stri
   return { meta: (Bun.YAML.parse(m[1]!) as any) ?? {}, body: m[2]!.trim() };
 }
 
+/** Files in a plugin, symlinks included as entries but never followed (a link to `.` or `/` can't loop or wander). */
 function walk(dir: string, out: string[] = []): string[] {
   for (const n of readdirSync(dir)) {
-    if (n === ".git" || n === "node_modules") continue;
+    if (n === ".git") continue;
     const p = join(dir, n);
-    if (statSync(p).isDirectory()) walk(p, out);
+    const st = lstatSync(p);
+    if (st.isDirectory()) walk(p, out);
     else out.push(p);
   }
   return out;
 }
+
+/**
+ * What trust is tied to: every file in the plugin (helpers a provider imports, node_modules, route files), by path and
+ * content, symlinks by their target. Checked again before anything trusted loads, so an edited file on disk, or an
+ * update that changed any of them, needs a fresh `hib plugin trust`.
+ */
+export function fingerprint(dir: string): string {
+  const h = new Bun.CryptoHasher("sha256");
+  for (const p of walk(dir).sort()) {
+    const st = lstatSync(p);
+    h.update(relative(dir, p)).update("\0");
+    h.update(st.isSymbolicLink() ? `link:${readlinkSync(p)}` : st.isFile() ? readFileSync(p) : `special:${st.mode}`).update("\0");
+  }
+  return h.digest("hex");
+}
+
+const trusted = (e: LockEntry | undefined, dir: string) => !!e?.trustedHash && e.trustedSha === e.sha && e.trustedHash === fingerprint(dir);
 
 const isMd = (p: string) => p.endsWith(".md") && !/^(readme|license|changelog|contributing)\.md$/i.test(basename(p));
 
@@ -83,7 +103,8 @@ function addMd(file: string, plugin: string, acc: Plugins) {
         name,
         plugin,
         keywords: meta.keywords ?? [],
-        route: { candidates: meta.candidates ?? [], mode: meta.mode === "agent" ? "agent" : "chat", advisor: !!meta.advisor, level: meta.level ?? "standard", ask: !!meta.ask },
+        // A route decides which account sees your prompts, so it's never looser than the default guard level.
+        route: { candidates: meta.candidates ?? [], mode: meta.mode === "agent" ? "agent" : "chat", advisor: !!meta.advisor, level: stricterLevel(meta.level, "standard"), ask: !!meta.ask },
       });
       break;
     case "guard":
@@ -113,7 +134,9 @@ export async function loadPlugins(home: string): Promise<Plugins> {
   const lock = readLock(home);
   for (const name of readdirSync(dir)) {
     const root = join(dir, name);
-    if (!statSync(root).isDirectory()) continue;
+    if (!lstatSync(root).isDirectory()) continue;
+    const isTrusted = trusted(lock[name], root);
+    const routesBefore = acc.routes.length;
     for (const f of walk(root).filter(isMd)) {
       try {
         addMd(f, name, acc);
@@ -121,11 +144,15 @@ export async function loadPlugins(home: string): Promise<Plugins> {
         acc.warnings.push(`${name}: ${basename(f)}: ${e.message}`);
       }
     }
+    // Routes send your prompts to the accounts they name: like code, they apply only once you've trusted the plugin.
+    if (!isTrusted && acc.routes.length > routesBefore) {
+      acc.routes.splice(routesBefore);
+      acc.warnings.push(`${name}: route(s) not applied; they choose which account sees your prompts. Review, then \`hib plugin trust ${name}\``);
+    }
     const code = codeFiles(root);
     if (!code.length) continue;
-    const entry = lock[name];
-    if (!entry?.trustedSha || entry.trustedSha !== entry.sha) {
-      acc.warnings.push(`${name}: ${code.length} code file(s) not loaded; run \`hib plugin trust ${name}\` after reviewing`);
+    if (!isTrusted) {
+      acc.warnings.push(`${name}: ${code.length} code file(s) not loaded; ${lock[name]?.trustedSha && !lock[name]?.trustedHash ? "trust predates file fingerprints, so trust it again" : "its files changed since you trusted it, or it was never trusted"}. Review, then \`hib plugin trust ${name}\``);
       continue;
     }
     for (const f of code) {
@@ -210,11 +237,12 @@ export function trust(home: string, name: string): { code: string[]; sha?: strin
   const e = lock[name];
   if (!e) throw new Error(`no plugin ${name}`);
   e.trustedSha = e.sha;
+  e.trustedHash = fingerprint(join(pluginsDir(home), name));
   writeLock(home, lock);
   return { code: codeFiles(join(pluginsDir(home), name)), sha: e.sha };
 }
 
-/** Fetches the newest commit; if code files changed, trust is dropped and the diff returned for review. */
+/** Fetches the newest commit; if anything besides markdown docs changed, trust is dropped and the diff returned for review. */
 export async function update(home: string, name: string): Promise<{ from?: string; to?: string; codeDiff: string; untrusted: boolean }> {
   const lock = readLock(home);
   const e = lock[name];
@@ -231,14 +259,29 @@ export async function update(home: string, name: string): Promise<{ from?: strin
   const to = await sh(["git", "rev-parse", "FETCH_HEAD"], dir);
   if (to === e.sha) return { from: e.sha, to, codeDiff: "", untrusted: false };
   await sh(["git", "fetch", "--quiet", "--deepen", "50", "origin"], dir).catch(() => {});
-  const codeDiff = await sh(["git", "diff", `${e.sha}..${to}`, "--", "*.provider.ts", "*.provider.js"], dir).catch(() => "(diff unavailable: history too shallow, review the files)");
+  // Everything except markdown that isn't trust-gated: a provider's helpers, configs, and route files all count.
+  // Each changed .md is judged by its new content (a deleted one counts as a doc).
+  const changed = (await sh(["git", "diff", "--name-only", `${e.sha}..${to}`], dir).catch(() => "")).split("\n").filter(Boolean);
+  const docs: string[] = [];
+  for (const f of changed.filter((f) => f.endsWith(".md"))) {
+    const next = await sh(["git", "show", `${to}:${f}`], dir).catch(() => null);
+    let route = false;
+    try {
+      route = next !== null && parseFrontmatter(next).meta.kind === "route";
+    } catch {
+      route = true; // unparseable frontmatter: review it
+    }
+    if (!route) docs.push(f);
+  }
+  const codeDiff = await sh(["git", "diff", `${e.sha}..${to}`, "--", ".", ...docs.map((f) => `:(exclude)${f}`)], dir).catch(() => "(diff unavailable: history too shallow, review the files)");
+  const hadTrust = trusted(e, dir);
   await sh(["git", "checkout", "--quiet", to], dir);
   const from = e.sha;
-  const hadTrust = e.trustedSha === e.sha;
   e.sha = to;
-  if (hadTrust && !codeDiff) e.trustedSha = to; // only markdown changed
+  if (hadTrust && !codeDiff) [e.trustedSha, e.trustedHash] = [to, fingerprint(dir)]; // only markdown docs changed
+  else delete e.trustedHash;
   writeLock(home, lock);
-  return { from, to, codeDiff, untrusted: codeFiles(dir).length > 0 && e.trustedSha !== to };
+  return { from, to, codeDiff, untrusted: codeFiles(dir).length > 0 && !trusted(e, dir) };
 }
 
 export function remove(home: string, name: string) {
@@ -255,6 +298,6 @@ export function list(home: string) {
     const exists = existsSync(dir);
     const code = exists ? codeFiles(dir) : [];
     const md = exists ? walk(dir).filter(isMd).length : 0;
-    return { name, source: e.source, sha: e.sha?.slice(0, 12), md, code: code.length, trusted: !!e.trustedSha && e.trustedSha === e.sha };
+    return { name, source: e.source, sha: e.sha?.slice(0, 12), md, code: code.length, trusted: exists && trusted(e, dir) };
   });
 }
