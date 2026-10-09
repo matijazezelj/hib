@@ -13,6 +13,7 @@ import { basename } from "node:path";
 import { safePath } from "./workspace/fs";
 import { ClaudeDriver } from "./workspace/claude-driver";
 import { CodexDriver } from "./workspace/codex-driver";
+import { defaultWorktreeDir, Tasks } from "./workspace/tasks";
 
 export function apiToken(home: string): string {
   const file = join(home, "token");
@@ -107,6 +108,12 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
       return root ? fn(root, req) : json({ error: { message: "unknown workspace; run hib in that folder first" } }, 404);
     });
   const sessions = new WorkspaceSessions(engine, engine.sealer, (p) => (p === "claude" ? new ClaudeDriver() : p === "codex" ? new CodexDriver() : null), `http://127.0.0.1:${port}`);
+  const tasks = new Tasks(engine, sessions, { dir: defaultWorktreeDir() });
+  // Task worktrees are registered so their sessions run like any workspace, but they aren't folders the user opened.
+  const userWorkspaces = () => {
+    const hidden = tasks.worktrees();
+    return workspaces.list().filter((w) => !hidden.has(w.root));
+  };
   const analyzer = new Analyzer(engine);
   // Files for analysis: a path inside a registered workspace (web), or an absolute path from the local CLI.
   const analysisPath = (b: any) => {
@@ -149,10 +156,27 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
         POST: ws(async (root, req) => {
           const b: any = await req.json();
           if (b.sessionId && !sessionIn(root, b.sessionId)) return json({ error: { message: "session not in this workspace" } }, 404);
+          const task = tasks.byWorktree(root);
+          if (task && workspaces.policyFor(task.root)) return json({ error: { message: "the folder this task came from is now sensitive; discard the task" } }, 403);
           const r = sessions.startTurn({ sessionId: b.sessionId || undefined, root, model: b.model || undefined, text: String(b.text ?? ""), auto: typeof b.auto === "boolean" ? b.auto : undefined, advisor: typeof b.advisor === "boolean" ? b.advisor : undefined });
           return "error" in r ? json({ error: { message: r.error } }, 409) : json(r);
         }),
       },
+      // A background task started from this folder: its own worktree and session, in auto mode.
+      "/ws/task": {
+        POST: ws(async (root, req) => {
+          const b: any = await req.json();
+          return json(await tasks.create({ root, prompt: String(b.text ?? ""), model: b.model || undefined }));
+        }),
+      },
+      "/hib/tasks": guarded((req) => {
+        const root = q(req, "root") ? workspaces.resolve(q(req, "root")) : undefined;
+        if (root === null) return json([]);
+        return json(tasks.list({ root, all: q(req, "all") === "1" }).map((t) => ({ ...t, running: sessions.running(t.session_id) })));
+      }),
+      "/hib/tasks/:id": guarded(async (req) => json(await tasks.review(req.params.id!))),
+      "/hib/tasks/:id/merge": { POST: guarded(async (req) => json(await tasks.merge(req.params.id!))) },
+      "/hib/tasks/:id/discard": { POST: guarded(async (req) => json(await tasks.discard(req.params.id!))) },
       "/ws/sessions": ws((root) => json(sessions.list(root))),
       "/ws/sessions/:id": ws((root, req) => {
         const snap = sessionIn(root, req.params.id!);
@@ -237,7 +261,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
         return server.upgrade(req, { data: { kind: "terminal", cwd: root } }) ? undefined : new Response("upgrade failed", { status: 400 });
       },
       "/hib/workspaces": {
-        GET: guarded(() => json(workspaces.list())),
+        GET: guarded(() => json(userWorkspaces())),
         POST: guarded(async (req) => json({ root: workspaces.register(String(((await req.json()) as any).root ?? "")) })),
         DELETE: guarded((req) => (workspaces.forget(q(req, "root")), json({ ok: true }))),
       },
@@ -420,8 +444,8 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           agents: [...engine.plugins.agents.values()].map(({ name, description, plugin }) => ({ name, description, plugin })),
           pluginWarnings: engine.plugins.warnings,
           agentDirs: engine.cfg.guard.agentDirs,
-          workspaces: workspaces.list().map((w) => w.root),
-          policies: Object.fromEntries(workspaces.list().map((w) => [w.root, w.policy])),
+          workspaces: userWorkspaces().map((w) => w.root),
+          policies: Object.fromEntries(userWorkspaces().map((w) => [w.root, w.policy])),
         }),
       ),
     },

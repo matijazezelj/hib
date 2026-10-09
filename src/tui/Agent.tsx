@@ -25,6 +25,8 @@ const HELP = [
   "Esc               stop the running turn",
   "/auto  /manual    auto: edits in this folder and commands run without asking (network, push, publish, sudo, rm -r still ask); manual is the default",
   "/advisor          let the agent consult a model from the other provider while it works (toggle; off by default)",
+  "/bg <task>        hand a task to a background agent in its own git worktree (auto mode; notifies when done)",
+  "/tasks            background tasks from this folder; review, merge or discard with hib tasks …",
   "/model <id>       switch model (same CLI keeps its native session, otherwise hands over)",
   "/models  /new  /resume  /web (open this session in the browser)  /egress (what left, and to whom)  /usage  /quit",
 ].join("\n");
@@ -80,6 +82,8 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
     { name: "model", args: "<id>", desc: "switch model for the next message", values: () => modelIds.current },
     { name: "models", desc: "list models you can switch to" },
     { name: "new", desc: "start a new session" },
+    { name: "bg", args: "<task>", desc: "run a task in the background, in its own worktree" },
+    { name: "tasks", desc: "background tasks from this folder" },
     { name: "resume", args: "[id]", desc: "resume a session in this folder", values: () => sessionIds.current },
     { name: "auto", desc: "run edits and commands without asking (risky ones still ask)" },
     { name: "advisor", args: "[on|off]", desc: "let the agent consult the other provider" },
@@ -310,6 +314,29 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
       case "stop":
         await interrupt();
         return true;
+      case "bg": {
+        if (!arg) return push({ text: "usage: /bg <what the background agent should do>", color: "yellow" }), true;
+        try {
+          const t = await client.post(`/ws/task?${q}`, { text: arg, model });
+          push({ text: `◆ task ${t.id.slice(2)} started on ${t.model} in ${t.branch} (auto mode); you'll get a notification`, color: "magenta" });
+          if (t.dirty) push({ text: `  it starts from the last commit; your ${t.dirty} uncommitted change(s) aren't in it`, dim: true });
+          push({ text: `  /tasks to check on it · hib tasks review ${t.id.slice(2)} · ${workspaceUrl(url, t.worktree, t.session_id)}`, dim: true });
+        } catch (e: any) {
+          push({ text: e.message, color: "red" });
+        }
+        return true;
+      }
+      case "tasks": {
+        const list = await client.get(`/hib/tasks?${q}`);
+        if (!list.length) return push({ text: "no open background tasks from this folder; start one with /bg <task>", dim: true }), true;
+        const color: Record<string, string> = { running: "cyan", waiting: "yellow", done: "green", failed: "red", interrupted: "yellow" };
+        for (const t of list) {
+          push({ text: `${t.id.slice(2)}  ${t.status.padEnd(11)} ${t.title}`, color: color[t.status] });
+          if (t.note && t.status !== "running") push({ text: `          ${t.note}`, dim: true });
+        }
+        push({ text: "in a shell: hib tasks review|merge|discard|open <id>", dim: true });
+        return true;
+      }
       case "egress": {
         if (!sidRef.current) return push({ text: "no session yet", dim: true }), true;
         for (const t of await client.get(`/ws/egress/${sidRef.current}?${q}`)) {

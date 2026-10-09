@@ -8,7 +8,7 @@ _Last updated: 2026-10-09_
 ## Where it stands
 
 hib is usable day to day: a local daemon, a terminal agent (`hib`), a web workspace (`hib serve`), a multi-model chat, and an
-OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (196 tests).
+OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (202 tests).
 
 ### Done
 - **Router.** OpenAI-compatible `/v1`. Classification uses rules first, then Haiku for anything ambiguous. Routes come from config with learned scores (Thompson sampling), and failover is driven by usage and rate limits. Also: advisor review on routes, arena, and work/personal accounts via `CLAUDE_CONFIG_DIR` / `CODEX_HOME`.
@@ -27,6 +27,15 @@ OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. 
   - Data files reach the agent pseudonymised, and raw shell reads of data are blocked.
 - **Analyze** (`hib analyze`, web panel). The model sees only the schema and writes `analyze(rows)`, which runs locally in a sandbox. Interpretation is optional. Includes column pseudonymisation and an offline GeoNames gazetteer for travel analysis.
 - **Auto mode** (`/auto`, off by default). Edits and commands run without asking, but risky commands (network, push, publish, sudo, rm -r, anything touching hib's daemon or credentials) still ask.
+- **Background tasks** (`hib task "…"`, `/bg` in the terminal and web).
+  - Each task is one agent session in its own git worktree, on branch `hib/task-<id>`, in auto mode. Worktrees live in `~/.local/share/hib/worktrees` (override with `HIB_WORKTREES`). That path avoids `.hib`/`.claude`, which auto mode and the CLI deny rules treat as credentials.
+  - The worktree is registered as a workspace so sessions, the guard and the web UI work there, but it's hidden from workspace listings.
+  - The model is chosen for the original folder, so `accounts.dirs` pins still apply.
+  - The agent gets a system note saying nobody is watching and that it should leave PROGRESS.md alone, so parallel tasks don't conflict on merge. Update PROGRESS.md after merging. hib commits whatever the agent leaves uncommitted at the end of each turn.
+  - Status: running, waiting (a risky command or a guard approval), done, failed, or interrupted (the daemon restarted). A macOS notification fires on done, failed and needs-approval.
+  - `hib tasks` lists them; `review`, `merge` (`--no-ff` into whatever the folder has checked out; a conflicting merge is aborted) and `discard` act on one, and `open` opens its session in the TUI. `/tasks` and `/task <id>` do the same on the web.
+  - Off in sensitive workspaces, because a worktree outside the folder wouldn't inherit the pin. A task whose origin later becomes sensitive refuses new turns.
+  - Code: `src/workspace/tasks.ts`, with tests in `test/tasks.test.ts`.
 - **Advisor tool** (`/advisor`, off by default). hib's MCP server gives the agent an `advisor` tool backed by the other provider, through the guard, logged.
 - **Web UI.** Dark-first redesign of chat, analyze, home and workspace. Slash commands in the web composer.
 - **Terminal.** Ink terminal agent and router chat with slash autocomplete, and `**bold**` rendering.
@@ -39,9 +48,12 @@ OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. 
 - **Advisor needs a logged-in account of the other provider.** Without one, `/advisor` switches itself off with a note.
 
 ## Next
-1. **Background tasks.** `hib task "…"` / `/bg`: a session in its own git worktree, in auto mode, with a macOS notification when it's done or needs approval. `hib tasks` lists them, with review, merge and discard.
-2. **Fix the auto-mode gap** above: a sandbox for agent commands, and/or a narrower token for the web UI.
-3. **Look into the empty `ls` output** in workspace sessions.
+1. **Fix the auto-mode gap** above: a sandbox for agent commands, and/or a narrower token for the web UI. This matters more now that background tasks run in auto mode unattended.
+2. **Look into the empty `ls` output** in workspace sessions.
+3. **Background task polish.**
+   - A tasks panel in the web UI with review, merge and discard buttons. Today the web has only `/bg`, `/tasks` and `/task <id>`; review and merge need the CLI.
+   - Worktrees start without `node_modules`, so the agent installs dependencies itself.
+   - Tasks that branch from HEAD don't include the folder's uncommitted changes. hib warns about this.
 4. **Before making the repo public:** add a LICENSE. Add a README line saying hib drives the official CLIs on your own subscriptions and never extracts their logins.
 
 ## How to check it works

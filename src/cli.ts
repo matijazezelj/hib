@@ -10,6 +10,13 @@ const HELP = `hib — harness in a box
   hib --resume [id]           resume a session in this folder (picker if no id)
   hib serve                   open this folder in the web workspace; runs the daemon in the
                               foreground if none is running (web UI + OpenAI-compatible API)
+  hib task "prompt" [-m model]
+                              background task: an agent in its own git worktree and branch, in
+                              auto mode; a notification when it's done or needs approval
+  hib tasks [--all]           background tasks started here (--all: every folder, incl. closed)
+  hib tasks review|merge|discard|open <id>
+                              see the branch's changes, merge them into this folder, throw them
+                              away, or open the task's session to answer prompts / continue it
   hib chat [--resume [id]]    multi-model router chat in the terminal
   hib daemon status|stop      the shared background daemon (logs: ~/.hib/daemon.log)
   hib workspace list|forget [dir]   folders agents may work in
@@ -54,6 +61,7 @@ const { values, positionals } = parseArgs({
     keep: { type: "string" },
     yes: { type: "boolean", short: "y" },
     "show-sent": { type: "boolean" },
+    all: { type: "boolean" },
     help: { type: "boolean", short: "h" },
   },
 });
@@ -215,6 +223,10 @@ async function main() {
       if (cmd === "stats") for (const s of (await client.get("/hib/stats")).scores) console.log(`${s.class.padEnd(8)} ${s.model.padEnd(28)} ${(s.mean * 100).toFixed(0).padStart(3)}  (α ${s.alpha.toFixed(1)} β ${s.beta.toFixed(1)})`);
       return;
     }
+    case "task":
+      return taskCmd(rest.join(" "));
+    case "tasks":
+      return tasksCmd(rest[0], rest[1]);
     case "plugin":
       return pluginCmd(rest);
     case "egress":
@@ -260,6 +272,71 @@ async function agent(resume?: string | true) {
   }
   const { runAgent } = await import("./tui/Agent");
   return runAgent({ dir: here.root, resume, model: values.model as string | undefined });
+}
+
+async function taskCmd(prompt: string) {
+  if (!prompt.trim()) throw new Error('usage: hib task "what to do" [-m model]');
+  const { eligible } = await import("./workspace/registry");
+  const here = eligible(process.cwd());
+  if (!here.ok) throw new Error(here.why);
+  const b = await import("./boot");
+  const { client, url } = await b.ensureDaemon();
+  const root = await b.registerWorkspace(client, here.root);
+  const t = await client.post(`/ws/task?root=${encodeURIComponent(root)}`, { text: prompt, model: values.model });
+  console.log(`task ${t.id} started on ${t.model}, in auto mode`);
+  console.log(`  branch ${t.branch}, worktree ${t.worktree}`);
+  if (t.dirty) console.log(`  note: it starts from the last commit; your ${t.dirty} uncommitted change(s) here aren't in it`);
+  console.log(`  watch it: ${b.workspaceUrl(url, t.worktree, t.session_id)}`);
+  console.log(`  then: hib tasks review ${t.id.slice(2)}  ·  hib tasks merge ${t.id.slice(2)}`);
+}
+
+const TASK_COLOR: Record<string, string> = { running: "36", waiting: "33", done: "32", failed: "31", interrupted: "33" };
+
+async function tasksCmd(sub = "list", id?: string) {
+  const b = await import("./boot");
+  const { client, url } = await b.ensureDaemon();
+  const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
+  if (sub === "list") {
+    const { realpathSync } = await import("node:fs");
+    const list = await client.get(`/hib/tasks${values.all ? "?all=1" : `?root=${encodeURIComponent(realpathSync(process.cwd()))}`}`);
+    if (!list.length) return console.log(values.all ? "no tasks yet" : 'no open tasks from this folder (hib tasks --all for every folder). Start one: hib task "…"');
+    for (const t of list) {
+      const st = `\x1b[${TASK_COLOR[t.status] ?? "2"}m${t.status.padEnd(11)}\x1b[0m`;
+      console.log(`${t.id.slice(2)}  ${st} ${new Date(t.created).toLocaleString()}  ${t.title}${values.all ? dim(`  (${t.root})`) : ""}`);
+      if (t.note && t.status !== "running") console.log(dim(`          ${t.note}`));
+    }
+    return console.log(dim("\nhib tasks review|merge|discard|open <id>"));
+  }
+  if (!id) throw new Error(`usage: hib tasks ${sub} <id>`);
+  if (sub === "review") {
+    const r = await client.get(`/hib/tasks/${id}`);
+    const t = r.task;
+    console.log(`\x1b[1m${t.title}\x1b[0m  ${t.status}${r.running ? " (running)" : ""}  ${t.branch} · ${t.model}`);
+    if (t.note) console.log(dim(t.note));
+    if (r.summary) console.log(`\n${process.stdout.isTTY ? bold(r.summary) : r.summary}`);
+    if (r.uncommitted) console.log(dim(`\n${r.uncommitted} uncommitted change(s) in the worktree; merge commits them first`));
+    if (!r.log) return console.log(dim("\nno commits on the task branch yet"));
+    console.log(`\n${r.log}\n\n${r.stat}\n`);
+    const colored = r.diff.replace(/^(\+(?!\+\+).*)$/gm, "\x1b[32m$1\x1b[0m").replace(/^(-(?!--).*)$/gm, "\x1b[31m$1\x1b[0m");
+    console.log(process.stdout.isTTY ? colored : r.diff);
+    return console.log(dim(`hib tasks merge ${t.id.slice(2)}  ·  hib tasks discard ${t.id.slice(2)}  ·  hib tasks open ${t.id.slice(2)} to ask for changes`));
+  }
+  if (sub === "merge") {
+    const r = await client.post(`/hib/tasks/${id}/merge`, {});
+    return console.log(`merged ${r.task.branch} into ${r.task.root}: ${r.summary}\nworktree and branch removed`);
+  }
+  if (sub === "discard") {
+    if (!(await confirm(`Discard task ${id} and delete its worktree and branch?`))) return;
+    const t = await client.post(`/hib/tasks/${id}/discard`, {});
+    return console.log(`discarded ${t.id}`);
+  }
+  if (sub === "open") {
+    const t = (await client.get(`/hib/tasks/${id}`)).task;
+    if (!process.stdout.isTTY) return console.log(b.workspaceUrl(url, t.worktree, t.session_id));
+    const { runAgent } = await import("./tui/Agent");
+    return runAgent({ dir: t.worktree, resume: t.session_id });
+  }
+  throw new Error(`unknown tasks command ${sub}; use review, merge, discard or open`);
 }
 
 /** Sets `ner = …` in the [guard] section of config.toml, adding the line if an older config lacks it. */

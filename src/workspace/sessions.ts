@@ -125,6 +125,7 @@ export class WorkspaceSessions {
   private busy = new Set<string>();
   private auto = new Set<string>(); // sessions in auto mode; in memory only, so a restarted daemon is back to manual
   private advisorOn = new Set<string>(); // same for the advisor tool
+  private notes = new Map<string, string>(); // extra system prompt per session (background tasks), in memory too
   private hubs = new Map<string, Hub>();
   private listeners = new Set<() => void>();
 
@@ -189,9 +190,10 @@ export class WorkspaceSessions {
   }
 
   /** Starts a turn in the background; clients follow it through subscribe(). Closing a client never stops it. */
-  startTurn(input: { sessionId?: string; root: string; model?: string; text: string; auto?: boolean; advisor?: boolean }): { sessionId: string } | { error: string } {
+  startTurn(input: { sessionId?: string; root: string; model?: string; text: string; auto?: boolean; advisor?: boolean; system?: string }): { sessionId: string } | { error: string } {
     const sid = input.sessionId ?? newId();
     if (this.busy.has(sid)) return { error: "this session is already running a turn" };
+    if (input.system !== undefined) this.setNote(sid, input.system);
     this.busy.add(sid);
     const h = this.hub(sid);
     const ac = new AbortController();
@@ -276,7 +278,7 @@ export class WorkspaceSessions {
     // Sensitive folders: the agent learns the data rule up front, so it reaches for Read instead of `head`/`cat`.
     // The advisor tool exists only when switched on, outside sensitive folders, and with another provider to ask.
     const advisorKey = !askReads && this.advisorOn.has(id) && this.engine.router.advisorFor(c) ? crypto.randomUUID() : undefined;
-    const sys = [system, askReads ? DATA_RULE_NOTE : "", advisorKey ? ADVISOR_NOTE : ""].filter(Boolean).join("\n\n") || undefined;
+    const sys = [system, this.notes.get(id), askReads ? DATA_RULE_NOTE : "", advisorKey ? ADVISOR_NOTE : ""].filter(Boolean).join("\n\n") || undefined;
     const mcp = advisorKey ? { name: "hib", command: process.execPath, args: [ADVISOR_SCRIPT], env: { HIB_URL: this.daemonUrl, HIB_ADVISOR_KEY: advisorKey, HIB_SESSION: id } } : undefined;
     await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp });
     const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey };
@@ -285,7 +287,7 @@ export class WorkspaceSessions {
   }
 
   /** Starts a turn and yields its events until it ends (used by tests and simple clients). */
-  async *send(input: { sessionId?: string; root: string; model?: string; text: string; auto?: boolean; advisor?: boolean }, _signal?: AbortSignal): AsyncGenerator<WsEvent> {
+  async *send(input: { sessionId?: string; root: string; model?: string; text: string; auto?: boolean; advisor?: boolean; system?: string }, _signal?: AbortSignal): AsyncGenerator<WsEvent> {
     const started = this.startTurn(input);
     if ("error" in started) return yield { type: "error", message: started.error };
     const q: WsEvent[] = [];
@@ -629,6 +631,26 @@ export class WorkspaceSessions {
     this.emit(sessionId, { type: "mode", auto: on });
     const l = this.live.get(sessionId);
     if (on && l) for (const [id, p] of l.pending) if (this.autoModeCovers(l, p.call)) this.answer(sessionId, id, "allow");
+  }
+
+  /** A standing system note for a session's CLI, applied whenever it (re)starts. */
+  setNote(sessionId: string, note: string) {
+    if (note) this.notes.set(sessionId, note);
+    else this.notes.delete(sessionId);
+  }
+
+  running(sessionId: string): boolean {
+    return !!this.hubs.get(sessionId)?.running;
+  }
+
+  /** Stops a session's turn and its CLI; the history stays. */
+  async close(sessionId: string) {
+    await this.interrupt(sessionId);
+    const l = this.live.get(sessionId);
+    this.live.delete(sessionId);
+    await l?.driver.close();
+    this.auto.delete(sessionId);
+    this.notes.delete(sessionId);
   }
 
   /** Switches the advisor tool for a session; it takes effect on the next message (the CLI restarts on its native session). */

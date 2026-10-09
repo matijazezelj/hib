@@ -41,6 +41,10 @@ CREATE TABLE IF NOT EXISTS ws_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, ts INTEGER, event TEXT
 );
 CREATE INDEX IF NOT EXISTS ws_events_session ON ws_events(session_id, id);
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY, root TEXT, worktree TEXT, branch TEXT, base TEXT, session_id TEXT, title TEXT, model TEXT,
+  status TEXT, note TEXT, created INTEGER, updated INTEGER
+);
 CREATE TABLE IF NOT EXISTS arena (id TEXT PRIMARY KEY, ts INTEGER, class TEXT, run_a TEXT, run_b TEXT, text_b TEXT, winner TEXT);
 `;
 

@@ -355,6 +355,33 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
         return note(String(e.message ?? e), "bad");
       }
     }
+    if (cmd === "/bg") {
+      if (!arg) return note("usage: /bg <what the background agent should do>", "warn");
+      try {
+        const t = await api.post(`/ws/task?${q}`, { text: arg, model });
+        const id = t.id.slice(2);
+        note(`Task ${id} started on ${t.model} in its own worktree (${t.branch}), in auto mode. You'll get a notification when it's done or needs approval.${t.dirty ? ` It starts from the last commit; your ${t.dirty} uncommitted change(s) aren't in it.` : ""} /tasks to check on it.`, "ok");
+      } catch (e: any) {
+        note(String(e.message ?? e), "bad");
+      }
+      return;
+    }
+    if (cmd === "/tasks") {
+      const list = await api.get(`/hib/tasks?${q}`).catch(() => []);
+      if (!list.length) return note("No open background tasks from this folder. Start one with /bg <task>.");
+      const tone: Record<string, "warn" | "bad" | "ok" | undefined> = { waiting: "warn", interrupted: "warn", failed: "bad", done: "ok" };
+      for (const t of list) note(`${t.id.slice(2)} · ${t.status} · ${t.title}${t.note && t.status !== "running" ? ` — ${t.note}` : ""}`, tone[t.status]);
+      return note("Open one: /task <id>. Review, merge or discard in a shell: hib tasks review|merge|discard <id>.");
+    }
+    if (cmd === "/task") {
+      try {
+        const t = (await api.get(`/hib/tasks/${encodeURIComponent(arg)}`)).task;
+        location.href = `/?ws=${encodeURIComponent(t.worktree)}&s=${t.session_id}`;
+      } catch (e: any) {
+        note(String(e.message ?? e), "bad");
+      }
+      return;
+    }
     if (cmd === "/model") {
       if (!arg) return note(`model: ${model} · available: ${agentModels.join(", ")}`);
       const m = agentModels.find((x) => x === arg || x.endsWith("/" + arg) || x.includes(arg));
@@ -362,7 +389,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
       setModel(m);
       return note(`next turn uses ${m}`, "ok");
     }
-    note(`${cmd === "/help" ? "" : `${cmd} isn't a command here. `}Commands: /auto, /manual, /advisor, /usage, /model [id], /new. Start with // to send a message that begins with a slash.`, cmd === "/help" ? undefined : "warn");
+    note(`${cmd === "/help" ? "" : `${cmd} isn't a command here. `}Commands: /auto, /manual, /advisor, /bg <task>, /tasks, /task <id>, /usage, /model [id], /new. Start with // to send a message that begins with a slash.`, cmd === "/help" ? undefined : "warn");
   }
 
   async function answer(id: string, choice: "allow" | "always" | "deny") {
