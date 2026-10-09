@@ -159,6 +159,19 @@ describe("routing and usage", () => {
     expect(r.of("meta")[0]!.skipped[0]!.id).toBe("alpha@main/fast");
   });
 
+  test("an approved turn goes only to the model the approval named: no failover to another vendor", async () => {
+    alpha.current = () => [{ type: "rate_limited", message: "usage limit" }];
+    const p = run({ messages: [{ role: "user", content: "fix -----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----" }], model: "hib/chat" });
+    await Bun.sleep(20);
+    const [a] = engine.pendingApprovals();
+    expect(a!.model).toBe("alpha@main/fast");
+    engine.decideApproval(a!.id, true);
+    const r = await p;
+    expect(r.of("failover").map((f) => f.to)).toEqual([undefined]); // reported, but to nobody
+    expect(r.of("error")[0]!.message).toContain("usage limit");
+    expect(sent.every((s) => s.provider === "alpha")).toBe(true);
+  });
+
   test("expired quota windows don't block", async () => {
     engine.usage.recordQuota("alpha@main", { window: "5h", usedPct: 1, resetsAt: Math.floor(Date.now() / 1000) - 10 });
     const r = await run({ messages: [{ role: "user", content: "hi" }], model: "hib/chat" });

@@ -8,7 +8,7 @@ _Last updated: 2026-10-09_
 ## Where it stands
 
 hib is usable day to day: a local daemon, a terminal agent (`hib`), a web workspace (`hib serve`), a multi-model chat, and an
-OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (242 tests,
+OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (244 tests,
 2 of them Linux-only) on Ubuntu and macOS.
 
 A full security audit ran on 2026-10-09 (daemon surface, agent permissions, guard/egress, analyze/plugins/web). All of
@@ -72,6 +72,8 @@ Known issues and in order under Next.
   - The router's advisor gets the primary answer through the guard (in agent mode it can quote files).
   - History keeps the text you approved, edits included, so later turns, titles, handoffs and the advisor never resend what you removed.
   - `accounts.dirs` pins hold for an over-quota explicit pick and for the advisor (`Router.advisorFor(primary, cwd)`).
+- **Approvals cover one model.** An approved turn goes only to the model the approval named: no failover, advisor or arena. If that model fails, the turn fails.
+- **Claude settings.** Every session runs with `--permission-mode manual` and `--setting-sources user`: your own settings apply, a repo's `.claude/` settings and hooks don't. "Always" for an MCP or unknown tool is keyed on that exact call.
 - **Codex permissions.** The whole command is judged (Codex's `/bin/zsh -lc '…'` unwrapped), not the first parsed segment; a move's destination is among the paths checked; a request with a `reason` (asking to leave the sandbox) is never auto-approved.
 - **Web UI, terminal.** Dark-first web UI with slash commands; Ink terminal agent and router chat with slash autocomplete and `**bold**`.
 - **Plugins.** Markdown plugins (skill, agent, route, guard, advisor) and code plugins.
@@ -81,18 +83,16 @@ Known issues and in order under Next.
 - **PROGRESS.md.** Workspaces with this file at their root start every fresh session from it. In sensitive folders hib only points to it.
 
 ## Known issues
-Open findings from the 2026-10-09 audit (all low, plus one remaining part of a medium), and older ones.
+Open findings from the 2026-10-09 audit (all low), and older ones.
 
 - **Guard and egress**
-  - [medium, part] An approval names one model, but failover and arena can then send the same text to another model without asking again.
   - [low] Egress log gaps: handoff transcript and PROGRESS.md content are logged only as flags and counts; agent tool output isn't logged as egress.
   - [low] Plaintext at rest: `messages`, `ws_events` and arena text keep originals; WAL/SHM files use the default umask.
   - [low] Detectors slow down quadratically on long input (100k chars ≈ 2.6 s at paranoid).
   - [low] Detector gaps: unprefixed tokens (`hvs.`, `hf_`, `shpat_`, Datadog, Okta), `scheme://user:pass@`, compressed IPv6, 100.64/8 and 169.254/16 as internal, IBANs, cards, phone numbers, names without NER.
 - **Agent permissions**
-  - [low] Unknown Claude tools default to kind `other` with the bare tool name as rule key, so "always" skips path checks for e.g. MCP file tools.
-  - [low] hib doesn't pass `--permission-mode default`; user/project allow rules or PreToolUse hooks can decide a call before hib sees it (non-sensitive folders).
-  - [low] Codex `webSearch` isn't gated, only logged.
+  - [low] Your own Claude allow rules and PreToolUse hooks (user settings) can still decide a call before hib sees it; that's your choice, and the README says so.
+  - [low] Codex `webSearch` isn't gated, only logged. Turning it off needs the right Codex config key (likely `web_search = "disabled"`, an enum with disabled/cached/indexed/live in 0.160); verify with `codex sandbox -c 'web_search="bogus"' -- true` outside a sandboxed session (it should reject the value) before setting it in `codex-driver.ts`, since a wrong key could break every Codex session.
   - [low] "Always" on a WebFetch host allows any URL/query to that host. An approved protected-file edit lets any content into that path for the rest of the turn.
   - [low] A background command can swap a directory for a symlink between an Edit's approval and its write; the end-of-turn check catches it for protected files only.
   - [low] Grep on a folder (not a single data file) in a sensitive workspace can return raw rows; it asks first and says so.
@@ -110,10 +110,9 @@ Open findings from the 2026-10-09 audit (all low, plus one remaining part of a m
 
 ## Next
 1. **Push and check CI.** Several things can't run in a sandboxed Claude session and are checked only by CI (or `bun test` on your machine): the server tests (browser sessions, forget refused), the Linux bubblewrap tests, and the macOS analysis Seatbelt profile (the "sandboxed run" tests). Confirm both jobs pass. If the macOS "sandboxed run" tests fail with EPERM on `tsconfig.json` or `package.json`, bun walked up to the repo root (now under the `/Users` deny): add literal allows for those two files in `seatbelt()`, don't re-allow the repo.
-2. **Approval vs failover**: ask again (or don't fail over) when the model that would receive the text isn't the one the approval named.
-3. **Low-severity items** above, roughly in order: Claude `--permission-mode default` and unknown-tool rule keys; gate Codex `webSearch`; egress log of handoff/PROGRESS content; detector gaps and speed; `frame-ancestors` via a header; pathspec literals; command-line secrets via env; plaintext at rest.
-4. **Older items**: the empty `ls` output; background-task polish (a tasks panel with review/merge/discard in the web UI; worktrees start without `node_modules`; tasks don't include uncommitted changes, hib warns).
-5. **Review feedback, P2**: whether the router's learned scores get enough real feedback; prompt injection from repo content and tool results beyond what the sandbox and approvals cover.
+2. **Low-severity items** above, roughly in order: gate Codex `webSearch` (verify the key first); egress log of handoff/PROGRESS content; detector gaps and speed; `frame-ancestors` via a header; pathspec literals; command-line secrets via env; plaintext at rest.
+3. **Older items**: the empty `ls` output; background-task polish (a tasks panel with review/merge/discard in the web UI; worktrees start without `node_modules`; tasks don't include uncommitted changes, hib warns).
+4. **Review feedback, P2**: whether the router's learned scores get enough real feedback; prompt injection from repo content and tool results beyond what the sandbox and approvals cover.
 
 ## How to check it works
 - `bun test` and `bunx tsc --noEmit -p .`. Inside a sandboxed Claude session, the analyze tests (nested Seatbelt) and the server tests (local port binding) fail for environmental reasons; CI runs them.

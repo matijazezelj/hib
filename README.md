@@ -94,7 +94,7 @@ A sensitive folder is seen by exactly one vendor account, and it must be a Claud
   - A symlink to a data file is judged by its target, so it gets the pseudonymised copy too.
   - Commands keep `[HIB…]` placeholders as they are; restored, `echo` would print the real values back to the model.
   - The agent is told this rule up front. Listing and counting (`ls`, `wc`, `find`) still work.
-- **Repo config is ignored.** Claude sessions load only your user settings, never the repo's `.claude/` settings or hooks, and no MCP servers. A cloned repo can't add allow rules or run hooks.
+- **No MCP servers** but hib's own (every session already ignores the repo's `.claude/` settings and hooks; see Security model).
 - **No browser terminal** (the server refuses it).
 - **Egress log.** Each turn records the redacted prompt and the account it went to, plus every tool call. View it in the *Egress* tab, with `/egress` in the terminal, or with `hib workspace egress`.
 
@@ -213,7 +213,7 @@ The log stores the redacted text locally in `~/.hib/hib.db`, so anything the gua
 - **A policy covers the whole tree.** A sensitive folder's rules apply in every folder inside it, and a folder that contains a sensitive one is held to them too, since an agent there could read it. Opening hib on a folder that spans two sensitive folders pinned to different accounts is refused.
 - **hib's own git calls run no repo code.** Background-task commits, merges and worktree setup run without hooks; a repo's hooks can be files the agent edited (husky, lefthook). No git call hib makes on its own (status, diffs, the advisor's diff) starts an fsmonitor, external diff or textconv from config. Commits you make from the web git panel still run your hooks.
 - **Other local processes.** Anything else running as your user, outside an agent sandbox, can still read `~/.hib/token`. hib protects against its agents, not against your own account.
-- **Your own CLI config still applies:** your `settings.json` allow rules, MCP servers and `CLAUDE.md` / `AGENTS.md` load into agent sessions. Broad allow rules there bypass hib's prompts, and commands listed in your own `sandbox.excludedCommands` run outside the sandbox.
+- **Repo settings are ignored; your own still apply.** Claude sessions run in ask mode (`--permission-mode manual`, whatever `defaultMode` says) and load only your user settings, never the repo's `.claude/` settings or hooks: a cloned repo can't add allow rules, or hooks that run outside the sandbox. Your own `settings.json` allow rules, MCP servers and `CLAUDE.md` / `AGENTS.md` still load; broad allow rules there bypass hib's prompts, and commands in your own `sandbox.excludedCommands` run outside the sandbox. "Always" for an MCP or unknown tool covers only that exact call.
 - **Rendering:** model output is rendered as markdown without raw HTML.
 
 ## Accounts

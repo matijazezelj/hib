@@ -156,3 +156,17 @@ describe("codex: the whole command and every path a change touches", () => {
     expect(e.call.paths).toEqual(["/work/src/a.ts", "/Users/x/.zshrc"]);
   });
 });
+
+test("claude: 'always' for an MCP or unknown tool covers only that exact call (no path check could vouch for more)", () => {
+  const { ClaudeDriver } = require("../src/workspace/claude-driver") as typeof import("../src/workspace/claude-driver");
+  const { Queue } = require("../src/workspace/queue") as typeof import("../src/workspace/queue");
+  const keyFor = (tool: string, input: unknown) => {
+    const d = new ClaudeDriver() as any;
+    d.q = new Queue<any>();
+    d.onMessage({ type: "control_request", request_id: "1", request: { subtype: "can_use_tool", tool_name: tool, input } });
+    return d.q.items[0].ruleKey as string;
+  };
+  expect(keyFor("mcp__fs__write_file", { path: "/Users/x/.zshrc" })).toBe('mcp__fs__write_file:exact:{"path":"/Users/x/.zshrc"}');
+  expect(keyFor("mcp__fs__write_file", { path: "a" })).not.toBe(keyFor("mcp__fs__write_file", { path: "b" }));
+  expect(keyFor("Grep", { pattern: "x" })).toBe("Grep"); // known tools keep their usual scope
+});

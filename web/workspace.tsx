@@ -416,7 +416,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     refresh();
   }
 
-  const ruleLabel = (k: string) => k.replace(/^net:(.*)/, "network access to $1").replace(/^WebFetch:(.*)/, "fetches from $1").replace(/^(Bash|command):exact:.*/, "this exact command").replace(/^(Bash|command):/, "").replace(/^edit$/, "edits in this folder");
+  const ruleLabel = (k: string) => k.replace(/^net:(.*)/, "network access to $1").replace(/^WebFetch:(.*)/, "fetches from $1").replace(/^(Bash|command):exact:.*/, "this exact command").replace(/^[^:]+:exact:.*/, "this exact call").replace(/^(Bash|command):/, "").replace(/^edit$/, "edits in this folder");
 
   return (
     <div className={`ws ${viewer ? "with-viewer" : ""} ${term ? "with-term" : ""}`}>

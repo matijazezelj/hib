@@ -425,7 +425,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
     }
   });
 
-  const rule = (k: string) => k.replace(/^net:(.*)/, "network access to $1").replace(/^WebFetch:(.*)/, "fetches from $1").replace(/^(Bash|command):exact:.*/, "this exact command").replace(/^(Bash|command):/, "").replace(/^edit$/, "edits in this folder");
+  const rule = (k: string) => k.replace(/^net:(.*)/, "network access to $1").replace(/^WebFetch:(.*)/, "fetches from $1").replace(/^(Bash|command):exact:.*/, "this exact command").replace(/^[^:]+:exact:.*/, "this exact call").replace(/^(Bash|command):/, "").replace(/^edit$/, "edits in this folder");
 
   return (
     <>

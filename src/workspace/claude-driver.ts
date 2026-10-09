@@ -71,6 +71,9 @@ export class ClaudeDriver implements AgentDriver {
       "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
       "--model", opts.model,
       "--permission-prompts", "host", "--permission-prompt-tool", "stdio",
+      // Ask mode whatever your settings' defaultMode says, and only your own settings: a repo's .claude/ settings could
+      // add allow rules that decide calls before hib sees them, or hooks that run outside the sandbox.
+      "--permission-mode", "manual", "--setting-sources", "user",
     ];
     if (opts.resume) args.push("--resume", opts.resume);
     if (opts.system) args.push("--append-system-prompt", opts.system);
@@ -84,8 +87,8 @@ export class ClaudeDriver implements AgentDriver {
     if (opts.askReads) {
       // Reads (and read-only Bash like `cat`) are normally auto-allowed; asking shows every file before its content leaves.
       permissions.ask = ["Read", "Grep", "Glob", "NotebookRead", "Bash", "Task", "Agent", "WebFetch", "WebSearch"];
-      // Repo-committed .claude settings (allow rules, hooks) and MCP servers can't loosen a sensitive session.
-      args.push("--setting-sources", "user", "--strict-mcp-config");
+      // Sensitive sessions also ignore every MCP server but hib's own.
+      args.push("--strict-mcp-config");
     }
     if (opts.mcp) {
       const { name, ...server } = opts.mcp;
@@ -165,7 +168,9 @@ export class ClaudeDriver implements AgentDriver {
                     ? `net:${r.input?.host ?? ""}` // "always" opens that host only
                     : r.tool_name === "WebFetch" && call.outbound
                       ? `WebFetch:${call.outbound.host}` // and fetches from that host only
-                      : r.tool_name;
+                      : KIND[r.tool_name]
+                        ? r.tool_name
+                        : `${r.tool_name}:exact:${short(JSON.stringify(r.input ?? null), 2000)}`; // MCP and unknown tools: "always" covers this exact call
           q.push({ type: "permission", id: pid, call, ruleKey, input: r.input });
         } else this.send({ type: "control_response", response: { subtype: "error", request_id: m.request_id, error: `hib does not handle ${m.request?.subtype}` } });
         break;

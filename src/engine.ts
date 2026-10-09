@@ -353,6 +353,11 @@ export class Engine {
         outbound = outbound.map((m, i) => (i === lastUserIdx ? { ...m, content: again } : m));
         edited = vault.restore(again);
       }
+      // You approved sending this to one model, the one the approval named: no failover, advisor or arena may take it
+      // anywhere else. If that model fails, the turn fails; you can send again.
+      input.solo = true;
+      plan.ordered = plan.ordered.slice(0, 1);
+      plan.route = { ...plan.route, advisor: false };
       yield { type: "approved", edited: r.edited !== undefined };
     }
     if (agent) outbound = [{ role: "system", content: obfuscateText(vault, agent.system, plan.route.level, this.cfg, plan.route.mode) }, ...outbound];
