@@ -497,6 +497,38 @@ test("sensitive workspaces hand Claude a pseudonymised copy when it reads a CSV"
   expect(sessions.egress(r.sid)[0]!.actions.map((a) => a.title).join()).toContain("pseudonymised copy of");
 });
 
+test("text is guarded whole before it's cut, so a cut can't strip a key's BEGIN line and let its body out", async () => {
+  const { Vault } = await import("../src/guard");
+  const body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gunVTLw7onLRnrq0/IzW7yWR7QkrmBL7jTKEn5u";
+  const text = `-----BEGIN RSA PRIVATE KEY-----\n${body}\n-----END RSA PRIVATE KEY-----\n${"filler line\n".repeat(20)}`;
+  const kept = (sessions as any).guarded(new Vault(), text, 200, "end") as string; // the tail: BEGIN would be cut off
+  expect(kept).not.toContain(body.slice(0, 30));
+});
+
+test("sensitive: commands can't read data files at all, a symlink to one is still pseudonymised, and commands keep placeholders", async () => {
+  const { writeFileSync, symlinkSync, realpathSync } = await import("node:fs");
+  writeFileSync(join(root, "users.csv"), "username,email,salary\njsmith,john@acme.io,72000\n");
+  symlinkSync(join(root, "users.csv"), join(root, "notes.txt"));
+  engine.workspaces.register(root);
+  engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@work" });
+  let tok = "";
+  script.current = async (text, d, q) => {
+    tok = /\[HIB\w+-TERM-1\]/.exec(text)![0];
+    q.push({ type: "permission", id: "r1", ruleKey: "read:.", call: { id: "c1", name: "Read", kind: "read", title: "Read notes.txt", path: "notes.txt" }, input: { file_path: join(root, "notes.txt") } });
+    await d.ask("r1");
+    q.push({ type: "permission", id: "b1", ruleKey: "Bash:echo", call: { id: "c2", name: "Bash", kind: "command", title: `$ echo ${tok}`, command: `echo ${tok}` }, input: { command: `echo ${tok}` } });
+    await d.ask("b1");
+  };
+  await turn("check ProjectFalcon in notes.txt", undefined, () => "allow", "hib/auto");
+  expect(drivers[0]!.started[0]!.sandbox!.denyRead).toContain(realpathSync(join(root, "users.csv")));
+  const read = drivers[0]!.decisions.get("r1") as any;
+  expect(read.updatedInput.file_path).not.toBe(join(root, "notes.txt"));
+  const { readFileSync } = await import("node:fs");
+  expect(readFileSync(read.updatedInput.file_path, "utf8")).not.toContain("jsmith");
+  const cmd = drivers[0]!.decisions.get("b1") as any;
+  expect(cmd.updatedInput.command).toBe(`echo ${tok}`);
+});
+
 describe("sensitive table reads", () => {
   const setup = async () => {
     const { writeFileSync } = await import("node:fs");

@@ -132,3 +132,27 @@ test("a sensitive folder can't be pinned to Codex (it runs cat/grep without aski
   const dir = ws.register(mkdtempSync(join(tmpdir(), "hib-cx-")));
   expect(() => ws.setPolicy(dir, { sensitive: true, account: "codex@main" })).toThrow(/Claude account/);
 });
+
+describe("codex: the whole command and every path a change touches", () => {
+  const { CodexDriver } = require("../src/workspace/codex-driver") as typeof import("../src/workspace/codex-driver");
+  const { Queue } = require("../src/workspace/queue") as typeof import("../src/workspace/queue");
+  const drive = (fn: (d: any) => void) => {
+    const d = new CodexDriver() as any;
+    d.opts = { cwd: "/work" };
+    d.q = new Queue<any>();
+    fn(d);
+    d.q.end();
+    return d.q.items as any[];
+  };
+
+  test("a compound command is judged whole, not by its first segment", () => {
+    const [e] = drive((d) => d.onServerRequest({ id: 1, method: "item/commandExecution/requestApproval", params: { itemId: "i", command: "/bin/zsh -lc 'cat a && rm -rf .'", commandActions: [{ type: "read", command: "cat a" }] } }));
+    expect(e.call.command).toBe("cat a && rm -rf .");
+    expect(e.ruleKey).toBe("command:exact:cat a && rm -rf .");
+  });
+
+  test("a move's destination is among the paths checked", () => {
+    const [e] = drive((d) => d.onNotification("item/started", { item: { type: "fileChange", id: "f", changes: [{ path: "/work/src/a.ts", kind: { type: "update", move_path: "/Users/x/.zshrc" }, diff: "" }] } }));
+    expect(e.call.paths).toEqual(["/work/src/a.ts", "/Users/x/.zshrc"]);
+  });
+});

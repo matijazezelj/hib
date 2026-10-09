@@ -111,6 +111,16 @@ describe("guard end to end", () => {
     expect(r.of("error")[0]!.message).toContain("rejected");
   });
 
+  test("what you remove in the approval dialog stays removed: history keeps the edit, so later turns can't resend it", async () => {
+    const p = run({ persist: true, messages: [{ role: "user", content: "fix this -----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----" }], model: "hib/chat" });
+    await Bun.sleep(20);
+    engine.decideApproval(engine.pendingApprovals()[0]!.id, true, "fix this key handling");
+    const r = await p;
+    const conv = engine.getConversation(r.of("conversation")[0]!.id) as any;
+    expect(JSON.stringify(conv)).not.toContain("BEGIN RSA");
+    expect(JSON.stringify(conv)).toContain("fix this key handling");
+  });
+
   test("a rejected turn is never persisted (no conversation, no title leak)", async () => {
     const p = run({ persist: true, messages: [{ role: "user", content: "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----" }], model: "hib/chat" });
     await Bun.sleep(20);
@@ -182,6 +192,15 @@ describe("advisor", () => {
     expect(r.of("advisor")[0]).toMatchObject({ model: "beta@main/big", verdict: "issues" });
     expect(sent.map((s) => s.provider)).toEqual(["alpha", "beta", "alpha"]);
     expect(r.events.filter((e) => e.type === "text" && e.part === "revision").map((e: any) => e.delta).join("")).toBe("fixed answer");
+  });
+
+  test("the advisor never sees a secret the primary wrote itself (e.g. quoted from a file it read)", async () => {
+    alpha.current = () => [{ type: "text", delta: "the deploy key in .env is AKIAIOSFODNN7EXAMPLE" }];
+    beta.current = () => [{ type: "text", delta: "OK" }];
+    await run({ messages: [{ role: "user", content: "what does the deploy use?" }], model: "hib/code" });
+    const toAdvisor = JSON.stringify(sent.filter((s) => s.provider === "beta"));
+    expect(toAdvisor).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    expect(toAdvisor).toMatch(/\[HIB\w+-AWS-KEY-1\]/);
   });
 
   test("OK verdict keeps the answer", async () => {
@@ -428,4 +447,17 @@ test("--keep columns go out exactly as they are, even with name detection on; ot
   expect(wire).not.toContain("Marija Horvat");
   expect(wire).not.toContain("in Zagreb"); // the same city inside free text is still tokenized
   engine.cfg.guard.ner = false;
+});
+
+test("a folder pinned to an account (accounts.dirs) keeps that account for an over-quota explicit pick and for the advisor", async () => {
+  const { resolveCandidate } = await import("../src/router/route");
+  const dir = mkdtempSync(join(tmpdir(), "hib-pin-"));
+  engine.cfg.accounts.find((a) => a.id === "alpha@work")!.dirs.push(dir);
+  engine.usage.cooldown("alpha@work", Date.now() + 60_000, "test");
+  const plan = await engine.router.plan("code", { explicit: "alpha/big", mode: "agent", cwd: dir });
+  expect(plan.ordered.map((c) => c.id)).toEqual(["alpha@work/big"]); // not the default (personal) account
+  expect(engine.router.advisorFor(resolveCandidate("beta/big", engine.cfg)!, dir)).toBeNull(); // pinned account busy: no advisor, never the other account
+  engine.usage.cooldown("alpha@work", Date.now() - 1, "over");
+  expect(engine.router.advisorFor(resolveCandidate("beta/big", engine.cfg)!, dir)!.id).toBe("alpha@work/big");
+  expect(engine.router.advisorFor(resolveCandidate("beta/big", engine.cfg)!)!.id).toBe("alpha@main/big");
 });

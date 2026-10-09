@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { Config, Mode, TaskClass } from "./config";
-import { inspect, obfuscateText, runNer, StreamRestorer, tokenNote, Vault, type NerResult } from "./guard";
+import { inspect, machineTerms, obfuscateText, runNer, StreamRestorer, tokenNote, Vault, type NerResult } from "./guard";
 import { NerModel, type Infer } from "./guard/ner";
 import { stricterLevel, type Finding } from "./guard/detectors";
 import { join } from "node:path";
@@ -334,6 +334,7 @@ export class Engine {
     if (insp.blocked) return yield { type: "error", message: `blocked: ${insp.blocked}` };
     let outbound = insp.messages;
     const lastUserIdx = outbound.map((m) => m.role).lastIndexOf("user");
+    let edited: string | undefined; // what you approved, if you changed it: history keeps that, not what you removed
 
     if (insp.decision.action === "ask") {
       const id = newId("ap");
@@ -350,6 +351,7 @@ export class Engine {
         if (edNer?.error) return yield { type: "error", message: `not sent: ${edNer.error}` };
         const again = obfuscateText(vault, r.edited, plan.route.level, this.cfg, plan.route.mode, edNer?.byText.get(r.edited));
         outbound = outbound.map((m, i) => (i === lastUserIdx ? { ...m, content: again } : m));
+        edited = vault.restore(again);
       }
       yield { type: "approved", edited: r.edited !== undefined };
     }
@@ -360,12 +362,16 @@ export class Engine {
     if (persistent) {
       if (!conversationId) {
         conversationId = newId("c");
-        const title = (input.messages.find((m) => m.role === "user")?.content ?? "chat").replace(/\s+/g, " ").slice(0, 80);
+        const first = input.messages.findIndex((m) => m.role === "user");
+        const title = ((first === lastIn ? edited : undefined) ?? input.messages[first]?.content ?? "chat").replace(/\s+/g, " ").slice(0, 80);
         this.db.run("INSERT INTO conversations(id, title, created, updated) VALUES (?,?,?,?)", [conversationId, title, Date.now(), Date.now()]);
         yield { type: "conversation", id: conversationId };
       }
       // History keeps a note of attachments, not the tables themselves.
-      for (const [i, m] of input.messages.entries()) this.addMessage(conversationId, i === lastIn && attached.length ? { ...m, content: `${m.content}\n${attached.map((x) => x.note).join("\n")}` } : m);
+      for (const [i, m] of input.messages.entries()) {
+        const content = i === lastIn && edited !== undefined ? edited : m.content;
+        this.addMessage(conversationId, i === lastIn && attached.length ? { ...m, content: `${content}\n${attached.map((x) => x.note).join("\n")}` } : { ...m, content });
+      }
     }
 
     const promptHash = hash(messages[lastUserIdx]?.content ?? "");
@@ -425,10 +431,13 @@ export class Engine {
 
     // advisor: a different provider critiques; the primary revises only if problems were found
     if (plan.route.advisor && !signal.aborted) {
-      const adv = this.router.advisorFor(primary);
+      const adv = this.router.advisorFor(primary, input.cwd);
       if (adv) {
         const critiqueRun = newId("r");
-        const review = await this.collect({ ...base, mode: "chat", c: adv, runId: critiqueRun, outbound: [...outbound, { role: "user", content: ADVISOR_PROMPT(res.raw, this.plugins.advisor.filter((a) => a.classes.includes(cls)).map((a) => a.text)) }], part: "advisor" });
+        // The answer goes to a second vendor. In agent mode it can quote files the primary read itself, real secrets
+        // included, so it passes the guard like any outbound text (same vault, so placeholders still line up).
+        const guardedAnswer = obfuscateText(vault, res.raw, plan.route.level, this.cfg, plan.route.mode);
+        const review = await this.collect({ ...base, mode: "chat", c: adv, runId: critiqueRun, outbound: [...outbound, { role: "user", content: ADVISOR_PROMPT(guardedAnswer, this.plugins.advisor.filter((a) => a.classes.includes(cls)).map((a) => a.text)) }], part: "advisor" });
         if (review.ok) {
           const ok = /^\s*OK\b/i.test(review.raw) && review.raw.trim().length < 20;
           yield { type: "advisor", model: adv.id, verdict: ok ? "ok" : "issues", critique: review.text };
@@ -534,9 +543,9 @@ export class Engine {
     const provider = c && this.registry.get(c.provider);
     if (!c || !provider || !(await this.registry.available(c.account)) || !this.usage.usable(c.account)) return null;
     const last = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
-    // Classifier sees only a paranoid-redacted excerpt under a throwaway vault.
-    const extra = (ner.byText.get(last) ?? []).filter((f) => f.end <= 2000);
-    const excerpt = new Vault().obfuscate(last.slice(0, 2000), { level: "paranoid", terms: this.cfg.guard.terms, extra }).text;
+    // Classifier sees only a paranoid-redacted excerpt under a throwaway vault, with every rule the main guard has
+    // (plugin patterns, this machine's user and host names). Redacted whole, then cut: a cut first could split a key.
+    const excerpt = new Vault().obfuscate(last, { level: "paranoid", terms: this.cfg.guard.terms, patterns: this.cfg.guard.patterns, identities: machineTerms(), extra: ner.byText.get(last) ?? [] }).text.slice(0, 2000);
     let out = "";
     try {
       const msgs: Message[] = [{ role: "system", content: CLASSIFY_PROMPT }, { role: "user", content: excerpt }];

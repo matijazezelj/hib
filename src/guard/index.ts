@@ -25,7 +25,7 @@ export interface Inspection {
   blocked?: string; // agent mode refused outright
 }
 
-function machineTerms(): string[] {
+export function machineTerms(): string[] {
   const out: string[] = [];
   try {
     const u = userInfo().username;

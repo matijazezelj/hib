@@ -20,6 +20,16 @@ export function describeOther(it: any): ToolCall {
   return { id: it.id, name: it.type, kind: "other", title: `${it.type}${it.tool ? ` ${it.tool}` : it.name ? ` ${it.name}` : ""}` };
 }
 
+/**
+ * The whole command a Codex request runs. `commandActions` splits `cat a && rm -rf .` into parsed pieces, and judging
+ * only the first would approve the rest unseen; so the full command, with Codex's `/bin/zsh -lc '…'` wrapper unwrapped.
+ */
+export function fullCommand(p: { command?: string; commandActions?: { command?: string }[] }): string {
+  const raw = p.command ?? p.commandActions?.map((a) => a.command ?? "").join(" && ") ?? "";
+  const m = /^\/bin\/(?:ba|z)?sh\s+-lc\s+'((?:[^']|'\\'')*)'$/s.exec(raw.trim());
+  return m ? m[1]!.replace(/'\\''/g, "'") : raw;
+}
+
 export class CodexDriver implements AgentDriver {
   readonly provider = "codex";
   private proc?: ReturnType<typeof Bun.spawn>;
@@ -104,7 +114,7 @@ export class CodexDriver implements AgentDriver {
   private onServerRequest(m: any) {
     const pid = `cx_${m.id}_${Date.now().toString(36)}`;
     if (m.method === "item/commandExecution/requestApproval") {
-      const cmd: string = m.params.commandActions?.[0]?.command ?? m.params.command ?? "";
+      const cmd = fullCommand(m.params);
       this.serverRequests.set(pid, m.id);
       // A command asking for more than the sandbox gives (network, extra paths, running unsandboxed) is never a plain
       // command: kind "other" keeps auto mode and "always" rules from approving it. Codex 0.160 marks such a request
@@ -137,7 +147,7 @@ export class CodexDriver implements AgentDriver {
       case "item/started": {
         const it = p.item;
         if (it.type === "commandExecution") {
-          const cmd = it.commandActions?.[0]?.command ?? it.command;
+          const cmd = fullCommand(it);
           q?.push({ type: "tool_call", call: { id: it.id, name: "shell", kind: "command", title: `$ ${short(cmd)}`, command: cmd } });
         } else if (it.type === "fileChange") {
           const changes = it.changes ?? [];
@@ -148,7 +158,8 @@ export class CodexDriver implements AgentDriver {
             kind: "edit",
             title: `${changes.some((c: any) => c.kind?.type === "add") ? "Write" : "Edit"} ${paths.join(", ")}`,
             path: paths[0],
-            paths: changes.map((c: any) => c.path),
+            // A move's destination is a write too: `insideRoot` must see it, not just the source.
+            paths: changes.flatMap((c: any) => [c.path, c.move_path ?? c.kind?.move_path].filter(Boolean)),
             // New files arrive as raw content; mark their lines as additions.
             diff: { path: paths[0] ?? "", unified: changes.map((c: any) => `--- ${this.rel(c.path)}\n+++ ${this.rel(c.path)}\n${c.kind?.type === "add" ? String(c.diff).replace(/\n$/, "").split("\n").map((l: string) => "+" + l).join("\n") : c.diff}`).join("\n") },
           };

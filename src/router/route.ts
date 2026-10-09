@@ -33,6 +33,12 @@ function pinnedAccount(cfg: Config, provider: string, cwd?: string): Account | u
   return cfg.accounts.find((a) => a.provider === provider && a.dirs.some((x) => d === x || d.startsWith(x + "/")));
 }
 
+/** `c` moved onto the account its provider is pinned to for `cwd`, if any. */
+function pinTo(cfg: Config, c: Candidate, cwd?: string): Candidate {
+  const pinned = pinnedAccount(cfg, c.provider, cwd);
+  return pinned && pinned !== c.account ? { ...c, account: pinned, id: `${c.provider}@${pinned.name}/${c.model}` } : c;
+}
+
 export class Router {
   constructor(private cfg: Config, private registry: Registry, private usage: Usage, private learner: Learner) {}
 
@@ -49,17 +55,17 @@ export class Router {
         skipped.push({ id, why: "unknown model or account" });
         continue;
       }
-      const pinned = route.mode === "agent" ? pinnedAccount(this.cfg, c.provider, opts.cwd) : undefined;
-      if (pinned && pinned !== c.account) c = { ...c, account: pinned, id: `${c.provider}@${pinned.name}/${c.model}` };
+      if (route.mode === "agent") c = pinTo(this.cfg, c, opts.cwd);
       if (!this.registry.get(c.provider)) skipped.push({ id: c.id, why: "provider not installed" });
       else if (!(await this.registry.available(c.account))) skipped.push({ id: c.id, why: "not logged in" });
       else if (!this.usage.usable(c.account)) skipped.push({ id: c.id, why: `usage ≥ ${Math.round(this.cfg.switchAt * 100)}% or cooling down` });
       else if (!usable.some((u) => u.id === c!.id)) usable.push(c);
     }
 
-    // An explicit pick that is over quota still runs; the user asked for it.
+    // An explicit pick that is over quota still runs; the user asked for it. Still on the folder's pinned account.
     if (opts.explicit && !usable.length) {
-      const c = resolveCandidate(opts.explicit, this.cfg);
+      let c = resolveCandidate(opts.explicit, this.cfg);
+      if (c && route.mode === "agent") c = pinTo(this.cfg, c, opts.cwd);
       if (c && this.registry.get(c.provider)) usable.push(c);
     }
 
@@ -68,11 +74,15 @@ export class Router {
     return { cls, route, ordered: scored.map((x) => x.c), skipped };
   }
 
-  /** Strongest model of a different provider than `primary`, for advisor/critique. */
-  advisorFor(primary: Candidate): Candidate | null {
+  /**
+   * Strongest model of a different provider than `primary`, for advisor/critique. Working in a folder pinned to an
+   * account of that provider (accounts.dirs), the advisor runs on that account too.
+   */
+  advisorFor(primary: Candidate, cwd?: string): Candidate | null {
     for (const [provider, id] of Object.entries(this.cfg.advisorModels)) {
       if (provider === primary.provider) continue;
-      const c = resolveCandidate(id, this.cfg);
+      let c = resolveCandidate(id, this.cfg);
+      if (c) c = pinTo(this.cfg, c, cwd);
       if (c && this.registry.get(c.provider) && this.usage.usable(c.account)) return c;
     }
     return null;

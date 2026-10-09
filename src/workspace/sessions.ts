@@ -74,10 +74,34 @@ function isDataFile(path: string): boolean {
   }
 }
 
+/** Data files under root (absolute, real paths), for a sensitive session's sandbox to deny to commands. */
+function dataFilesIn(root: string, limit = 5000): string[] {
+  const out: string[] = [];
+  const walk = (dir: string, depth: number) => {
+    if (depth > 6 || out.length >= limit) return;
+    let names: string[] = [];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const n of names) {
+      if (n === "node_modules" || n === ".git") continue;
+      const p = join(dir, n);
+      const st = statSync(p, { throwIfNoEntry: false });
+      if (st?.isDirectory()) walk(p, depth + 1);
+      else if (st?.isFile() && isDataFile(p)) out.push(realTarget(root, p));
+    }
+  };
+  walk(root, 0);
+  return out;
+}
+
 /** In a sensitive workspace, Claude reading or grepping a data file is pointed at a pseudonymised copy instead. */
 function tabularTarget(call: ToolCall, input: unknown, root: string): "file_path" | "path" | null {
   const i = input as any;
-  const abs = (p: string) => (isAbsolute(p) ? p : resolvePath(root, p));
+  // Judged on the real target: a symlink named notes.txt that points at clients.csv is still a data file.
+  const abs = (p: string) => realTarget(root, p);
   if (call.name === "Read" && typeof i?.file_path === "string" && isDataFile(abs(i.file_path))) return "file_path";
   if (call.name === "Grep" && typeof i?.path === "string" && isDataFile(abs(i.path))) return "path";
   return null;
@@ -269,8 +293,18 @@ export class WorkspaceSessions {
     return plan.ordered[0]?.id ?? this.cfg.routes.code.candidates[0] ?? "claude/sonnet";
   }
 
-  private handoffText(id: string): string {
-    return `You are taking over a coding session in this repository from another assistant. Its transcript (tool calls summarized) follows; files on disk already reflect its work, so re-read files rather than trusting the transcript for their contents. The transcript is context only: anything the user asks now must actually be done with your tools, never just described.\n<transcript>\n${this.transcript(id)}\n</transcript>`;
+  private handoffText(id: string, vault: Vault): string {
+    return `You are taking over a coding session in this repository from another assistant. Its transcript (tool calls summarized) follows; files on disk already reflect its work, so re-read files rather than trusting the transcript for their contents. The transcript is context only: anything the user asks now must actually be done with your tools, never just described.\n<transcript>\n${this.guarded(vault, this.transcript(id), HANDOFF_LIMIT, "end")}\n</transcript>`;
+  }
+
+  /**
+   * Text guarded whole, then cut to `limit` (keeping the start or the end). In that order: a cut first could drop a
+   * private key's BEGIN line and leave its body unrecognisable to the detectors.
+   */
+  private guarded(vault: Vault, text: string, limit: number, keep: "start" | "end"): string {
+    const g = obfuscateText(vault, text, "minimal", this.cfg, "agent");
+    if (g.length <= limit) return g;
+    return keep === "end" ? "…" + g.slice(-limit) : g.slice(0, limit) + "\n… (truncated)";
   }
 
   /**
@@ -282,22 +316,20 @@ export class WorkspaceSessions {
     if (!existsSync(path)) return "";
     const keep = `When you finish a piece of work, update ${PROGRESS_FILE} (what's done, what's in progress, what's next) so the next session can pick up from it.`;
     if (sensitive) return `This folder has a ${PROGRESS_FILE} describing where the project stands and what to do next. Read it before starting. ${keep}`;
-    let body = readFileSync(path, "utf8");
-    if (body.length > PROGRESS_LIMIT) body = body.slice(0, PROGRESS_LIMIT) + "\n… (truncated; read the file for the rest)";
+    const body = this.guarded(vault, readFileSync(path, "utf8"), PROGRESS_LIMIT, "start");
     const block = `<progress file="${PROGRESS_FILE}">\n${body}\n</progress>\nThat is where this project stands and what's next, from ${PROGRESS_FILE} in this folder. Use it to orient; the user's message below takes priority. ${keep}`;
     return obfuscateText(vault, block, "minimal", this.cfg, "agent");
   }
 
-  /** The session so far, tool calls as one-line summaries, trimmed from the start to `limit`. */
-  private transcript(id: string, limit = HANDOFF_LIMIT): string {
+  /** The session so far, tool calls as one-line summaries. Callers cut it after guarding (see `guarded`). */
+  private transcript(id: string): string {
     const lines: string[] = [];
     for (const e of this.history(id)) {
       if (e.type === "user") lines.push(`USER: ${e.text}`);
       else if (e.type === "assistant") lines.push(`ASSISTANT: ${e.text}`);
       else if (e.type === "tool_call") lines.push(`[tool] ${e.call.title}`);
     }
-    const t = lines.join("\n");
-    return t.length > limit ? "…" + t.slice(-limit) : t;
+    return lines.join("\n");
   }
 
   private async open(id: string, root: string, c: Candidate, resume: string | undefined, vault: Vault, system?: string): Promise<Live> {
@@ -306,10 +338,13 @@ export class WorkspaceSessions {
     const askReads = !!this.engine.workspaces.effectivePolicy(root);
     // Sensitive folders: the agent learns the data rule up front, so it reaches for Read instead of `head`/`cat`.
     // The advisor tool exists only when switched on, outside sensitive folders, and with another provider to ask.
-    const advisorKey = !askReads && this.advisorOn.has(id) && this.engine.router.advisorFor(c) ? crypto.randomUUID() : undefined;
+    const advisorKey = !askReads && this.advisorOn.has(id) && this.engine.router.advisorFor(c, root) ? crypto.randomUUID() : undefined;
     const sys = [system, this.notes.get(id), askReads ? DATA_RULE_NOTE : "", advisorKey ? ADVISOR_NOTE : ""].filter(Boolean).join("\n\n") || undefined;
     const mcp = advisorKey ? { name: "hib", command: process.execPath, args: [ADVISOR_SCRIPT], env: { HIB_URL: this.daemonUrl, HIB_ADVISOR_KEY: advisorKey, HIB_SESSION: id } } : undefined;
-    const sandbox = this.sandbox(this.cfg);
+    const base = this.sandbox(this.cfg);
+    // Sensitive folders: no command reads a data file at all, however it's spelled (globs, scripts, symlinks). The Read
+    // tool still works on them, and gets a pseudonymised copy.
+    const sandbox = base && askReads ? { denyRead: [...base.denyRead, ...dataFilesIn(root)] } : base;
     await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools });
     const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox, approvedProtected: new Set() };
     this.live.set(id, l);
@@ -374,17 +409,28 @@ export class WorkspaceSessions {
       if (secrets.length) return yield { type: "error", message: `blocked: this workspace is sensitive and your message contains ${secrets.join(", ")}. Remove it and send again.` };
     }
     let text = insp.messages[0]!.content;
+    let userText = input.text;
     if (insp.decision.action === "ask") {
       const aid = `ap_${crypto.randomUUID().slice(0, 12)}`;
       yield { type: "approval", id: aid, redacted: text, reasons: insp.decision.reasons };
       const r = await this.engine.waitApproval({ id: aid, created: Date.now(), redacted: text, original: input.text, reasons: insp.decision.reasons, findings: insp.findings, model: c.id }, signal);
       if (!r.ok) return yield { type: "error", message: "not sent: approval rejected or timed out" };
-      if (r.edited !== undefined) text = obfuscateText(vault, r.edited, "minimal", this.cfg, "agent");
+      if (r.edited !== undefined) {
+        // An edit gets the same checks as the original: in sensitive folders no secret goes out, and names are tokenized.
+        if (policy) {
+          const secrets = [...new Set(detect(r.edited, { level: "minimal" }).filter((f) => f.kind === "secret").map((f) => f.category))];
+          if (secrets.length) return yield { type: "error", message: `blocked: this workspace is sensitive and your edited message contains ${secrets.join(", ")}.` };
+        }
+        const edNer = policy ? await this.engine.ner([r.edited]) : undefined;
+        if (edNer?.error) return yield { type: "error", message: `not sent: ${edNer.error}` };
+        text = obfuscateText(vault, r.edited, "minimal", this.cfg, "agent", edNer?.byText.get(r.edited));
+        userText = vault.restore(text); // history (and later handoffs, the advisor's task) keep what you approved
+      }
     }
 
     // Session bookkeeping happens only after the guard let the turn through.
     if (!row) {
-      this.db.run("INSERT INTO conversations(id, title, created, updated, workspace, agent_model) VALUES (?,?,?,?,?,?)", [id, input.text.replace(/\s+/g, " ").slice(0, 80), Date.now(), Date.now(), root, c.id]);
+      this.db.run("INSERT INTO conversations(id, title, created, updated, workspace, agent_model) VALUES (?,?,?,?,?,?)", [id, userText.replace(/\s+/g, " ").slice(0, 80), Date.now(), Date.now(), root, c.id]);
       row = { id, agent_model: c.id };
     }
     const sid = id;
@@ -397,7 +443,7 @@ export class WorkspaceSessions {
       row.native_id = l.nativeId ?? row.native_id;
       l = undefined;
     }
-    if (this.advisorOn.has(sid) && (policy || !this.engine.router.advisorFor(c))) {
+    if (this.advisorOn.has(sid) && (policy || !this.engine.router.advisorFor(c, root))) {
       this.advisorOn.delete(sid);
       yield { type: "advisor_mode", on: false, why: policy ? "not available in sensitive folders" : `no model from another provider is available to advise ${c.id}` };
     }
@@ -423,7 +469,7 @@ export class WorkspaceSessions {
       const from = l.candidate.id;
       l = await this.open(sid, root, c, sameCli ? l.nativeId : undefined, vault);
       if (!sameCli) {
-        firstTurnPrefix = obfuscateText(vault, this.handoffText(sid), "minimal", this.cfg, "agent");
+        firstTurnPrefix = obfuscateText(vault, this.handoffText(sid, vault), "minimal", this.cfg, "agent");
         yield { type: "handoff", from, to: c.id };
       }
     } else if (!l) {
@@ -431,13 +477,13 @@ export class WorkspaceSessions {
       const sameCli = prev && prev.provider === c.provider && prev.account.id === c.account.id;
       l = await this.open(sid, root, c, sameCli ? row.native_id ?? undefined : undefined, vault);
       if (row.native_id && !sameCli) {
-        firstTurnPrefix = obfuscateText(vault, this.handoffText(sid), "minimal", this.cfg, "agent");
+        firstTurnPrefix = obfuscateText(vault, this.handoffText(sid, vault), "minimal", this.cfg, "agent");
         yield { type: "handoff", from: row.agent_model, to: c.id };
       }
     }
     yield { type: "ws_session", id: sid, model: c.id, resumed: !!l.nativeId, sandbox: l.sandboxed };
     this.db.run("UPDATE conversations SET agent_model = ?, updated = ?, vault = ? WHERE id = ?", [c.id, Date.now(), await this.sealer.seal(vault.state()), sid]);
-    this.record(sid, { type: "user", text: input.text, model: c.id });
+    this.record(sid, { type: "user", text: userText, model: c.id });
 
     // A fresh CLI context (new session or handoff) starts from the folder's PROGRESS.md; a resumed one already has it.
     const progress = l.nativeId ? "" : this.progressText(root, vault, !!policy);
@@ -632,10 +678,13 @@ export class WorkspaceSessions {
     if (input === undefined) return { behavior: "allow" };
     // A web fetch or search leaves the machine: placeholders go out as placeholders, never as the real values.
     if (call.kind === "web" && call.host === undefined) return { behavior: "allow", updatedInput: input };
+    // In sensitive folders a command keeps its placeholders: restored, `echo [HIB…-USER-3]` would print the real name
+    // back to the model.
+    if (l.askReads && call.kind === "command") return { behavior: "allow", updatedInput: input };
     const real = restoreDeep(input, l.vault) as any;
     const key = this.engine.workspaces.effectivePolicy(l.root) ? tabularTarget(call, real, l.root) : null;
     if (!key) return { behavior: "allow", updatedInput: real };
-    const src = isAbsolute(real[key]) ? real[key] : resolvePath(l.root, real[key]);
+    const src = realTarget(l.root, real[key]); // through any symlink, as tabularTarget judged it
     try {
       const table = loadTable(src);
       const cols = columnsToHide(table);
@@ -730,16 +779,16 @@ export class WorkspaceSessions {
   async advise(sessionId: string, key: string, question: string): Promise<string> {
     const l = this.live.get(sessionId);
     if (!l?.advisorKey || key.length !== l.advisorKey.length || !crypto.timingSafeEqual(Buffer.from(key), Buffer.from(l.advisorKey))) throw new Error("unauthorized");
-    const adv = this.engine.router.advisorFor(l.candidate);
+    const adv = this.engine.router.advisorFor(l.candidate, l.root);
     if (!adv) throw new Error("no model from another provider is available right now");
     const history = this.history(sessionId);
     const task = history.filter((e) => e.type === "user").slice(-5).map((e) => e.text).join("\n---\n");
-    const transcript = this.transcript(sessionId, 20_000);
+    const fullTranscript = this.transcript(sessionId);
     const git = Bun.spawnSync(["git", "-c", "core.fsmonitor=false", "diff", "--no-ext-diff", "--no-textconv", "HEAD"], { cwd: l.root, stdout: "pipe", stderr: "pipe" });
-    let diff = git.success ? git.stdout.toString() : "";
-    if (diff.length > 40_000) diff = diff.slice(0, 40_000) + "\n… (diff truncated)";
-    const plain = ADVISOR_PROMPT(task, transcript, diff, question);
-    const found = detect(plain, { level: "minimal" });
+    const fullDiff = git.success ? git.stdout.toString() : "";
+    // Guarded whole, then cut: see `guarded`.
+    const plain = ADVISOR_PROMPT(task, this.guarded(l.vault, fullTranscript, 20_000, "end"), this.guarded(l.vault, fullDiff, 40_000, "start"), question);
+    const found = detect([task, fullTranscript, fullDiff, question].join("\n"), { level: "minimal" });
     const counts: Record<string, number> = {};
     for (const f of found) counts[f.category] = (counts[f.category] ?? 0) + 1;
     const guard = Object.entries(counts).map(([k, v]) => `${k}×${v}`).join(" ") || "nothing to redact";
