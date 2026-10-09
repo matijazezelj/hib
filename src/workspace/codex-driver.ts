@@ -48,7 +48,13 @@ export class CodexDriver implements AgentDriver {
 
   async start(opts: StartOptions) {
     this.opts = opts;
-    this.proc = Bun.spawn(["codex", "app-server", "--listen", "stdio://"], { cwd: opts.cwd, env: accountEnv(opts.account), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const args = ["codex", "app-server", "--listen", "stdio://"];
+    if (opts.mcp) {
+      const k = `mcp_servers.${opts.mcp.name}`;
+      const env = Object.entries(opts.mcp.env).map(([n, v]) => `${n}=${JSON.stringify(v)}`).join(", ");
+      args.push("-c", `${k}.command=${JSON.stringify(opts.mcp.command)}`, "-c", `${k}.args=${JSON.stringify(opts.mcp.args)}`, "-c", `${k}.env={${env}}`, "-c", `${k}.tool_timeout_sec=600`, "-c", `${k}.default_tools_approval_mode="approve"`);
+    }
+    this.proc = Bun.spawn(args, { cwd: opts.cwd, env: accountEnv(opts.account), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     this.readLoop();
     new Response(this.proc.stderr as ReadableStream).text().catch(() => {}); // tracing logs; drained, not fatal
     await this.request("initialize", { clientInfo: { name: "hib", title: "hib", version: "0.1" }, capabilities: { experimentalApi: false, requestAttestation: false } });

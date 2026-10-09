@@ -106,7 +106,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
       const root = workspaces.resolve(q(req, "root"));
       return root ? fn(root, req) : json({ error: { message: "unknown workspace; run hib in that folder first" } }, 404);
     });
-  const sessions = new WorkspaceSessions(engine, engine.sealer, (p) => (p === "claude" ? new ClaudeDriver() : p === "codex" ? new CodexDriver() : null));
+  const sessions = new WorkspaceSessions(engine, engine.sealer, (p) => (p === "claude" ? new ClaudeDriver() : p === "codex" ? new CodexDriver() : null), `http://127.0.0.1:${port}`);
   const analyzer = new Analyzer(engine);
   // Files for analysis: a path inside a registered workspace (web), or an absolute path from the local CLI.
   const analysisPath = (b: any) => {
@@ -149,7 +149,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
         POST: ws(async (root, req) => {
           const b: any = await req.json();
           if (b.sessionId && !sessionIn(root, b.sessionId)) return json({ error: { message: "session not in this workspace" } }, 404);
-          const r = sessions.startTurn({ sessionId: b.sessionId || undefined, root, model: b.model || undefined, text: String(b.text ?? ""), auto: typeof b.auto === "boolean" ? b.auto : undefined });
+          const r = sessions.startTurn({ sessionId: b.sessionId || undefined, root, model: b.model || undefined, text: String(b.text ?? ""), auto: typeof b.auto === "boolean" ? b.auto : undefined, advisor: typeof b.advisor === "boolean" ? b.advisor : undefined });
           return "error" in r ? json({ error: { message: r.error } }, 409) : json(r);
         }),
       },
@@ -200,6 +200,26 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           sessions.setAuto(b.sessionId, !!b.auto);
           return json({ ok: true, auto: !!b.auto });
         }),
+      },
+      "/ws/advisor": {
+        POST: ws(async (root, req) => {
+          const b: any = await req.json();
+          if (!sessionIn(root, b.sessionId)) return json({ error: { message: "not found" } }, 404);
+          sessions.setAdvisor(b.sessionId, !!b.on);
+          return json({ ok: true, on: !!b.on });
+        }),
+      },
+      // Called by the advisor MCP server inside an agent CLI: authorized by its per-session key only, which can do nothing else.
+      "/ws/advise": {
+        POST: async (req) => {
+          if (!hosts.has(req.headers.get("host") ?? "") || req.headers.get("origin")) return json({ error: { message: "unauthorized" } }, 401);
+          const b: any = await req.json();
+          try {
+            return json({ advice: await sessions.advise(String(b.sessionId ?? ""), req.headers.get("x-hib-advisor") ?? "", String(b.question ?? "")) });
+          } catch (e: any) {
+            return json({ error: { message: String(e?.message ?? e) } }, e?.message === "unauthorized" ? 401 : 502);
+          }
+        },
       },
       "/ws/interrupt": {
         POST: ws(async (root, req) => {

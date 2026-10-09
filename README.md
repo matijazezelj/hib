@@ -45,12 +45,22 @@ Any OpenAI client can use the router: set `OPENAI_BASE_URL=http://127.0.0.1:4141
   - "Always" lasts for the session and is scoped to the program and subcommand, so `git status` doesn't cover `git push`.
   - Compound commands like `a; rm b` only ever match themselves.
   - "Always allow edits" only covers files inside the folder.
+- **Auto mode** (`/auto`, or the **Ask first** chip in the browser; off by default, per session). Edits inside the folder and commands run without asking. hib still asks for:
+  - network tools, `git push`, publishing, `sudo`, `rm -r` and history rewrites;
+  - commands that touch hib's daemon or credential folders;
+  - edits to tool config;
+  - reads in sensitive folders.
+
+  This is a speed bump, not a sandbox: a script the agent writes and runs can still do anything you can.
+- **Advisor** (`/advisor`, or the **Advisor** chip; off by default, never in sensitive folders). The agent gets an `advisor` tool, served by hib over MCP. It can consult a model from the other provider (Claude asks Codex, Codex asks Claude) before it starts, when stuck and before it says it's done.
+  - The advisor sees the task, a session summary and the current diff, redacted by the guard with the session's placeholders.
+  - Every consult shows in the timeline and the egress log.
 - **Native sessions.** Claude runs as a long-lived `claude -p --input-format stream-json --permission-prompt-tool stdio` process, and Codex as `codex app-server`. Sessions resume natively. Switching to a model on another CLI mid-session hands the transcript over.
 - **Files, changes, terminal** (browser only):
   - a file tree and viewer, jailed to the folder and gitignore-aware;
   - a git panel with diff, discard and commit;
   - a real shell on a pty, using xterm.js.
-- **Terminal commands:** `/model`, `/models`, `/new`, `/resume`, `/web` (prints the browser link for this session), `/egress`, `/usage`, `/quit`. Type `/` for an autocomplete menu: Tab completes, ↑/↓ select, Enter runs, Esc clears (or stops a running turn). `/model` and `/resume` also complete their arguments. A message that starts with a path, like `/etc/hosts is broken`, is sent as text.
+- **Terminal commands:** `/auto`, `/manual`, `/advisor`, `/model`, `/models`, `/new`, `/resume`, `/web` (prints the browser link for this session), `/egress`, `/usage`, `/quit`. Type `/` for an autocomplete menu: Tab completes, ↑/↓ select, Enter runs, Esc clears (or stops a running turn). `/model` and `/resume` also complete their arguments. A message that starts with a path, like `/etc/hosts is broken`, is sent as text.
 
 The browser home page `/` lists your workspaces, and `/?router` is the multi-model chat. hib refuses `~` and `/` as workspaces, and `hib workspace forget` removes a folder.
 

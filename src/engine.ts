@@ -510,6 +510,15 @@ export class Engine {
     return { raw, text, ok, why: failure ? vault.restore(failure) : undefined };
   }
 
+  /**
+   * One call outside the router, for the workspace advisor. `outbound` is already obfuscated with `vault`;
+   * the call is metered, logged in the egress table and its reply returned with tokens intact.
+   */
+  async consult(c: Candidate, vault: Vault, outbound: Message[], opts: { cwd: string; guard: string; signal: AbortSignal }): Promise<RunResult> {
+    const text = outbound.map((m) => m.content).join("\n");
+    return this.collect({ c, runId: newId("run"), outbound, cls: "code", mode: "chat", cwd: opts.cwd, vault, signal: opts.signal, promptHash: hash(text), part: "advisor", guard: opts.guard });
+  }
+
   private async collect(x: RunCtx): Promise<RunResult> {
     const gen = this.stream(x);
     let r: IteratorResult<HibEvent, RunResult>;

@@ -24,6 +24,7 @@ const HELP = [
   "y / a / n         answer a permission prompt: allow once, always (this session), deny",
   "Esc               stop the running turn",
   "/auto  /manual    auto: edits in this folder and commands run without asking (network, push, publish, sudo, rm -r still ask); manual is the default",
+  "/advisor          let the agent consult a model from the other provider while it works (toggle; off by default)",
   "/model <id>       switch model (same CLI keeps its native session, otherwise hands over)",
   "/models  /new  /resume  /web (open this session in the browser)  /egress (what left, and to whom)  /usage  /quit",
 ].join("\n");
@@ -61,6 +62,8 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
   const [busy, setBusy] = useState(false);
   const [auto, setAuto] = useState(false);
   const autoRef = useRef(false);
+  const [advisor, setAdvisor] = useState(false);
+  const advisorRef = useRef(false);
   const [pending, setPending] = useState<Pending[]>([]);
   const [approval, setApproval] = useState<any | null>(null);
   const [picker, setPicker] = useState<any[] | null>(null);
@@ -79,6 +82,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
     { name: "new", desc: "start a new session" },
     { name: "resume", args: "[id]", desc: "resume a session in this folder", values: () => sessionIds.current },
     { name: "auto", desc: "run edits and commands without asking (risky ones still ask)" },
+    { name: "advisor", args: "[on|off]", desc: "let the agent consult the other provider" },
     { name: "manual", desc: "ask before every edit and command (default)" },
     { name: "stop", desc: "stop the running turn (Esc)" },
     { name: "web", desc: "browser link for this session" },
@@ -117,6 +121,15 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         break;
       case "ws_session":
         setModel(e.model);
+        break;
+      case "advisor_mode":
+        advisorRef.current = e.on;
+        setAdvisor(e.on);
+        push({ text: e.on ? "advisor on: the agent can consult the other provider (from your next message)" : `advisor off${e.why ? `: ${e.why}` : ""}`, dim: true });
+        break;
+      case "advice":
+        flushLive();
+        push({ text: `◆ advisor ${e.model} (guard: ${e.guard})`, color: e.ok ? "magenta" : "red" }, { text: `  asked: ${e.question.replace(/\s+/g, " ").slice(0, 200)}`, dim: true }, { text: bold(e.advice) });
         break;
       case "mode":
         autoRef.current = e.auto;
@@ -185,6 +198,8 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
     setBusy(snap.running);
     autoRef.current = !!snap.auto;
     setAuto(!!snap.auto);
+    advisorRef.current = !!snap.advisor;
+    setAdvisor(!!snap.advisor);
     let after = quiet ? 0 : snap.seq;
     (async () => {
       while (!ac.signal.aborted) {
@@ -271,12 +286,21 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         else apply({ type: "mode", auto: on });
         return true;
       }
+      case "advisor": {
+        const on = arg ? arg !== "off" : !advisorRef.current;
+        if (on && policy) return push({ text: "advisor is not available in sensitive folders", color: "yellow" }), true;
+        if (sidRef.current) await client.post(`/ws/advisor?${q}`, { sessionId: sidRef.current, on }).catch((e) => push({ text: e.message, color: "red" }));
+        else apply({ type: "advisor_mode", on });
+        return true;
+      }
       case "new":
         follow.current?.abort();
         sidRef.current = undefined;
         setSid(undefined);
         autoRef.current = false;
         setAuto(false);
+        advisorRef.current = false;
+        setAdvisor(false);
         push({ text: "new session (starts with your next message)", dim: true });
         return true;
       case "resume":
@@ -317,7 +341,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
     if (isCommand(text)) return void (await command(text.trim()));
     if (busy) return push({ text: "a turn is running; wait, or Esc to stop it", color: "yellow" });
     try {
-      const r = await client.post<{ sessionId: string }>(`/ws/turn?${q}`, { sessionId: sidRef.current, model, text, auto: autoRef.current });
+      const r = await client.post<{ sessionId: string }>(`/ws/turn?${q}`, { sessionId: sidRef.current, model, text, auto: autoRef.current, advisor: advisorRef.current });
       if (r.sessionId !== sidRef.current) await attach(r.sessionId, true);
     } catch (e: any) {
       push({ text: e.message, color: "red" });
@@ -407,7 +431,7 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         </Box>
       )}
       <Text dimColor>
-        [{model}{sid ? ` · ${sid}` : ""}{policy ? ` · sensitive → ${policy.account}` : ""}{auto ? " · auto" : ""}] {busy ? "working… (esc to stop)" : ""}
+        [{model}{sid ? ` · ${sid}` : ""}{policy ? ` · sensitive → ${policy.account}` : ""}{auto ? " · auto" : ""}{advisor ? " · advisor" : ""}] {busy ? "working… (esc to stop)" : ""}
       </Text>
       <Box>
         <Text color="cyan">› </Text>

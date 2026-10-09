@@ -68,6 +68,11 @@ export class ClaudeDriver implements AgentDriver {
       // Repo-committed .claude settings (allow rules, hooks) and MCP servers can't loosen a sensitive session.
       args.push("--setting-sources", "user", "--strict-mcp-config");
     }
+    if (opts.mcp) {
+      const { name, ...server } = opts.mcp;
+      args.push("--mcp-config", JSON.stringify({ mcpServers: { [name]: { type: "stdio", ...server } } }));
+      permissions.allow = [`mcp__${name}`]; // hib's own tool: no prompt
+    }
     args.push("--settings", JSON.stringify({ permissions }));
     this.proc = Bun.spawn(args, { cwd: opts.cwd, env: accountEnv(opts.account), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     this.readLoop();

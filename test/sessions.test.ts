@@ -21,6 +21,14 @@ default = "main"
 env = {}
 [providers.alpha.accounts.work]
 env = {}
+[models.beta]
+big = "strong"
+[providers.beta]
+default = "main"
+[providers.beta.accounts.main]
+env = {}
+[advisor]
+beta = "beta/big"
 [routes.code]
 candidates = ["alpha/big"]
 [guard]
@@ -64,6 +72,7 @@ class FakeDriver implements AgentDriver {
   }
 }
 
+let advisorSaw: string[] = [];
 let root: string, sessions: WorkspaceSessions, script: { current: Script }, drivers: FakeDriver[], engine: Engine;
 
 beforeEach(async () => {
@@ -72,8 +81,17 @@ beforeEach(async () => {
   const cfg = parseConfig(Bun.TOML.parse(TOML) as any, home);
   cfg.guard.agentDirs.push(root);
   const alpha: Provider = { id: "alpha", available: async () => true, async *run() {} };
+  advisorSaw = [];
+  const beta: Provider = {
+    id: "beta",
+    available: async () => true,
+    async *run(req) {
+      advisorSaw.push(req.messages.map((m) => m.content).join("\n"));
+      yield { type: "text", delta: "Check the edge case first." };
+    },
+  };
   const sealer = await Sealer.open(home);
-  engine = new Engine(cfg, memoryDb(), new Registry([alpha]), sealer, { skills: new Map(), agents: new Map(), routes: [], guardTerms: [], guardPatterns: [], askOn: [], advisor: [], providers: [], warnings: [] });
+  engine = new Engine(cfg, memoryDb(), new Registry([alpha, beta]), sealer, { skills: new Map(), agents: new Map(), routes: [], guardTerms: [], guardPatterns: [], askOn: [], advisor: [], providers: [], warnings: [] });
   script = { current: async () => {} };
   drivers = [];
   sessions = new WorkspaceSessions(engine, sealer, () => {
@@ -164,6 +182,8 @@ describe("workspace sessions", () => {
       ["hooks", { kind: "edit", path: ".git/hooks/pre-commit", paths: [".git/hooks/pre-commit"] }],
       ["outside", { kind: "edit", path: "/etc/hosts", paths: ["/etc/hosts"] }],
       ["mcp", { kind: "other" }],
+      ["token", { kind: "command", command: "cat ~/.hib/token" }],
+      ["daemon", { kind: "command", command: `bun -e "fetch('http://127.0.0.1:4141/hib/session')"` }],
     ];
     script.current = async (_t, d, q) => {
       for (const [id, call] of asks) {
@@ -177,7 +197,7 @@ describe("workspace sessions", () => {
       if (e.type === "ws_session") sid = e.id;
       if (e.type === "permission") prompted.push(e.id), sessions.answer(sid, e.id, "deny");
     }
-    expect(prompted).toEqual(["push", "curl", "rm", "sudo", "hooks", "outside", "mcp"]);
+    expect(prompted).toEqual(["push", "curl", "rm", "sudo", "hooks", "outside", "mcp", "token", "daemon"]);
     for (const id of ["edit", "test", "read"]) expect(drivers[0]!.decisions.get(id)!.behavior).toBe("allow");
   });
 
@@ -448,5 +468,46 @@ describe("sensitive workspaces: shell reads of data", () => {
     };
     await turn("read package.json", undefined, () => "allow", "hib/auto");
     expect(drivers[0]!.decisions.get("r1")).toEqual({ behavior: "allow", updatedInput: { file_path: join(root, "package.json") } });
+  });
+});
+
+describe("advisor tool", () => {
+  test("off by default; when on, the CLI gets hib's MCP tool and advice goes through the guard to the other provider", async () => {
+    const first = await turn("hello");
+    expect(drivers[0]!.started[0]!.mcp).toBeUndefined();
+
+    sessions.setAdvisor(first.sid, true);
+    let advice = "";
+    script.current = async (_t, d) => {
+      const key = d.started[0]!.mcp!.env.HIB_ADVISOR_KEY!;
+      await expect(sessions.advise(first.sid, "wrong-key-" + key.slice(10), "plan?")).rejects.toThrow("unauthorized");
+      advice = await sessions.advise(first.sid, key, "Plan: rename ProjectFalcon in a.ts. Sound?");
+    };
+    const second = await turn("rename ProjectFalcon everywhere", first.sid);
+    const d = drivers[1]!; // restarted with the tool, on the same native session
+    expect(d.started[0]!.resume).toBe("native-1");
+    expect(d.started[0]!.mcp).toMatchObject({ name: "hib", env: { HIB_SESSION: first.sid } });
+    expect(d.started[0]!.system).toContain("`advisor` tool");
+    expect(advice).toBe("Check the edge case first.");
+    expect(advisorSaw).toHaveLength(1);
+    expect(advisorSaw[0]).toContain("Plan: rename");
+    expect(advisorSaw[0]).not.toContain("ProjectFalcon");
+    const ev = second.events.find((e) => e.type === "advice") as any;
+    expect(ev).toMatchObject({ model: "beta@main/big", ok: true, question: "Plan: rename ProjectFalcon in a.ts. Sound?" });
+    expect(sessions.egress(first.sid).some((t) => t.prompt.startsWith("advisor"))).toBe(true);
+
+    sessions.setAdvisor(first.sid, false);
+    script.current = async () => {};
+    await turn("thanks", first.sid);
+    expect(drivers[2]!.started[0]!.mcp).toBeUndefined();
+  });
+
+  test("never in sensitive folders", async () => {
+    engine.workspaces.register(root);
+    engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@main" });
+    const events: WsEvent[] = [];
+    for await (const e of sessions.send({ root, model: "alpha/big", text: "go", advisor: true })) events.push(e);
+    expect(events.find((e) => e.type === "advisor_mode" && !e.on)).toMatchObject({ why: "not available in sensitive folders" });
+    expect(drivers[0]!.started[0]!.mcp).toBeUndefined();
   });
 });

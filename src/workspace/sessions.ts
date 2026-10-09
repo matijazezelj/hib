@@ -27,6 +27,8 @@ export type WsEvent =
   | { type: "turn_start"; text: string; model?: string }
   | { type: "permission_answer"; id: string; choice: string }
   | { type: "mode"; auto: boolean }
+  | { type: "advisor_mode"; on: boolean; why?: string }
+  | { type: "advice"; model: string; account: string; question: string; advice: string; ok: boolean; chars: number; guard: string }
   | { type: "sent"; account: string; model: string; text: string; handoff: boolean; chars: number }
   | { type: "pseudonymised"; file: string; columns: string[]; callId?: string }
   | AgentEvent
@@ -53,6 +55,7 @@ interface Live {
   alwaysAllow: Set<string>;
   pending: Map<string, { call: ToolCall; ruleKey: string; input?: unknown }>;
   askReads: boolean;
+  advisorKey?: string; // set when this CLI was started with hib's advisor tool
 }
 
 /** A data file: CSV/TSV always; JSON only when it loads as a table (an array of records), not config like package.json. */
@@ -82,11 +85,23 @@ function protectedPath(root: string, p: string): boolean {
 }
 
 /**
- * Auto mode still asks for commands that reach off this machine or can't be undone locally:
- * network tools, publishing, pushing, privilege escalation, recursive deletes and history rewrites.
+ * Auto mode still asks for commands that reach off this machine or can't be undone locally (network tools,
+ * publishing, pushing, privilege escalation, recursive deletes, history rewrites), and for ones that touch hib's
+ * own daemon or credentials. A speed bump, not a sandbox: an approved script can still do anything you can.
  */
 const ASK_EVEN_IN_AUTO =
-  /(^|[\s;&|(`$])(sudo|su|doas|curl|wget|ssh|scp|sftp|rsync|nc|ncat|netcat|telnet|ftp|socat)\b|\bgit\s+(push|reset\s+--hard|clean|filter-branch|remote\s+(add|set-url))\b|\b(npm|bun|pnpm|yarn|cargo|twine|gem)\s+publish\b|\bgh\s+(pr|release|repo|api|gist|issue)\b|\brm\s+(-\w+\s+)*-\w*[rR]|\/dev\/(tcp|udp)\//;
+  /\.hib\b|hib_token|\/hib\/session|localhost:\d|127\.0\.0\.1|\.ssh\b|\.aws\b|\.gnupg\b|\.config\/gh\b|\.claude|\.codex\b|(^|[\s;&|(`$])(sudo|su|doas|curl|wget|ssh|scp|sftp|rsync|nc|ncat|netcat|telnet|ftp|socat)\b|\bgit\s+(push|reset\s+--hard|clean|filter-branch|remote\s+(add|set-url))\b|\b(npm|bun|pnpm|yarn|cargo|twine|gem)\s+publish\b|\bgh\s+(pr|release|repo|api|gist|issue)\b|\brm\s+(-\w+\s+)*-\w*[rR]|\/dev\/(tcp|udp)\//;
+
+const ADVISOR_SCRIPT = new URL("./advisor-mcp.ts", import.meta.url).pathname;
+const ADVISOR_NOTE =
+  "You have an `advisor` tool (from hib) backed by a model from a different AI provider. Call it before substantive work, " +
+  "when stuck, and before you declare the task done. It sees the task, a summary of this session and the current diff.";
+const ADVISOR_PROMPT = (task: string, transcript: string, diff: string, question: string) =>
+  "You are an advisor to a coding agent (another AI) working in a repository for a user. You can't run tools; you see the user's task, " +
+  "a summary of the session so far and the current uncommitted diff. Answer the agent's question with concise, concrete advice: wrong " +
+  "assumptions, risks, missing steps, simpler approaches. If the plan is sound, say so briefly. Don't write the whole solution. " +
+  "Values like [HIB…] are placeholders for redacted data; keep them as they are.\n\n" +
+  `<task>\n${task}\n</task>\n\n<session>\n${transcript}\n</session>\n\n<diff>\n${diff || "(no uncommitted changes)"}\n</diff>\n\n<question>\n${question}\n</question>`;
 
 const newId = () => `w_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
 const HANDOFF_LIMIT = 60_000;
@@ -107,10 +122,11 @@ export class WorkspaceSessions {
   private live = new Map<string, Live>();
   private busy = new Set<string>();
   private auto = new Set<string>(); // sessions in auto mode; in memory only, so a restarted daemon is back to manual
+  private advisorOn = new Set<string>(); // same for the advisor tool
   private hubs = new Map<string, Hub>();
   private listeners = new Set<() => void>();
 
-  constructor(private engine: Engine, private sealer: Sealer, private drivers: DriverFactory) {}
+  constructor(private engine: Engine, private sealer: Sealer, private drivers: DriverFactory, private daemonUrl = "") {}
 
   private get cfg(): Config {
     return this.engine.cfg;
@@ -157,6 +173,7 @@ export class WorkspaceSessions {
       seq: h?.seq ?? 0,
       running: !!h?.running,
       auto: this.auto.has(id),
+      advisor: this.advisorOn.has(id),
       row: this.db.query("SELECT id, title, workspace, agent_model AS model FROM conversations WHERE id = ?").get(id) ?? null,
     };
   }
@@ -170,7 +187,7 @@ export class WorkspaceSessions {
   }
 
   /** Starts a turn in the background; clients follow it through subscribe(). Closing a client never stops it. */
-  startTurn(input: { sessionId?: string; root: string; model?: string; text: string; auto?: boolean }): { sessionId: string } | { error: string } {
+  startTurn(input: { sessionId?: string; root: string; model?: string; text: string; auto?: boolean; advisor?: boolean }): { sessionId: string } | { error: string } {
     const sid = input.sessionId ?? newId();
     if (this.busy.has(sid)) return { error: "this session is already running a turn" };
     this.busy.add(sid);
@@ -182,6 +199,7 @@ export class WorkspaceSessions {
     h.dbMark = ((this.db.query("SELECT MAX(id) AS m FROM ws_events WHERE session_id = ?").get(sid) as any)?.m ?? 0) as number;
     this.emit(sid, { type: "turn_start", text: input.text, model: input.model });
     if (input.auto !== undefined && input.auto !== this.auto.has(sid)) this.setAuto(sid, input.auto);
+    if (input.advisor !== undefined && input.advisor !== this.advisorOn.has(sid)) this.setAdvisor(sid, input.advisor);
     (async () => {
       try {
         for await (const e of this.runTurn({ ...input, sessionId: sid, isNew: !input.sessionId }, ac.signal)) this.emit(sid, e);
@@ -219,15 +237,19 @@ export class WorkspaceSessions {
   }
 
   private handoffText(id: string): string {
+    return `You are taking over a coding session in this repository from another assistant. Its transcript (tool calls summarized) follows; files on disk already reflect its work, so re-read files rather than trusting the transcript for their contents. The transcript is context only: anything the user asks now must actually be done with your tools, never just described.\n<transcript>\n${this.transcript(id)}\n</transcript>`;
+  }
+
+  /** The session so far, tool calls as one-line summaries, trimmed from the start to `limit`. */
+  private transcript(id: string, limit = HANDOFF_LIMIT): string {
     const lines: string[] = [];
     for (const e of this.history(id)) {
       if (e.type === "user") lines.push(`USER: ${e.text}`);
       else if (e.type === "assistant") lines.push(`ASSISTANT: ${e.text}`);
       else if (e.type === "tool_call") lines.push(`[tool] ${e.call.title}`);
     }
-    let t = lines.join("\n");
-    if (t.length > HANDOFF_LIMIT) t = "…" + t.slice(-HANDOFF_LIMIT);
-    return `You are taking over a coding session in this repository from another assistant. Its transcript (tool calls summarized) follows; files on disk already reflect its work, so re-read files rather than trusting the transcript for their contents. The transcript is context only: anything the user asks now must actually be done with your tools, never just described.\n<transcript>\n${t}\n</transcript>`;
+    const t = lines.join("\n");
+    return t.length > limit ? "…" + t.slice(-limit) : t;
   }
 
   private async open(id: string, root: string, c: Candidate, resume: string | undefined, vault: Vault, system?: string): Promise<Live> {
@@ -235,15 +257,18 @@ export class WorkspaceSessions {
     if (!driver) throw new Error(`provider ${c.provider} has no agent driver`);
     const askReads = !!this.engine.workspaces.policy(root);
     // Sensitive folders: the agent learns the data rule up front, so it reaches for Read instead of `head`/`cat`.
-    const sys = askReads ? [system, DATA_RULE_NOTE].filter(Boolean).join("\n\n") : system;
-    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads });
-    const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads };
+    // The advisor tool exists only when switched on, outside sensitive folders, and with another provider to ask.
+    const advisorKey = !askReads && this.advisorOn.has(id) && this.engine.router.advisorFor(c) ? crypto.randomUUID() : undefined;
+    const sys = [system, askReads ? DATA_RULE_NOTE : "", advisorKey ? ADVISOR_NOTE : ""].filter(Boolean).join("\n\n") || undefined;
+    const mcp = advisorKey ? { name: "hib", command: process.execPath, args: [ADVISOR_SCRIPT], env: { HIB_URL: this.daemonUrl, HIB_ADVISOR_KEY: advisorKey, HIB_SESSION: id } } : undefined;
+    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp });
+    const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey };
     this.live.set(id, l);
     return l;
   }
 
   /** Starts a turn and yields its events until it ends (used by tests and simple clients). */
-  async *send(input: { sessionId?: string; root: string; model?: string; text: string; auto?: boolean }, _signal?: AbortSignal): AsyncGenerator<WsEvent> {
+  async *send(input: { sessionId?: string; root: string; model?: string; text: string; auto?: boolean; advisor?: boolean }, _signal?: AbortSignal): AsyncGenerator<WsEvent> {
     const started = this.startTurn(input);
     if ("error" in started) return yield { type: "error", message: started.error };
     const q: WsEvent[] = [];
@@ -317,6 +342,17 @@ export class WorkspaceSessions {
     let l = this.live.get(sid);
     if (l && !!policy !== l.askReads) {
       // The folder's sensitivity changed since this CLI started; restart it on its native session with the right permissions.
+      await l.driver.close();
+      this.live.delete(sid);
+      row.native_id = l.nativeId ?? row.native_id;
+      l = undefined;
+    }
+    if (this.advisorOn.has(sid) && (policy || !this.engine.router.advisorFor(c))) {
+      this.advisorOn.delete(sid);
+      yield { type: "advisor_mode", on: false, why: policy ? "not available in sensitive folders" : `no model from another provider is available to advise ${c.id}` };
+    }
+    if (l && this.advisorOn.has(sid) !== !!l.advisorKey) {
+      // The advisor was switched on or off: restart the CLI on its native session with or without the tool.
       await l.driver.close();
       this.live.delete(sid);
       row.native_id = l.nativeId ?? row.native_id;
@@ -440,7 +476,7 @@ export class WorkspaceSessions {
             }
             if (policy && tabularTarget(call, e.input, root)) call.title += " (the agent gets a pseudonymised copy)";
             else if (policy && call.name === "Grep") call.title += " (may return raw rows from data files)";
-            if (this.autoAllowed(l, e.ruleKey, call) || (this.auto.has(sid) && this.autoModeCovers(l, call))) {
+            if ((l.advisorKey && call.name === "mcp__hib__advisor") || this.autoAllowed(l, e.ruleKey, call) || (this.auto.has(sid) && this.autoModeCovers(l, call))) {
               l.driver.answer(e.id, this.allowDecision(l, call, e.input));
               break;
             }
@@ -495,6 +531,7 @@ export class WorkspaceSessions {
     const byCall = new Map<string, { kind: string; title: string; status: string }>();
     for (const e of this.history(id)) {
       if (e.type === "sent") turns.push({ account: e.account, model: e.model, prompt: e.text, handoff: e.handoff, actions: [] });
+      else if (e.type === "advice") turns.push({ account: e.account, model: e.model, prompt: `advisor (${e.chars} chars: task, session summary, diff): ${e.question}`, handoff: false, guard: e.guard, actions: [] });
       else if (e.type === "guard_decision" && turns.length) turns[turns.length - 1]!.guard = e.summary;
       else if (e.type === "pseudonymised" && turns.length)
         turns[turns.length - 1]!.actions.push({ kind: "read", title: `pseudonymised copy of ${e.file} (tokenized: ${e.columns.join(", ") || "none"})`, status: "done" });
@@ -573,6 +610,42 @@ export class WorkspaceSessions {
     this.emit(sessionId, { type: "mode", auto: on });
     const l = this.live.get(sessionId);
     if (on && l) for (const [id, p] of l.pending) if (this.autoModeCovers(l, p.call)) this.answer(sessionId, id, "allow");
+  }
+
+  /** Switches the advisor tool for a session; it takes effect on the next message (the CLI restarts on its native session). */
+  setAdvisor(sessionId: string, on: boolean) {
+    if (on) this.advisorOn.add(sessionId);
+    else this.advisorOn.delete(sessionId);
+    this.emit(sessionId, { type: "advisor_mode", on });
+  }
+
+  /**
+   * The agent's advisor tool call. Context (task, session summary, diff) goes through the guard with the session's
+   * own vault, so placeholders match what the agent sees; the reply goes back with placeholders intact.
+   */
+  async advise(sessionId: string, key: string, question: string): Promise<string> {
+    const l = this.live.get(sessionId);
+    if (!l?.advisorKey || key.length !== l.advisorKey.length || !crypto.timingSafeEqual(Buffer.from(key), Buffer.from(l.advisorKey))) throw new Error("unauthorized");
+    const adv = this.engine.router.advisorFor(l.candidate);
+    if (!adv) throw new Error("no model from another provider is available right now");
+    const history = this.history(sessionId);
+    const task = history.filter((e) => e.type === "user").slice(-5).map((e) => e.text).join("\n---\n");
+    const transcript = this.transcript(sessionId, 20_000);
+    const git = Bun.spawnSync(["git", "diff", "HEAD"], { cwd: l.root, stdout: "pipe", stderr: "pipe" });
+    let diff = git.success ? git.stdout.toString() : "";
+    if (diff.length > 40_000) diff = diff.slice(0, 40_000) + "\n… (diff truncated)";
+    const plain = ADVISOR_PROMPT(task, transcript, diff, question);
+    const found = detect(plain, { level: "minimal" });
+    const counts: Record<string, number> = {};
+    for (const f of found) counts[f.category] = (counts[f.category] ?? 0) + 1;
+    const guard = Object.entries(counts).map(([k, v]) => `${k}×${v}`).join(" ") || "nothing to redact";
+    const outbound = [{ role: "user" as const, content: obfuscateText(l.vault, plain, "minimal", this.cfg, "agent") }];
+    const r = await this.engine.consult(adv, l.vault, outbound, { cwd: l.root, guard, signal: AbortSignal.timeout(600_000) });
+    const ev = { type: "advice" as const, model: adv.id, account: adv.account.id, question: l.vault.restore(question), advice: r.ok ? r.text : `advisor failed: ${r.why}`, ok: r.ok, chars: outbound[0]!.content.length, guard };
+    this.record(sessionId, ev);
+    this.emit(sessionId, ev);
+    if (!r.ok) throw new Error(r.why ?? "advisor failed");
+    return r.raw;
   }
 
   /** Allow once, allow this kind of call for the rest of the session, or deny. */

@@ -258,6 +258,12 @@ button.chip { padding: 4px 8px; font-size: 11.5px; }
 .ws-thread .turn-user:first-child { margin-top: 0; }
 .ws-thread .turn-ai { margin: 4px 0; }
 .usage-inline .section-title { margin-top: 0; }
+.advice { border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: var(--radius); background: var(--panel); padding: 10px 14px; display: flex; flex-direction: column; gap: 6px; }
+.advice.failed { border-left-color: var(--bad); }
+.advice-head { display: flex; align-items: center; gap: 6px; font-size: 12.5px; }
+.advice-head > .icon { color: var(--accent); }
+.advice-head .spacer { flex: 1; }
+.advice-q { font-size: 12.5px; color: var(--muted); white-space: pre-wrap; border-left: 2px solid var(--line-strong); padding-left: 8px; }
 .tool { width: 100%; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); font-size: 13px; overflow: hidden; }
 .tool.pending { border-color: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
 .tool.failed { border-color: var(--bad-soft); }

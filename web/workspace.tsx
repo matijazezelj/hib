@@ -17,6 +17,7 @@ type Item =
   | { kind: "egress"; account?: string; handoff?: boolean; findings?: Record<string, number>; action?: string; summary?: string }
   | { kind: "note"; text: string; tone?: "warn" | "bad" | "ok" }
   | { kind: "usage"; usage: any[] }
+  | { kind: "advice"; model: string; question: string; advice: string; ok: boolean; guard: string }
   | { kind: "approval"; id: string; redacted: string; reasons: string[]; original?: string };
 
 const AUTO_NOTE = "auto: edits in this folder and commands run without asking; network, push, publish, sudo and rm -r still ask";
@@ -72,6 +73,10 @@ function fold(items: Item[], e: any): Item[] {
     }
     case "mode":
       return [...items, { kind: "note", text: e.auto ? AUTO_NOTE : "manual: every edit and command asks first", tone: e.auto ? "warn" : undefined }];
+    case "advisor_mode":
+      return [...items, { kind: "note", text: e.on ? "advisor on: the agent can consult a model from the other provider (from your next message)" : `advisor off${e.why ? `: ${e.why}` : ""}` }];
+    case "advice":
+      return [...items, { kind: "advice", model: e.model, question: e.question, advice: e.advice, ok: e.ok, guard: e.guard }];
     case "handoff":
       return [...items, { kind: "note", text: `handed over from ${e.from} to ${e.to} (new native session, transcript passed along)`, tone: "warn" }];
     case "guard":
@@ -196,6 +201,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [auto, setAutoState] = useState(false);
+  const [advisor, setAdvisorState] = useState(false);
   const [term, setTerm] = useState(false);
   const [commitMsg, setCommitMsg] = useState("");
   const [approvals, setApprovals] = useState<any[]>([]);
@@ -260,6 +266,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     if (snap.row?.model) setModel(snap.row.model);
     setBusy(snap.running);
     setAutoState(!!snap.auto);
+    setAdvisorState(!!snap.advisor);
     api.get(`/ws/egress/${id}?${q}`).then(setEgress).catch(() => setEgress([]));
     let after = quiet ? 0 : snap.seq;
     (async () => {
@@ -274,6 +281,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
               continue;
             }
             if (e.type === "mode") setAutoState(e.auto);
+            if (e.type === "advisor_mode") setAdvisorState(e.on);
             if (e.type === "ws_session") {
               setModel(e.model);
               continue;
@@ -297,6 +305,14 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     setItems([]);
     setBusy(false);
     setAutoState(false);
+    setAdvisorState(false);
+  }
+
+  async function setAdvisor(on: boolean) {
+    if (policy) return setItems((x) => fold(x, { type: "advisor_mode", on: false, why: "not available in sensitive folders" }));
+    setAdvisorState(on);
+    if (sidRef.current) await api.post(`/ws/advisor?${q}`, { sessionId: sidRef.current, on }).catch(() => setAdvisorState(!on));
+    else setItems((x) => fold(x, { type: "advisor_mode", on }));
   }
 
   async function setAuto(on: boolean) {
@@ -312,7 +328,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     if (text.startsWith("//")) text = text.slice(1);
     else if (text.startsWith("/")) return command(text);
     try {
-      const r = await api.post(`/ws/turn?${q}`, { sessionId: sidRef.current, model, text, auto });
+      const r = await api.post(`/ws/turn?${q}`, { sessionId: sidRef.current, model, text, auto, advisor });
       if (r.sessionId !== sidRef.current) {
         setItems([]);
         await attach(r.sessionId, true);
@@ -330,6 +346,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
     if (cmd === "/new") return newSession();
     if (cmd === "/auto") return setAuto(arg ? arg !== "off" : !auto);
     if (cmd === "/manual") return setAuto(false);
+    if (cmd === "/advisor") return setAdvisor(arg ? arg !== "off" : !advisor);
     if (cmd === "/usage") {
       try {
         const usage = await api.get("/hib/usage");
@@ -345,7 +362,7 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
       setModel(m);
       return note(`next turn uses ${m}`, "ok");
     }
-    note(`${cmd === "/help" ? "" : `${cmd} isn't a command here. `}Commands: /auto, /manual, /usage, /model [id], /new. Start with // to send a message that begins with a slash.`, cmd === "/help" ? undefined : "warn");
+    note(`${cmd === "/help" ? "" : `${cmd} isn't a command here. `}Commands: /auto, /manual, /advisor, /usage, /model [id], /new. Start with // to send a message that begins with a slash.`, cmd === "/help" ? undefined : "warn");
   }
 
   async function answer(id: string, choice: "allow" | "always" | "deny") {
@@ -490,6 +507,18 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
           {items.map((it, i) => {
             if (it.kind === "user") return <div key={i} className="turn-user">{it.text}</div>;
             if (it.kind === "assistant") return <div key={i} className="turn-ai"><div className="md"><Markdown text={it.text} /></div></div>;
+            if (it.kind === "advice")
+              return (
+                <div key={i} className={`advice ${it.ok ? "" : "failed"}`}>
+                  <div className="advice-head">
+                    <Icon name="sparkles" size={13} /> <b>Advisor</b> <span className="muted">{it.model.replace(/@default\//, "/")}</span>
+                    <span className="spacer" />
+                    <span className="chip guard mono" title="What the guard redacted in the context sent to the advisor"><Icon name="shield-check" size={11} /> {it.guard}</span>
+                  </div>
+                  <div className="advice-q">{it.question}</div>
+                  <div className="md"><Markdown text={it.advice} /></div>
+                </div>
+              );
             if (it.kind === "usage") return <div key={i} className="usage-inline"><UsagePanel usage={it.usage} /></div>;
             if (it.kind === "note") return <div key={i} className={`note ${it.tone ?? ""}`}>{it.text}</div>;
             if (it.kind === "egress") {
@@ -561,6 +590,11 @@ export function WorkspaceApp({ info, root }: { info: any; root: string }) {
               <button className={`chip ${auto ? "warn" : ""}`} onClick={() => setAuto(!auto)} title={auto ? AUTO_NOTE : "Every edit and command waits for your OK. Click for auto mode."}>
                 <Icon name={auto ? "play" : "lock"} size={12} /> {auto ? "Auto" : "Ask first"}
               </button>
+              {!policy && (
+                <button className={`chip ${advisor ? "accent" : ""}`} onClick={() => setAdvisor(!advisor)} title={advisor ? "The agent can consult a model from the other provider; context goes through the guard" : "Let the agent consult a model from the other provider while it works"}>
+                  <Icon name="sparkles" size={12} /> Advisor{advisor ? " on" : ""}
+                </button>
+              )}
               <span className="spacer" />
               {busy ? (
                 <button className="send" onClick={() => api.post(`/ws/interrupt?${q}`, { sessionId: sidRef.current })} title="Stop"><Icon name="stop" size={14} /></button>

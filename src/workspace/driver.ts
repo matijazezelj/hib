@@ -41,6 +41,14 @@ export interface StartOptions {
   resume?: string; // native session/thread id
   system?: string;
   askReads?: boolean; // sensitive workspaces: file reads need approval too
+  mcp?: McpServer; // hib's own tools (the advisor), launched by the CLI
+}
+
+export interface McpServer {
+  name: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
 }
 
 /** A long-lived agent CLI process for one workspace session. */
