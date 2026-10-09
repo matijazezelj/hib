@@ -4,7 +4,7 @@
 
 A local, security-first harness over your **subscription** coding CLIs (Claude Code, Codex). It gives you a coding agent in the terminal and the browser and a local OpenAI-compatible router. It picks a model per task, switches accounts as quota runs low, lets one provider review another, learns what works where, and redacts sensitive data before anything leaves your machine.
 
-hib drives the official CLIs you're already logged into. It never extracts OAuth tokens or calls private endpoints.
+hib drives the official CLIs on your own subscriptions, as you'd run them yourself. It never extracts their logins (OAuth tokens or keys) and never calls private endpoints.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ hib drives the official CLIs you're already logged into. It never extracts OAuth
 ## Install
 
 ```sh
-git clone git@github.com:matijazezelj/hib.git ~/work/personal/hib
+git clone https://github.com/matijazezelj/hib.git ~/work/personal/hib
 cd ~/work/personal/hib && bun install
 ln -s ~/work/personal/hib/src/cli.ts ~/.local/bin/hib   # any dir on your PATH; the file has a bun shebang
 ```
@@ -30,6 +30,8 @@ cd ~/code/myproject
 hib                  # terminal coding agent for this folder
 hib serve            # the same folder in the browser: http://127.0.0.1:4141/?ws=…
 hib --resume         # pick up a session in this folder, whether it started here or in the browser
+hib task "…"         # hand a task to a background agent in its own git worktree
+hib tasks            # check on background tasks; review, merge or discard one
 hib chat             # multi-model router chat in the terminal
 hib ask "…"          # one-shot answer on stdout
 hib daemon status    # or: stop
@@ -56,12 +58,16 @@ Any OpenAI client can use the router: set `OPENAI_BASE_URL=http://127.0.0.1:4141
   - The advisor sees the task, a session summary and the current diff, redacted by the guard with the session's placeholders.
   - Every consult shows in the timeline and the egress log.
 - **PROGRESS.md.** If the folder has a `PROGRESS.md` at its root, every fresh agent session (new, or after a handoff) starts from it. The file goes through the guard and shows in the egress log, and the agent is asked to keep it updated. In sensitive folders hib only points the agent at the file, so reading it still asks.
+- **Background tasks** (`hib task "…"`, or `/bg …` in the terminal and browser; not in sensitive folders). Each task is an agent session in its own git worktree and branch (`hib/task-<id>`), in auto mode, so your folder stays untouched while it works.
+  - You get a macOS notification when it's done, fails, or hits a command that still asks (answer it with `hib tasks open <id>`).
+  - `hib tasks` lists them. `hib tasks review <id>` shows the agent's summary and the branch diff. `merge` merges it into your folder and `discard` throws it away; both remove the worktree.
+  - A task starts from your last commit, not from uncommitted changes. Worktrees live in `~/.local/share/hib/worktrees` (or `$HIB_WORKTREES`).
 - **Native sessions.** Claude runs as a long-lived `claude -p --input-format stream-json --permission-prompt-tool stdio` process, and Codex as `codex app-server`. Sessions resume natively. Switching to a model on another CLI mid-session hands the transcript over.
 - **Files, changes, terminal** (browser only):
   - a file tree and viewer, jailed to the folder and gitignore-aware;
   - a git panel with diff, discard and commit;
   - a real shell on a pty, using xterm.js.
-- **Terminal commands:** `/auto`, `/manual`, `/advisor`, `/model`, `/models`, `/new`, `/resume`, `/web` (prints the browser link for this session), `/egress`, `/usage`, `/quit`. Type `/` for an autocomplete menu: Tab completes, ↑/↓ select, Enter runs, Esc clears (or stops a running turn). `/model` and `/resume` also complete their arguments. A message that starts with a path, like `/etc/hosts is broken`, is sent as text.
+- **Terminal commands:** `/auto`, `/manual`, `/advisor`, `/bg`, `/tasks`, `/model`, `/models`, `/new`, `/resume`, `/web` (prints the browser link for this session), `/egress`, `/usage`, `/quit`. Type `/` for an autocomplete menu: Tab completes, ↑/↓ select, Enter runs, Esc clears (or stops a running turn). `/model` and `/resume` also complete their arguments. A message that starts with a path, like `/etc/hosts is broken`, is sent as text.
 
 The browser home page `/` lists your workspaces, and `/?router` is the multi-model chat. hib refuses `~` and `/` as workspaces, and `hib workspace forget` removes a folder.
 
@@ -239,8 +245,13 @@ The tests cover:
 - the CLI stream parsers, against captured fixtures
 - the router engine end to end: what reaches the wire, failover, advisor, resume, learning and arena
 - workspace sessions: permission scoping, restoring tokens in tool input, live fan-out and the busy lock
+- background tasks against a real git repo: worktree, auto mode, notifications, merge, discard and restart
 - the file jail, the git panel, and plugin trust
 
 CI runs the typecheck and tests on Ubuntu and macOS.
 
 Layout: `src/` is the daemon, router, guard, providers and the workspace drivers and sessions; `src/tui/` is the terminal UIs; `web/` is the browser UI; `test/` is the tests.
+
+## License
+
+[MIT](LICENSE)

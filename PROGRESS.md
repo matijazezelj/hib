@@ -40,6 +40,7 @@ OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. 
 - **Web UI.** Dark-first redesign of chat, analyze, home and workspace. Slash commands in the web composer.
 - **Terminal.** Ink terminal agent and router chat with slash autocomplete, and `**bold**` rendering.
 - **Plugins.** Markdown plugins (skill, agent, route, guard, advisor) and code plugins pinned by SHA with trust.
+- **Ready to publish.** The repo has an MIT LICENSE, and the README says hib drives the official CLIs on your own subscriptions and never extracts their logins.
 - **PROGRESS.md.** Workspaces with this file at their root start every fresh session from it. In sensitive folders hib only points to it.
 
 ## Known issues
@@ -54,7 +55,6 @@ OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. 
    - A tasks panel in the web UI with review, merge and discard buttons. Today the web has only `/bg`, `/tasks` and `/task <id>`; review and merge need the CLI.
    - Worktrees start without `node_modules`, so the agent installs dependencies itself.
    - Tasks that branch from HEAD don't include the folder's uncommitted changes. hib warns about this.
-4. **Before making the repo public:** add a LICENSE. Add a README line saying hib drives the official CLIs on your own subscriptions and never extracts their logins.
 
 ## How to check it works
 - `bun test` and `bunx tsc --noEmit -p .`
