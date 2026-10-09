@@ -628,7 +628,7 @@ export class WorkspaceSessions {
 
   /**
    * Auto mode: edits inside the folder and commands run without asking, except edits to tool config and
-   * ASK_EVEN_IN_AUTO commands. In sensitive folders reads, searches and fetches keep asking. Commands are
+   * ASK_EVEN_IN_AUTO commands. Reads and searches run unasked (but ask in sensitive folders); web fetches and searches always ask. Commands are
    * sandboxed (no writes outside the folder, no reads of hib or credentials), and a command reaching a host
    * other than a package registry asks.
    */
@@ -640,7 +640,8 @@ export class WorkspaceSessions {
       return paths.length > 0 && paths.every((p) => insideRoot(l.root, p) && !protectedPath(l.root, p));
     }
     if (call.kind === "command") return !!call.command && !ASK_EVEN_IN_AUTO.test(call.command);
-    if (call.kind === "read" || call.kind === "search" || call.kind === "web") return !l.askReads;
+    if (call.kind === "read" || call.kind === "search") return !l.askReads;
+    // WebFetch / WebSearch send text (and anything a prompt-injected page asks for) off the machine: always ask.
     return false;
   }
 

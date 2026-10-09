@@ -46,9 +46,11 @@ Any OpenAI client can use the router: set `OPENAI_BASE_URL=http://127.0.0.1:4141
 - **Agent timeline.** Reads, edits and commands stream in as they happen. Edits show a diff and wait for **Allow / Always / Deny**. In the terminal those are **y / a / n**.
   - "Always" lasts for the session and is scoped to the program and subcommand, so `git status` doesn't cover `git push`.
   - Compound commands like `a; rm b` only ever match themselves.
+  - Interpreters and wrappers (`python`, `node`, `bash`, `env`, `xargs`, `find`, `sudo` and similar) only match the exact command line, because their arguments are code.
   - "Always allow edits" only covers files inside the folder.
 - **Auto mode** (`/auto`, or the **Ask first** chip in the browser; off by default, per session). Edits inside the folder and sandboxed commands run without asking. hib still asks for:
   - a command reaching a new network host (package registries like npm and PyPI excepted);
+  - web fetches and web searches by the agent;
   - network tools, `git push`, publishing, `sudo`, `rm -r` and history rewrites;
   - commands that touch hib's daemon or credential folders;
   - edits to tool config;
@@ -110,7 +112,7 @@ hib ask -f users.csv "which 3 people in Engineering earn the most?"
 - `--share department` adds the real distinct values of a non-identifying column, so the model can filter on them.
 - The model writes an `analyze(rows)` function. You see it and approve it, and it runs **on your machine**:
   - in a separate process, with no `eval` or imports;
-  - on macOS, inside a sandbox with no network, no file writes and no reads of your home folder.
+  - on macOS (Seatbelt) or Linux with `bwrap` installed, inside a sandbox with no network, no file writes and no reads of your home folder. Without `bwrap` on Linux it is a separate process with a restricted JavaScript context only.
 - The result stays local. Sending the question, code and result for interpretation is a separate step, and you see exactly what would be sent first.
 - If the code fails, only the error message is sent back for a fix.
 - In the browser, open a CSV, TSV or JSON file in a workspace and press **Analyze**.
