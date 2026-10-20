@@ -11,6 +11,7 @@ import type { Provider } from "../src/providers/types";
 import type { AgentDriver, AgentEvent, Decision, Sandbox, StartOptions } from "../src/workspace/driver";
 import { Queue } from "../src/workspace/queue";
 import { denyData, WorkspaceSessions, type WsEvent } from "../src/workspace/sessions";
+import { fakeInfer } from "./helpers/fake-ner";
 
 const TOML = `
 [models.alpha]
@@ -614,6 +615,81 @@ describe("sensitive table reads", () => {
     engine.workspaces.setKeep(root, []);
     expect(engine.workspaces.policy(root)!.keep).toBeUndefined();
   });
+  describe("name detection on Read copies", () => {
+    // `then` runs once the prompt went through the guard: a failing model or a spent budget there would make it ask.
+    const read = async (name: string, then = () => {}) => {
+      script.current = async (_t, d, q) => {
+        then();
+        q.push({ type: "permission", id: "n1", ruleKey: "read:.", call: { id: "c1", name: "Read", kind: "read", title: `Read ${name}` }, input: { file_path: join(root, name) } });
+        await d.ask("n1");
+      };
+      const r = await turn(`read ${name}`, undefined, () => "allow", "hib/auto");
+      const d = drivers[drivers.length - 1]!.decisions.get("n1") as any;
+      const ev = sessions.history(r.sid).find((e) => e.type === "pseudonymised");
+      return { copy: readFileSync(d.updatedInput.file_path, "utf8"), ev };
+    };
+    const tickets = () =>
+      writeFileSync(
+        join(root, "tickets.csv"),
+        [
+          "id,file.name,notes",
+          "1,_3077649_-_ivana_babic_learner_-_contact_form.pdf,Ivana Babić asked for a callback about the invoice",
+          "2,https://files.example.org/files-pri/T0-F0/petra-learner-cv.pdf,no notes",
+          "3,report.pdf,Routine export of the weekly numbers",
+        ].join("\n"),
+      );
+    beforeEach(() => {
+      engine.cfg.guard.ner = true;
+      engine.nerInfer = fakeInfer;
+    });
+
+    test("a name in a free-text cell and in a slug cell is hidden, with one token for both forms", async () => {
+      await setup();
+      tickets();
+      const { copy, ev } = await read("tickets.csv");
+      expect(copy).not.toMatch(/ivana|babi|petra/i);
+      expect(copy).toContain("asked for a callback about the invoice");
+      expect(copy).toContain("Routine export of the weekly numbers");
+      const [slugTok] = /_3077649_-_(\[HIB\w+-PERSON-\d+\])_learner/.exec(copy)!.slice(1);
+      expect(copy).toContain(`${slugTok} asked for a callback`);
+      expect(ev.names).toBeUndefined();
+    });
+
+    test("a plain-text log gets name detection line by line, slugs included", async () => {
+      await setup();
+      writeFileSync(join(root, "upload.log"), "Oct 16 10:00:01 web: Ivana Babić uploaded a file\nOct 16 10:00:02 web: stored as /srv/up/ivana-babic-cv.pdf\n");
+      const { copy } = await read("upload.log");
+      expect(copy).not.toMatch(/ivana|babi/i);
+      expect(copy).toContain("uploaded a file");
+    });
+
+    test("off or unavailable, the copy goes as before and the timeline says its names weren't checked", async () => {
+      await setup();
+      tickets();
+      engine.cfg.guard.ner = false;
+      const off = await read("tickets.csv");
+      expect(off.copy).toContain("Ivana Babić"); // today's behaviour: column rules and the regex guard only
+      expect(off.ev.names).toContain("name detection is off");
+      engine.cfg.guard.ner = true;
+      const failed = await read("tickets.csv", () => {
+        engine.nerInfer = async () => {
+          throw new Error("model missing");
+        };
+      });
+      expect(failed.ev.names).toContain("name detection failed: model missing");
+      expect(sessions.egress(sessions.list(root)[0]!.id)[0]!.actions.map((a) => a.title).join()).toContain("names in free text weren't checked");
+    });
+
+    test("out of budget, the free-text cells are tokenised whole and the timeline says so", async () => {
+      await setup();
+      tickets();
+      const { copy, ev } = await read("tickets.csv", () => (engine.cfg.guard.nerBudgetSec = -1));
+      expect(copy).not.toMatch(/ivana|babi|petra|callback|Routine export/i);
+      expect(copy).toMatch(/\[HIB\w+-TEXT-1\]/);
+      expect(ev.names).toContain("ran out of budget");
+    });
+  });
+
   test("if the copy can't be made, the read is denied instead of falling back to the real file", async () => {
     await setup();
     script.current = async (_t, d, q) => {

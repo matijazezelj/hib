@@ -48,6 +48,30 @@ describe("encoded payloads", () => {
     expect(out).toBe("payload:\n[HIBab12-BASE64-ENCODED-1]\nend");
   });
 
+  test("a blob glued to a path, a key or a scheme is found: after '/', '=' and ':'", () => {
+    const blob = Buffer.from("hello jane.roe@example.org").toString("base64"); // aGVsbG8gamFuZS5yb2VAZXhhbXBsZS5vcmc=
+    for (const [text, want] of [
+      [`cp /tmp/${blob} .`, "cp /tmp/[HIBab12-BASE64-ENCODED-1] ."],
+      [`GET /upload/${blob}/raw`, "GET /upload/[HIBab12-BASE64-ENCODED-1]/raw"],
+      [`payload=${blob}`, "payload=[HIBab12-BASE64-ENCODED-1]"],
+      [`data:${blob}`, "data:[HIBab12-BASE64-ENCODED-1]"],
+    ] as const)
+      expect(new Vault("ab12").obfuscate(text, { level: "standard" }).text).toBe(want);
+  });
+
+  test("gzip+base64 and zlib+base64 are inflated and guarded as text; inflating is capped", async () => {
+    const { gzipSync, deflateSync } = await import("node:zlib");
+    const script = 'print("mail jane.roe@example.org")';
+    for (const packed of [gzipSync(script), deflateSync(script)]) {
+      const blob = Buffer.from(packed).toString("base64");
+      expect(encodedBlobs(`python3 -c ${blob}`).map((b) => b.decoded)).toEqual([script]);
+      expect(detect(`python3 -c ${blob}`, { level: "standard" }).map((f) => f.category)).toEqual(["BASE64-ENCODED"]);
+    }
+    // 200 KB of text compresses to a few hundred bytes: past 10× the input it stays closed, like any binary.
+    const bomb = Buffer.from(gzipSync("a".repeat(200_000))).toString("base64");
+    expect(encodedBlobs(`x ${bomb}`)).toEqual([]);
+  });
+
   test("string literals of decoded code are pulled out for name detection", () => {
     expect(stringLiterals(`import os\nos.system('ls')\nprint("lookup Ivo Ivić")`)).toBe("ls\nlookup Ivo Ivić");
   });

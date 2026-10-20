@@ -105,6 +105,112 @@ function locate(segment: string, entity: string, from: number, caseless: boolean
   return m ? [m.index, m.index + m[0].length] : null;
 }
 
+// Letters NFD doesn't take apart. One output character per input code unit, so offsets in the folded copy stay put.
+const FOLD: Record<string, string> = { đ: "d", Đ: "d", ł: "l", Ł: "l", ø: "o", Ø: "o", ħ: "h", Ħ: "h", ı: "i" };
+
+/** Lowercase with diacritics dropped (`Babić` -> `babic`), the same length as `s`. */
+export function fold(s: string): string {
+  let out = "";
+  for (const c of s) {
+    const f = FOLD[c] ?? c.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
+    out += f.length === c.length ? f : c.toLowerCase().length === c.length ? c.toLowerCase() : c;
+  }
+  return out;
+}
+
+const nameParts = (s: string) => fold(s).split(/[^\p{L}]+/u).filter(Boolean);
+/** How a person's name is keyed in the vault: folded parts, space-joined. Single words have none. */
+export function nameKey(value: string): string | undefined {
+  const parts = nameParts(value);
+  return parts.length >= 2 ? parts.join(" ") : undefined;
+}
+
+/**
+ * Every written form of the full names found: any case, diacritics folded, the parts joined by a space, `_`, `-`,
+ * `.`, `+`, `%20` or nothing (`IvanaBabic`), in prose and code alike. Only names of two or more parts, each at least 3
+ * letters: a lone "dover" or "turner" is a word as often as a name.
+ */
+export function spreadNames(text: string, names: Iterable<string>): Finding[] {
+  const keys = new Map<string, string[]>(); // letters only ("ivanababic") -> parts; a match maps back to its key that way
+  for (const n of names) {
+    const parts = nameParts(n);
+    if (parts.length >= 2 && parts.every((p) => p.length >= 3)) keys.set(parts.join(""), parts);
+  }
+  if (!keys.size) return [];
+  const re = new RegExp(
+    [...keys.values()].sort((a, b) => b.join("").length - a.join("").length).map((ps) => ps.map(esc).join("(?:\\s+|[_.+-]|%20)?")).join("|"),
+    "g",
+  );
+  const folded = fold(text);
+  const isAlnum = (c: string | undefined) => !!c && /[\p{L}\p{N}]/u.test(c);
+  const lower = (c: string | undefined) => !!c && /\p{Ll}/u.test(c);
+  const upper = (c: string | undefined) => !!c && /\p{Lu}/u.test(c);
+  const out: Finding[] = [];
+  for (const m of folded.matchAll(re)) {
+    const s = m.index!;
+    const e = s + m[0].length;
+    // Whole words, or a camelCase piece (getIvanaBabic, IvanaBabicRecord).
+    const startOk = !isAlnum(text[s - 1]) || (lower(text[s - 1]) && upper(text[s]));
+    const endOk = !isAlnum(text[e]) || (lower(text[e - 1]) && upper(text[e]));
+    if (!startOk || !endOk) continue;
+    const parts = keys.get(m[0].replace(/[^\p{L}]/gu, ""));
+    if (parts) out.push({ start: s, end: e, value: text.slice(s, e), category: "PERSON", kind: "pii", key: parts.join(" ") });
+  }
+  return out;
+}
+
+// A file name, URL or path (`_3077649_-_ivana_babic_learner_-_….pdf`): words joined by _ or -, percent escapes, a scheme,
+// or several path segments. The model reads such text as one unknown token, so it gets a readable copy.
+const RUN = /[^\s"'`<>()[\]{},;|]{6,}/g;
+const SLUGGY = /[\p{L}\p{N}](?:[_-]+|%[0-9A-Fa-f]{2}|\+)[\p{L}\p{N}]|:\/\/|\/[^/]*\p{L}{2}[^/]*\/[^/]*\p{L}{2}/u;
+const MAX_RUN = MAX_PIECE; // longer runs aren't file names; base64 and the like
+
+/**
+ * A readable copy of a slug for the model: separators become spaces, percent escapes are decoded and each word is
+ * title-cased. `from[i]`/`to[i]` are the run offsets character i of the copy came from.
+ */
+export function deslug(run: string): { text: string; from: number[]; to: number[] } {
+  let text = "";
+  const from: number[] = [];
+  const to: number[] = [];
+  const put = (s: string, a: number, b: number) => {
+    for (const c of s) {
+      text += c;
+      for (let k = 0; k < c.length; k++) from.push(a), to.push(b);
+    }
+  };
+  for (let i = 0; i < run.length; ) {
+    const esc = /^(?:%[0-9A-Fa-f]{2})+/.exec(run.slice(i))?.[0];
+    if (esc) {
+      let decoded: string | null = null;
+      try {
+        decoded = decodeURIComponent(esc);
+      } catch {}
+      if (decoded !== null) {
+        put(decoded.replace(/[^\p{L}\p{N}]/gu, " "), i, i + esc.length); // a decoded char maps to its whole escape
+        i += esc.length;
+        continue;
+      }
+    }
+    const c = run[i]!;
+    put(/[\p{L}\p{N}]/u.test(c) ? c : " ", i, i + 1);
+    i++;
+  }
+  return { text: text.replace(/(?<![\p{L}\p{N}])\p{Ll}/gu, (c) => c.toUpperCase()), from, to };
+}
+
+/** Slug-like runs in `text`: what deslug() opens up. */
+function slugRuns(text: string): { start: number; value: string }[] {
+  const out: { start: number; value: string }[] = [];
+  for (const m of text.matchAll(RUN)) {
+    if (m[0].length > MAX_RUN || /HIB[0-9a-f]{4}-/.test(m[0]) || !SLUGGY.test(m[0])) continue;
+    // Two words to hold a full name, not counting a file extension ("attachment-1.csv" is one).
+    if ((m[0].replace(/\.[A-Za-z0-9]{1,5}$/, "").match(/\p{L}{3,}/gu) ?? []).length < 2) continue;
+    out.push({ start: m.index!, value: m[0] });
+  }
+  return out;
+}
+
 export type Infer = (text: string) => Promise<RawToken[]>;
 
 export interface NerOptions {
@@ -163,20 +269,24 @@ export async function nerScan(text: string, model: Infer, opts: NerOptions = {})
   const ignore = new Set([...TECH, ...(opts.ignore ?? []).map((s) => s.toLowerCase())]);
   const found: Finding[] = [];
   const isWord = (c: string | undefined) => !!c && /[\p{L}\p{N}]/u.test(c);
-  const add = (start: number, end: number, category: string) => {
+  const add = (start: number, end: number, category: string, key?: string) => {
     // Whole words only: the model sometimes tags a fragment ("SM" of "SMB"), which would leave "[ORG-1]B".
     while (start > 0 && isWord(text[start - 1]) && isWord(text[start])) start--;
     while (end < text.length && isWord(text[end]) && isWord(text[end - 1])) end++;
     const value = text.slice(start, end);
     if (value.length < 2 || ignore.has(value.toLowerCase()) || /^\[?HIB[0-9a-f]{4}-/.test(value)) return;
-    found.push({ start, end, value, category, kind: "pii" });
+    key ??= category === "PERSON" ? nameKey(value) : undefined;
+    found.push({ start, end, value, category, kind: "pii", ...(key ? { key } : {}) });
   };
+  const personOf = (f: Finding) => (f.category === "PERSON" ? [f.key ?? f.value] : []);
   // Encoded payloads: names in a decoded script (its string literals too, since code lines aren't read as prose) hide
   // the whole blob. A payload the budget didn't reach goes whole as well: it wasn't read, so it can't be passed.
   const encoded: Finding[] = [];
+  const decodedNames: string[] = []; // people named inside payloads: their other forms in the text are found too
   for (const b of depth < 2 ? encodedBlobs(text) : []) {
     const inner = overBudget() ? null : await nerScan(`${b.decoded}\n${stringLiterals(b.decoded)}`, infer, { ...opts, cells: undefined, depth: depth + 1 });
     if (inner && !inner.findings.length) continue;
+    decodedNames.push(...(inner?.findings.flatMap(personOf) ?? []));
     const absorbed = [...new Set(inner?.findings.map((f) => f.category) ?? [])];
     encoded.push({ start: b.start, end: b.end, value: b.value, category: encodedCategory(b), kind: "pii", ...(absorbed.length ? { absorbed } : {}) });
   }
@@ -205,6 +315,46 @@ export async function nerScan(text: string, model: Infer, opts: NerOptions = {})
     for (const m of seg.text.matchAll(ORG_SUFFIX)) add(seg.start + m.index!, seg.start + m.index! + m[0].length, "ORG");
     for (const m of seg.text.matchAll(ADDRESS)) add(seg.start + m.index!, seg.start + m.index! + m[0].length, "ADDRESS");
   }
+  // Pass 3: file names, URLs and slugs, anywhere (a URL line can look like code). Each distinct one goes to the model
+  // as a readable, title-cased copy, several to a piece; what it finds maps back onto the exact span in the text.
+  // `slugsTo`: runs ending past it weren't read this way (all of them if prose already ran out of budget).
+  let slugsTo = 0;
+  if (scannedTo === text.length) {
+    slugsTo = text.length;
+    const byCopy = new Map<string, { start: number; from: number[]; to: number[] }[]>();
+    for (const r of slugRuns(text)) {
+      const d = deslug(r.value);
+      byCopy.set(d.text, [...(byCopy.get(d.text) ?? []), { start: r.start, from: d.from, to: d.to }]);
+    }
+    const copies = [...byCopy.keys()];
+    for (let i = 0; i < copies.length; ) {
+      if (overBudget()) {
+        scannedTo = slugsTo = Math.min(...copies.slice(i).flatMap((c) => byCopy.get(c)!.map((r) => r.start)));
+        break;
+      }
+      const batch: { at: number; copy: string }[] = [];
+      let input = "";
+      while (i < copies.length && (!batch.length || input.length + 1 + copies[i]!.length <= MAX_PIECE)) {
+        if (batch.length) input += "\n";
+        batch.push({ at: input.length, copy: copies[i]! });
+        input += copies[i++]!;
+      }
+      let cursor = 0;
+      for (const e of mergeTokens(await infer(input))) {
+        if (e.score < 0.9 || !LABEL[e.label]) continue;
+        const at = locate(input, e.text, cursor, true);
+        if (!at) continue;
+        cursor = at[1];
+        const b = batch.findLast((x) => x.at <= at[0]);
+        if (!b || at[1] > b.at + b.copy.length) continue; // spans two copies
+        const key = e.label === "PER" ? nameKey(e.text) : undefined;
+        for (const r of byCopy.get(b.copy)!) add(r.start + r.from[at[0] - b.at]!, r.start + r.to[at[1] - b.at - 1]!, LABEL[e.label]!, key);
+      }
+    }
+  }
+  // Spreading: a full name found anywhere (prose, a slug, a decoded payload) is found in all its forms across the whole
+  // text, code included: `ivana_babic`, `IvanaBabic`, `"ivana babic"` get the token `Ivana Babić` got.
+  found.push(...spreadNames(text, new Set([...found.flatMap(personOf), ...decodedNames])));
   // Consistency: once a value is found, every occurrence in the prose is a finding, so a single miss by the model
   // can't leave "Split" tokenized in one row and in clear text in the next. This covers the whole text, including any
   // part the budget didn't reach. One pass with every value, longest first.
@@ -233,6 +383,8 @@ export async function nerScan(text: string, model: Infer, opts: NerOptions = {})
       if (end <= scannedTo || (start < hi && end > lo) || wordCount(line) < 4) continue;
       whole(start, end);
     }
+    // File names, URLs and slugs it didn't reach go whole too: one "word" to the rules above, a full name to a reader.
+    for (const r of slugRuns(text)) if (r.start + r.value.length > slugsTo) whole(r.start, r.start + r.value.length);
   }
   found.push(...encoded);
   // One finding per span; adjacent same-kind findings separated only by spaces merge ("Ericsson" "Nikola Tesla"
@@ -246,6 +398,7 @@ export async function nerScan(text: string, model: Infer, opts: NerOptions = {})
     if (last && !whole && last.category === f.category && f.start >= last.end && /^ +$/.test(text.slice(last.end, f.start))) {
       last.end = f.end;
       last.value = text.slice(last.start, last.end);
+      if (last.category === "PERSON") last.key = nameKey(last.value);
     } else merged.push({ ...f });
   }
   return { findings: merged.sort((a, b) => b.end - b.start - (a.end - a.start)), scannedTo, tokenised };

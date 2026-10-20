@@ -1,6 +1,6 @@
 import type { Config } from "../config";
 import type { Engine } from "../engine";
-import { inspect, obfuscateText, StreamRestorer, tokenNote, Vault } from "../guard";
+import { inspect, obfuscateText, runNer, StreamRestorer, tokenNote, Vault } from "../guard";
 import type { VaultState } from "../guard/vault";
 import type { Sealer } from "../guard/seal";
 import { resolveCandidate, type Candidate } from "../router/route";
@@ -8,13 +8,13 @@ import type { AgentDriver, AgentEvent, Decision, Outbound, Sandbox, ToolCall } f
 import { REGISTRIES, sandboxFor, sandboxProblem, secretPaths } from "./sandbox";
 import { insideRoot, realTarget } from "./fs";
 import { changes as protectedChanges, revert as revertProtected, snapshot as protectedSnapshot } from "./protect";
-import { detect } from "../guard/detectors";
+import { detect, type Finding } from "../guard/detectors";
 import { onPinnedAccount, pinnedModel, SENSITIVE_NEEDS_CLAUDE, supportsSensitive } from "./registry";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, sep, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { loadTable, TABLE_FILE } from "../analyze/table";
-import { columnsToHide, pseudonymize } from "../analyze/pseudo";
+import { columnsToHide, pseudonymizeWithSpans } from "../analyze/pseudo";
 import { DATA_RULE_NOTE, rawDataCommand } from "./datarules";
 import { readdirSync, statSync } from "node:fs";
 
@@ -32,7 +32,7 @@ export type WsEvent =
   | { type: "advisor_mode"; on: boolean; why?: string }
   | { type: "advice"; model: string; account: string; question: string; advice: string; ok: boolean; chars: number; guard: string }
   | { type: "sent"; account: string; model: string; text: string; handoff: boolean; progress?: boolean; chars: number }
-  | { type: "pseudonymised"; file: string; columns: string[]; callId?: string }
+  | { type: "pseudonymised"; file: string; columns: string[]; callId?: string; names?: string } // names: why the copy's names weren't (all) checked
   | { type: "protected_reverted"; changes: { path: string; change: string }[]; failed: string[] } // unapproved changes to git hooks/config or tool config, put back
   | AgentEvent
   | { type: "done" }
@@ -133,6 +133,39 @@ function tabularTarget(call: ToolCall, input: unknown, root: string): "file_path
   if (call.name === "Read" && typeof i?.file_path === "string" && isDataFile(abs(i.file_path))) return "file_path";
   if (call.name === "Grep" && typeof i?.path === "string" && isDataFile(abs(i.path))) return "path";
   return null;
+}
+
+/**
+ * Name findings made over a whole pseudonymised CSV, as replacements the CSV can take: each inside one cell (a name
+ * spread across a line break would join two rows), none in a kept column or over an existing placeholder, and no two
+ * overlapping (the longer one wins).
+ */
+function withinCells(findings: Finding[], cells: [number, number][], kept: [number, number][], csv: string): Finding[] {
+  // The last of `spans` (sorted, not overlapping) starting before `pos`.
+  const before = (spans: [number, number][], pos: number) => {
+    let lo = 0;
+    let hi = spans.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (spans[mid]![0] < pos) lo = mid;
+      else hi = mid - 1;
+    }
+    return spans[lo] && spans[lo]![0] < pos ? spans[lo] : undefined;
+  };
+  const clash = (spans: [number, number][], f: Finding) => (before(spans, f.end)?.[1] ?? -1) > f.start;
+  const tokens = [...csv.matchAll(/\[HIB[0-9a-f]{4}-[A-Z0-9-]+?-\d+\]/g)].map((m) => [m.index!, m.index! + m[0].length] as [number, number]);
+  const out: Finding[] = [];
+  for (const f of [...findings].sort((a, b) => a.start - b.start || b.end - a.end)) {
+    const cell = before(cells, f.start + 1);
+    if (!cell || f.end > cell[1] || clash(kept, f) || clash(tokens, f)) continue;
+    const last = out[out.length - 1];
+    if (last && f.start < last.end) {
+      if (f.end - f.start > last.end - last.start) out[out.length - 1] = f;
+      continue;
+    }
+    out.push(f);
+  }
+  return out;
 }
 
 const PROTECTED = new Set([".claude", ".codex", ".git", ".hib", ".mcp.json"]); // lower-case: compared case-insensitively
@@ -617,7 +650,7 @@ export class WorkspaceSessions {
             if (policy && tabularTarget(call, e.input, root)) call.title += " (the agent gets a pseudonymised copy)";
             else if (policy && call.name === "Grep") call.title += " (may return raw rows from data files)";
             if ((l.advisorKey && call.name === "mcp__hib__advisor") || this.autoAllowed(l, e.ruleKey, call) || (this.auto.has(sid) && this.autoModeCovers(l, call))) {
-              l.driver.answer(e.id, this.allowDecision(l, call, e.input));
+              l.driver.answer(e.id, await this.allowDecision(l, call, e.input));
               break;
             }
             l.pending.set(e.id, { call, ruleKey: e.ruleKey, input: e.input });
@@ -689,7 +722,7 @@ export class WorkspaceSessions {
       else if (e.type === "advice") turns.push({ account: e.account, model: e.model, prompt: `advisor (${e.chars} chars: task, session summary, diff): ${e.question}`, handoff: false, guard: e.guard, actions: [] });
       else if (e.type === "guard_decision" && turns.length) turns[turns.length - 1]!.guard = e.summary;
       else if (e.type === "pseudonymised" && turns.length)
-        turns[turns.length - 1]!.actions.push({ kind: "read", title: `pseudonymised copy of ${e.file} (tokenized: ${e.columns.join(", ") || "none"})`, status: "done" });
+        turns[turns.length - 1]!.actions.push({ kind: "read", title: `pseudonymised copy of ${e.file} (tokenized: ${e.columns.join(", ") || "none"}${e.names ? `; ${e.names}` : ""})`, status: "done" });
       else if (e.type === "tool_call" && turns.length) {
         const known = byCall.get(e.call.id);
         if (known) {
@@ -711,7 +744,7 @@ export class WorkspaceSessions {
    * What the CLI actually executes: placeholders restored, and in sensitive folders table reads redirected to a
    * pseudonymised copy. If that copy can't be made, the read is denied: it was approved on the promise of the copy.
    */
-  private allowDecision(l: Live, call: ToolCall, input: unknown): Decision {
+  private async allowDecision(l: Live, call: ToolCall, input: unknown): Promise<Decision> {
     if (call.kind === "edit") for (const p of call.paths ?? (call.path ? [call.path] : [])) if (protectedPath(l.root, p)) l.approvedProtected.add(realTarget(l.root, p));
     if (input === undefined) return { behavior: "allow" };
     // A web fetch or search leaves the machine: placeholders go out as placeholders, never as the real values.
@@ -724,30 +757,55 @@ export class WorkspaceSessions {
     if (!key) return { behavior: "allow", updatedInput: real };
     const src = realTarget(l.root, real[key]); // through any symlink, as tabularTarget judged it
     try {
-      let text: string, cols: string[];
+      let text: string, cols: string[], names: string | undefined;
+      let table: ReturnType<typeof loadTable> | undefined;
       try {
-        const table = loadTable(src);
-        cols = columnsToHide(table, [], this.engine.workspaces.effectivePolicy(l.root)?.keep);
-        // Columns first, then the guard over each readable cell, for an email or key typed into a free-text column.
-        text = pseudonymize(table, cols, l.vault, (t) => obfuscateText(l.vault, t, "standard", this.cfg));
+        table = loadTable(src);
       } catch (e) {
         // A plain-text log or JSON that holds no records has no columns: it gets the guard alone (IPs, emails, users,
         // secrets), never raw. Too large to load means refused.
         if (!/\.(log|json)$/i.test(src) || statSync(src).size > 50 * 1024 * 1024) throw e;
-        text = obfuscateText(l.vault, readFileSync(src, "utf8"), "standard", this.cfg);
+      }
+      if (table) {
+        const keep = this.engine.workspaces.effectivePolicy(l.root)?.keep ?? [];
+        cols = columnsToHide(table, [], keep);
+        // Columns first, then the guard over each readable cell, for an email or key typed into a free-text column, then
+        // name detection over the readable cells.
+        const p = pseudonymizeWithSpans(table, cols, l.vault, keep, (t) => obfuscateText(l.vault, t, "standard", this.cfg), true);
+        const ner = await this.nameCheck(p.csv, p.text);
+        names = ner.note;
+        text = ner.findings ? l.vault.replace(p.csv, withinCells(ner.findings, p.cells, p.kept, p.csv)) : p.csv;
+      } else {
+        // Plain text: name detection's findings join the guard's, line by line, like a prompt's.
+        const raw = readFileSync(src, "utf8");
+        const ner = await this.nameCheck(raw);
+        names = ner.note;
+        text = obfuscateText(l.vault, raw, "standard", this.cfg, "chat", ner.findings);
         cols = [];
       }
       const dir = join(tmpdir(), `hib-pseudo-${process.getuid?.() ?? "u"}`, l.id);
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       const copy = join(dir, basename(src));
       writeFileSync(copy, text, { mode: 0o600 });
-      const ev = { type: "pseudonymised" as const, file: real[key], columns: cols, callId: call.id };
+      const ev = { type: "pseudonymised" as const, file: real[key], columns: cols, callId: call.id, ...(names ? { names } : {}) };
       this.record(l.id, ev);
       this.emit(l.id, ev); // live viewers mark the tool card
       return { behavior: "allow", updatedInput: { ...real, [key]: copy } };
     } catch (e: any) {
       return { behavior: "deny", message: `hib couldn't make a pseudonymised copy of ${basename(src)} (${e?.message ?? e}), so the read was blocked.` };
     }
+  }
+
+  /**
+   * Name detection over a Read copy, within the guard's budget (`cells`: free-text cells, tokenised whole if it runs
+   * out). Off or unavailable, the copy goes without it and `note` says so for the timeline: the copy still went out on
+   * your approval, but you should know its names weren't checked. Not cached: a copy is read once and can be large.
+   */
+  private async nameCheck(text: string, cells?: [number, number][]): Promise<{ findings?: Finding[]; note?: string }> {
+    if (!this.cfg.guard.ner) return { note: "name detection is off: names in free text weren't checked" };
+    const r = await runNer([text], this.cfg, this.engine.nerInfer ?? this.engine.nerModel.infer, cells ? new Map([[text, cells]]) : undefined);
+    if (r.error) return { note: `${r.error}: names in free text weren't checked` };
+    return { findings: r.byText.get(text) ?? [], note: r.partial?.get(text) };
   }
 
   /**
@@ -857,12 +915,14 @@ export class WorkspaceSessions {
     if (!l || !p) return false;
     l.pending.delete(permissionId);
     if (choice === "always") l.alwaysAllow.add(p.ruleKey);
-    // The CLI executes exactly what we return, so placeholders are swapped back to real values here.
-    const d: Decision =
-      choice === "deny"
-        ? { behavior: "deny", message: message || "The user denied this action." }
-        : this.allowDecision(l, p.call, p.input);
-    l.driver.answer(permissionId, d);
+    // The CLI executes exactly what we return, so placeholders are swapped back to real values here. Making a Read
+    // copy can take a while (name detection), so the CLI gets the answer when it's ready; it waits for it anyway.
+    if (choice === "deny") l.driver.answer(permissionId, { behavior: "deny", message: message || "The user denied this action." });
+    else
+      void this.allowDecision(l, p.call, p.input).then(
+        (d) => l.driver.answer(permissionId, d),
+        (e) => l.driver.answer(permissionId, { behavior: "deny", message: `hib couldn't prepare this call (${e?.message ?? e}), so it was blocked.` }),
+      );
     this.record(sessionId, { type: "permission_answer", id: permissionId, choice });
     this.emit(sessionId, { type: "permission_answer", id: permissionId, choice });
     this.changed();

@@ -48,6 +48,8 @@ function siem(): { text: string; planted: Planted } {
     const u = plant(planted, "username", pick(users));
     const h = plant(planted, "hostname", pick(["WS-ZG-0142", "WS-ST-0007", "dc01.corp.acme.local", "LAPTOP-8KQ2M1"]));
     const person = plant(planted, "name only in message", pick(people));
+    // Slack-style stored file name: the person's name in slug form, in no identifying field
+    const slug = plant(planted, "name in slug", person.toLowerCase().normalize("NFD").replace(/\p{M}/gu, "").replace(/ /g, "_"));
     const ext = plant(planted, "public IP", pick(["185.220.101.34", "45.155.205.99"]));
     lines.push(JSON.stringify({
       "@timestamp": new Date(Date.UTC(2026, 9, 1) + i * 37_000).toISOString(),
@@ -65,6 +67,7 @@ function siem(): { text: string; planted: Planted } {
         ]),
       },
       url: { full: `https://portal.acme-corp.com/reset?token=${plant(planted, "URL token", `tok_${(1e9 + i).toString(36)}`)}` },
+      file: { name: `_${3077649 + i}_-_${slug}_learner_-_new_contact_form.pdf` },
       message: `CORP\\${u} logon from ${ext} to ${h} (${person})`,
     }));
   }
@@ -100,13 +103,23 @@ try {
       const left = checked.filter((v) => out.includes(v) || out.includes(JSON.stringify(v).slice(1, -1)));
       console.log(`  ${left.length ? "READABLE" : "hidden  "} ${kind.padEnd(20)} ${left.length}/${checked.length}${left.length ? `  e.g. ${left[0]}` : ""}`);
     }
-    if (withNer && file.endsWith(".csv")) {
+    if (withNer) {
       const model = new NerModel(join(cfg.home, "models"));
       await stage("name model load", () => model.load());
       const sample = out.split("\n").slice(0, 501).join("\n");
       const s = performance.now();
-      await stage("name detection, 500 rows", () => nerFindings(sample, model.infer));
+      const found = await stage("name detection, 500 rows", () => nerFindings(sample, model.infer));
       console.log(`  ≈ ${((performance.now() - s) / 500).toFixed(0)} ms a row`);
+      // What's still readable in the sample once name detection's findings are applied (overlaps: the first, longest wins).
+      const spans: typeof found = [];
+      for (const f of found.sort((a, b) => a.start - b.start || b.end - a.end)) if (!spans.length || f.start >= spans[spans.length - 1]!.end) spans.push(f);
+      const named = vault.replace(sample, spans);
+      for (const [kind, values] of planted) {
+        const checked = [...values].filter((v) => sample.includes(v));
+        if (!checked.length) continue;
+        const left = checked.filter((v) => named.includes(v));
+        console.log(`  ${left.length ? "READABLE" : "hidden  "} ${`${kind}, after names`.padEnd(32)} ${left.length}/${checked.length}${left.length ? `  e.g. ${left[0]}` : ""}`);
+      }
     }
   }
   console.log(`\npeak RSS ${(process.resourceUsage().maxRSS / 1024).toFixed(0)} MB (${process.platform}, bun ${Bun.version})`);
