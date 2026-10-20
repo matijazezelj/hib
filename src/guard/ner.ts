@@ -150,10 +150,16 @@ const wordCount = (s: string) => s.trim().split(/\s+/).filter(Boolean).length;
  * reach is never passed through: free-text cells (4+ words) there are tokenised whole, and so are free-text lines outside
  * the tables. `scannedTo` and `tokenised` say what happened, for the approval reason.
  */
-export async function nerScan(text: string, infer: Infer, opts: NerOptions = {}): Promise<NerScan> {
+export async function nerScan(text: string, model: Infer, opts: NerOptions = {}): Promise<NerScan> {
   const depth = opts.depth ?? 0;
-  const rss0 = process.memoryUsage().rss;
-  const overBudget = () => (opts.deadline !== undefined && Date.now() > opts.deadline) || process.memoryUsage().rss - rss0 > MAX_RSS_GROWTH;
+  // Memory is measured from the first model call on, so loading the model (~500 MB) isn't charged to the scan.
+  let rss0: number | undefined;
+  const overBudget = () => (opts.deadline !== undefined && Date.now() > opts.deadline) || (rss0 !== undefined && process.memoryUsage().rss - rss0 > MAX_RSS_GROWTH);
+  const infer: Infer = async (t) => {
+    const r = await model(t);
+    rss0 ??= process.memoryUsage().rss;
+    return r;
+  };
   const ignore = new Set([...TECH, ...(opts.ignore ?? []).map((s) => s.toLowerCase())]);
   const found: Finding[] = [];
   const isWord = (c: string | undefined) => !!c && /[\p{L}\p{N}]/u.test(c);
@@ -235,7 +241,9 @@ export async function nerScan(text: string, infer: Infer, opts: NerOptions = {})
   const merged: Finding[] = [];
   for (const f of unique) {
     const last = merged[merged.length - 1];
-    if (last && last.category === f.category && f.start >= last.end && /^ +$/.test(text.slice(last.end, f.start))) {
+    // Withheld blobs and cells are one value each: two on a line keep two tokens.
+    const whole = /-ENCODED$|^TEXT$/.test(f.category);
+    if (last && !whole && last.category === f.category && f.start >= last.end && /^ +$/.test(text.slice(last.end, f.start))) {
       last.end = f.end;
       last.value = text.slice(last.start, last.end);
     } else merged.push({ ...f });
