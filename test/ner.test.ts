@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isLowerProse, mergeTokens, nerFindings, proseSegments } from "../src/guard/ner";
+import { isLowerProse, mergeTokens, nerFindings, nerScan, proseSegments } from "../src/guard/ner";
 import { fakeInfer } from "./helpers/fake-ner";
 
 describe("NER helpers", () => {
@@ -44,8 +44,41 @@ describe("nerFindings", () => {
   test("names inside code are left alone", async () => {
     expect(await nerFindings("```\nconst who = 'Marija Horvat';\n```", fakeInfer)).toEqual([]);
   });
-  test("oversized input is refused, not partially scanned", async () => {
-    await expect(nerFindings("Marija Horvat ".repeat(20_000), fakeInfer)).rejects.toThrow("too large");
+  test("input over 200,000 characters is scanned in chunks, a name deep inside included", async () => {
+    const text = `${"routine status line with nothing in it\n".repeat(6000)}ticket #3077649 - Petra Learner - new contact form\n${"ok ".repeat(2000)}`;
+    expect(text.length).toBeGreaterThan(200_000);
+    const r = await nerScan(text, fakeInfer);
+    expect(r.scannedTo).toBe(text.length);
+    expect(r.findings.map((f) => f.value)).toEqual(["Petra Learner"]);
+  });
+  test("a long line is cut at spaces into pieces the model can read", async () => {
+    const seen: number[] = [];
+    const text = `${"word ".repeat(1000)}Marija Horvat`;
+    const f = await nerFindings(text, async (t) => (seen.push(t.length), fakeInfer(t)));
+    expect(Math.max(...seen)).toBeLessThanOrEqual(1000);
+    expect(f.map((x) => text.slice(x.start, x.end))).toEqual(["Marija Horvat"]);
+  });
+  test("out of budget: free-text cells it didn't reach are tokenised whole, short cells and lines outside are judged apart", async () => {
+    const head = "summarise:\n<table>\n";
+    const rows = ["id,notes", "1,called the customer back about it", "2,ok", "3,Petra Learner asked for a refund today"];
+    const text = `${head}${rows.join("\n")}\n</table>\nplease list everyone who asked for refunds`;
+    const cells: [number, number][] = [];
+    for (const cell of ["called the customer back about it", "Petra Learner asked for a refund today"]) cells.push([text.indexOf(cell), text.indexOf(cell) + cell.length]);
+    const r = await nerScan(text, fakeInfer, { deadline: Date.now() - 1, cells });
+    expect(r.scannedTo).toBe(0);
+    const whole = r.findings.filter((f) => f.category === "TEXT").map((f) => f.value).sort();
+    expect(whole).toEqual(["Petra Learner asked for a refund today", "called the customer back about it", "please list everyone who asked for refunds"]);
+    expect(r.tokenised).toBe(3);
+  });
+  test("encoded payloads: a name in a decoded script hides the whole blob; out of budget, any blob goes whole", async () => {
+    const blob = Buffer.from('import os\nprint("lookup Ivo Ivić")').toString("base64");
+    const text = `sudo: COMMAND=/bin/python3 -c ${blob}`;
+    const [f] = await nerFindings(text, fakeInfer);
+    expect(f).toMatchObject({ value: blob, category: "BASE64-ENCODED" });
+    expect(f!.absorbed).toEqual(["PERSON"]);
+    expect(await nerFindings(`run ${Buffer.from("echo nightly backup completed").toString("base64")}`, fakeInfer)).toEqual([]);
+    // the blob alone is one word, not a free-text line: only the blob rule covers it
+    expect((await nerScan(blob, fakeInfer, { deadline: Date.now() - 1 })).findings.map((x) => [x.value, x.category])).toEqual([[blob, "BASE64-ENCODED"]]);
   });
 });
 

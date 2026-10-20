@@ -134,7 +134,11 @@ export function loadTable(path: string): Table {
   const body = grid.slice(1);
   const types = header.map((_, i) => inferType(body.map((r) => (r[i] ?? "").trim())));
   const rows = body.map((r) => Object.fromEntries(header.map((h, i) => [h, convert((r[i] ?? "").trim(), types[i]!)])));
-  return { columns: header, rows };
+  if (!rows.some((r) => Object.values(r).some(jsonObjectIn))) return { columns: header, rows };
+  // A CSV export of JSON events (a full_log column): its JSON cells become dotted columns too.
+  const flat = rows.map((r) => flatten(r));
+  const columns = [...new Set(flat.flatMap((r) => Object.keys(r)))];
+  return { columns, rows: flat.map((r) => Object.fromEntries(columns.map((c) => [c, r[c] ?? null]))) };
 }
 
 const isRecord = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -157,9 +161,27 @@ function recordsIn(value: unknown, depth = 0): Record<string, unknown>[] | null 
   return best;
 }
 
-function flatten(value: any, prefix = "", out: Record<string, Cell> = {}): Record<string, Cell> {
+/** A string cell holding a JSON object (Wazuh's full_log), parsed; anything else is null. */
+function jsonObjectIn(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "string" || value.length > MAX_JSON_CELL) return null;
+  const s = value.trim();
+  if (!s.startsWith("{") || !s.endsWith("}")) return null;
+  try {
+    const v = JSON.parse(s);
+    return isRecord(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+const MAX_JSON_CELL = 1024 * 1024;
+
+function flatten(value: any, prefix = "", out: Record<string, Cell> = {}, depth = 0): Record<string, Cell> {
+  // JSON stored in a string is flattened like nested JSON (full_log.callerIp), so each field is judged on its own
+  // instead of the whole document as one value. The original column goes away; its fields replace it.
+  const inner = depth < 3 ? jsonObjectIn(value) : null;
+  if (inner && Object.keys(inner).length) return flatten(inner, prefix, out, depth + 1);
   if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-    for (const [k, v] of Object.entries(value)) flatten(v, prefix ? `${prefix}.${k}` : k, out);
+    for (const [k, v] of Object.entries(value)) flatten(v, prefix ? `${prefix}.${k}` : k, out, depth);
     return out;
   }
   const key = prefix || "value";
@@ -169,8 +191,36 @@ function flatten(value: any, prefix = "", out: Record<string, Cell> = {}): Recor
   return out;
 }
 
-const IDENTIFYING_NAME = /user|login|name|e-?mail|mail|phone|mobile|tel|\bip\b|ip_?addr|address|addr|street|zip|postal|ssn|oib|jmbg|iban|account|card|passport|birth|dob|token|password|secret|host|device|mac_?addr|uuid|guid|person|employee|customer|client|owner/i;
+// Hard identifiers name a person whatever the column holds, numbers and dates too (an OIB is 11 digits, a birth date is
+// a date). Soft words identify string columns, and number or date columns only when they look like an id (user_id).
+const HARD_NAME = /e-?mail|mail|phone|mobile|tel|address|addr|street|zip|postal|ssn|oib|jmbg|iban|account|card|passport|birth|dob|token|password|secret|mac_?addr|uuid|guid/i;
+const SOFT_NAME = /user|login|name|(?<![a-z])ip(?:v[46])?(?![a-z])|ip_?addr|host|device|person|employee|customer|client|owner/i;
+const CAMEL_IP = /[a-z]I[pP](?![a-z])/; // callerIp, sourceIP
+const ID_LIKE = /id$/i;
+// Segments that name a thing, not a person: methodName, service_name, program_name. displayName and full_name aren't here.
+const THING_NAME = /^(?:method|service|log|event|program|process|app|application|resource|rule|policy|operation|action|task|job|command|module|function|class|type|metric|decoder|index|table|field|queue|topic|product|plugin|integration|protocol|alert|signature|feature|setting|template|workflow|step|stage)[_-]?name$/i;
+// Descriptors of a person-ish word that aren't the person: user_type, loginCount, account_status.
+// Case matters for camelCase: "account" ends in "count" but isn't a count.
+const DESCRIPTOR = /[_-](?:type|kind|version|count|status|TYPE|KIND|VERSION|COUNT|STATUS)$|[a-z](?:Type|Kind|Version|Count|Status)$/;
+// A client's software, not a customer: client_id (an OAuth app), client_type, clientOsVersion.
+const CLIENT_META = /^client[_-]?(?:id|type|os|version|app|platform|software|lib|agent|build|locale|lang)/i;
 const IDENTIFYING_VALUE = /@[\w-]+\.\w|^\d{1,3}(\.\d{1,3}){3}$|^\+?\d[\d\s()-]{7,}$/;
+
+/** The part of a column path its name is judged by: no trailing ".name", no thing names or descriptors. */
+function judgedName(column: string): string {
+  const segs = column.split(".");
+  // user.name and host.name identify, process.name doesn't: a trailing ".name" is judged by its parent.
+  if (segs.length > 1 && /^name$/i.test(segs[segs.length - 1]!)) segs.pop();
+  return segs.map((s) => (THING_NAME.test(s) || DESCRIPTOR.test(s) || CLIENT_META.test(s) ? "" : s)).join(".");
+}
+
+/** Identifying by name alone: hard identifiers always, soft words for strings, and for numbers and dates only as ids. */
+function identifyingName(column: string, type: ColType): boolean {
+  const judged = judgedName(column);
+  if (HARD_NAME.test(judged)) return true;
+  if (!SOFT_NAME.test(judged) && !CAMEL_IP.test(judged)) return false;
+  return type === "string" || ID_LIKE.test(column.split(".").pop()!);
+}
 
 function columnType(rows: Record<string, Cell>[], col: string): ColType {
   const v = rows.map((r) => r[col]).find((x) => x !== null && x !== undefined);
@@ -190,10 +240,10 @@ export function isIdentifying(name: string, rows: Record<string, Cell>[]): boole
  * whole cells, so the model can still read what each row says.
  */
 export function identifyingBy(name: string, rows: Record<string, Cell>[]): "name" | "value" | "text" | null {
-  if (columnType(rows, name) === "boolean") return null; // a yes/no flag ("known_abuser") identifies no one
-  // A nested field is judged by its path without a trailing ".name": user.name and host.name identify, process.name doesn't.
-  if (IDENTIFYING_NAME.test(name.includes(".") ? name.replace(/\.name$/i, "") : name)) return "name";
-  if (columnType(rows, name) !== "string") return null; // numbers and ISO dates aren't emails, IPs or phones
+  const type = columnType(rows, name);
+  if (type === "boolean") return null; // a yes/no flag ("known_abuser") identifies no one
+  if (identifyingName(name, type)) return "name";
+  if (type !== "string") return null; // numbers and ISO dates aren't emails, IPs or phones
   const sample = rows.slice(0, 200).map((r) => r[name]).filter((x): x is string => typeof x === "string" && x !== "");
   if (!sample.length || sample.filter((x) => IDENTIFYING_VALUE.test(x)).length / sample.length <= 0.3) return null;
   return sample.filter((x) => x.trim().split(/\s+/).length >= 4).length / sample.length >= 0.5 ? "text" : "value";

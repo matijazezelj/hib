@@ -1,3 +1,4 @@
+import { encodedBlobs, encodedCategory } from "../guard/encoded";
 import type { Vault } from "../guard/vault";
 import { identifyingBy, type Table } from "./table";
 
@@ -42,14 +43,22 @@ export function pseudonymize(table: Table, columns: string[], vault: Vault, guar
  * `guard` runs on each column name and each readable text cell on its own, so no detector can match across a cell
  * boundary and swallow the next cell.
  */
-export function pseudonymizeWithSpans(table: Table, columns: string[], vault: Vault, keep: string[], guard: (text: string) => string = (t) => t): { csv: string; kept: [number, number][] } {
+export function pseudonymizeWithSpans(
+  table: Table,
+  columns: string[],
+  vault: Vault,
+  keep: string[],
+  guard: (text: string) => string = (t) => t,
+): { csv: string; kept: [number, number][]; text: [number, number][] } {
   const kept: [number, number][] = [];
+  const text: [number, number][] = []; // readable free-text cells (4+ words): tokenised whole if name detection can't reach them
   const keepSet = new Set(keep);
   let csv = "";
   const line = (cells: string[], keepFlags: boolean[]) => {
     cells.forEach((c, i) => {
       if (i) csv += ",";
       if (keepFlags[i] && c) kept.push([csv.length, csv.length + c.length]);
+      else if (c.trim().split(/\s+/).length >= 4) text.push([csv.length, csv.length + c.length]);
       csv += c;
     });
     csv += "\n";
@@ -84,11 +93,24 @@ export function pseudonymizeWithSpans(table: Table, columns: string[], vault: Va
         const v = r[c];
         if (v === null || v === undefined || v === "") return csvCell(v);
         if (hidden.has(c)) return csvCell(tok(c, String(v)));
-        return csvCell(typeof v === "string" && !keepSet.has(c) ? guard(replaceKnown(v, known, maxWords)) : v);
+        return csvCell(typeof v === "string" && !keepSet.has(c) ? guard(replaceKnownEncoded(replaceKnown(v, known, maxWords), known, maxWords, vault)) : v);
       }),
       flags,
     );
-  return { csv, kept };
+  return { csv, kept, text };
+}
+
+/** An encoded blob (`python3 -c <base64>`) that decodes to text naming a hidden value goes out as one token. */
+function replaceKnownEncoded(text: string, known: Map<string, string>, maxWords: number, vault: Vault): string {
+  if (!known.size) return text;
+  let out = "";
+  let pos = 0;
+  for (const b of encodedBlobs(text)) {
+    if (replaceKnown(b.decoded, known, maxWords) === b.decoded) continue;
+    out += text.slice(pos, b.start) + `[${vault.token(encodedCategory(b), b.value)}]`;
+    pos = b.end;
+  }
+  return out + text.slice(pos);
 }
 
 const norm = (s: string) => s.trim().replace(/\s+/g, " ").toLowerCase();

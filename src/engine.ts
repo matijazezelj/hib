@@ -15,7 +15,7 @@ import { Router, resolveCandidate, type Candidate } from "./router/route";
 import { Usage } from "./usage";
 import { onPinnedAccount, pinnedModel, Workspaces } from "./workspace/registry";
 import { columnsToHide, pseudonymizeWithSpans } from "./analyze/pseudo";
-import { dirname } from "node:path";
+import { dirname, extname } from "node:path";
 import type { Table } from "./analyze/table";
 
 export interface ChatInput {
@@ -111,16 +111,17 @@ export class Engine {
 
   /** Local NER over texts, cached per text so long conversations aren't re-scanned every turn. Tests swap `nerInfer`. */
   nerInfer?: Infer;
-  async ner(texts: string[]): Promise<NerResult> {
+  async ner(texts: string[], cells?: Map<string, [number, number][]>): Promise<NerResult> {
     if (!this.cfg.guard.ner) return { byText: new Map() };
     const todo = texts.filter((t) => !this.nerCache.has(t));
-    const r = await runNer(todo, this.cfg, this.nerInfer ?? this.nerModel.infer);
+    const r = await runNer(todo, this.cfg, this.nerInfer ?? this.nerModel.infer, cells);
     if (r.error) return r;
     for (const [t, f] of r.byText) {
+      if (r.partial?.has(t)) continue; // a scan the budget cut short is redone next time, not reused
       if (this.nerCache.size > 2000) this.nerCache.delete(this.nerCache.keys().next().value!);
       this.nerCache.set(t, f);
     }
-    return { byText: new Map(texts.map((t) => [t, this.nerCache.get(t) ?? []])) };
+    return { byText: new Map(texts.map((t) => [t, this.nerCache.get(t) ?? r.byText.get(t) ?? []])), partial: r.partial };
   }
 
   /** Egress log for router requests: exactly what each model call sent (already redacted), and to whom. */
@@ -269,28 +270,38 @@ export class Engine {
       vault = new Vault();
     }
     // Attached tables go out pseudonymised by column, with tokens from this conversation's vault so answers restore.
-    const attached = (input.attachments ?? []).map((a) => {
+    // The file name goes out neutral (attachment-1.csv): "jdoe_ssh_logs.csv" names a person no detector would catch.
+    // The history note uses it too, since history is resent on later turns.
+    const attached = (input.attachments ?? []).map((a, i) => {
       const cols = columnsToHide(a.table, a.hide, a.keep);
-      const { csv, kept } = pseudonymizeWithSpans(a.table, cols, vault, a.keep ?? []);
-      const head = `<table name="${a.name}" rows="${a.table.rows.length}">\n`;
+      const { csv, kept, text } = pseudonymizeWithSpans(a.table, cols, vault, a.keep ?? []);
+      const name = `attachment-${i + 1}${extname(a.name).toLowerCase().replace(/[^.a-z0-9]/g, "")}`;
+      const head = `<table name="${name}" rows="${a.table.rows.length}">\n`;
       const keptNote = a.keep?.length ? `; kept readable: ${a.keep.join(", ")}` : "";
-      return { note: `[attached ${a.name}: ${a.table.rows.length} rows; pseudonymised: ${cols.join(", ") || "none"}${keptNote}]`, text: `${head}${csv}</table>`, kept: kept.map(([s, e]) => [s + head.length, e + head.length] as [number, number]) };
+      const shift = (spans: [number, number][]) => spans.map(([s, e]) => [s + head.length, e + head.length] as [number, number]);
+      return { note: `[attached ${name}: ${a.table.rows.length} rows; pseudonymised: ${cols.join(", ") || "none"}${keptNote}]`, text: `${head}${csv}</table>`, kept: shift(kept), cells: shift(text) };
     });
     if (attached.reduce((n, x) => n + x.text.length, 0) > 400_000)
       return yield { type: "error", message: "attached table is too large to send; use `hib analyze`, which sends only the schema" };
-    // Kept columns are exempt from every detector: record their spans in the final message text.
+    // Kept columns are exempt from every detector: record their spans in the final message text. Free-text cells are
+    // recorded too, for name detection to tokenise whole if its budget runs out before them.
     const exempt = new Map<string, [number, number][]>();
+    const textCells = new Map<string, [number, number][]>();
     const outgoingInput = attached.length
       ? input.messages.map((m, i) => {
           if (i !== lastIn || m.role !== "user") return m;
           let content = m.content;
           const spans: [number, number][] = [];
+          const cells: [number, number][] = [];
           for (const x of attached) {
             content += "\n\n";
-            spans.push(...x.kept.map(([s, e]) => [s + content.length, e + content.length] as [number, number]));
+            const at = content.length;
+            spans.push(...x.kept.map(([s, e]) => [s + at, e + at] as [number, number]));
+            cells.push(...x.cells.map(([s, e]) => [s + at, e + at] as [number, number]));
             content += x.text;
           }
           exempt.set(content, spans);
+          textCells.set(content, cells);
           return { ...m, content };
         })
       : input.messages;
@@ -328,7 +339,7 @@ export class Engine {
 
     // guard
     // Names, places and companies (local NER) are tokenized too, unless the route only covers secrets.
-    const ner = plan.route.level === "minimal" ? undefined : await this.ner(messages.map((m) => m.content));
+    const ner = plan.route.level === "minimal" ? undefined : await this.ner(messages.map((m) => m.content), textCells);
     const insp = inspect(messages, plan.route, this.cfg, { cwd: input.cwd, vault, ner, exempt });
     yield { type: "guard", findings: insp.findings, action: insp.blocked ? "block" : insp.decision.action, reasons: insp.blocked ? [insp.blocked] : insp.decision.reasons };
     if (insp.blocked) return yield { type: "error", message: `blocked: ${insp.blocked}` };
