@@ -15,6 +15,8 @@ describe("sensitive workspaces: raw data through the shell", () => {
     `python3 - <<'EOF'\nprint(open('data').read())\nEOF`,
     `duckdb -c "select * from 'investigation-kibana.csv'"`,
     `awk -F, '{print $3}' investigation-kibana.csv`,
+    `tail -n 200 logs/auth.log`,
+    `grep -h failure *.log`,
   ];
   for (const c of leaked) test(`blocks: ${c.split("\n")[0]!.slice(0, 60)}`, () => expect(rawDataCommand(c, root, data)).not.toBeNull());
 

@@ -89,9 +89,11 @@ A sensitive folder is seen by exactly one vendor account, and it must be a Claud
 - **Nothing that copies data elsewhere:** no handoff, failover, advisor, arena, or classifier call.
 - **Reads need approval.** Every file read, search, Bash command and subagent asks first, so you see each file before its contents go out. "Always" for a read covers only that directory.
 - **Secrets are blocked** in prompts outright, not just tokenized.
-- **Data stays pseudonymised.** Data files (CSV/TSV, table-shaped JSON) reach the agent only through the Read tool, which hands it a pseudonymised copy.
+- **Data stays pseudonymised.** Data files (CSV/TSV, table-shaped JSON, JSON lines, Elasticsearch exports, `.log` files) reach the agent only through the Read tool, which hands it a pseudonymised copy.
+  - Nested JSON is flattened into dotted columns (`user.name`, `source.ip`), so each field is judged on its own. A value hidden in one column gets the same token wherever it appears in other text (`CORP\jdoe` in a message, `C:\Users\jdoe\…` in a path), and every readable cell also goes through the regex guard.
+  - A `.log` that isn't JSON lines has no columns: its copy gets the regex guard alone (IPs, emails, `user=`, home folders, keys, passwords on command lines). A bare username in free text ("Failed password for jdoe") stays readable there.
   - The agent's commands can't read data files; the OS sandbox enforces it.
-    - On macOS the sandbox denies data files by pattern (`*.csv`, `*.tsv`, `*.xlsx`, `*.parquet`, `*.sqlite`… and every `*.json` except build config like `package.json` and `tsconfig*.json`). That covers any depth, any case, files created later, symlinks, hard links, renames and copies.
+    - On macOS the sandbox denies data files by pattern (`*.csv`, `*.tsv`, `*.log`, `*.xlsx`, `*.parquet`, `*.sqlite`… and every `*.json` except build config like `package.json` and `tsconfig*.json`). That covers any depth, any case, files created later, symlinks, hard links, renames and copies.
     - On Linux it denies the data files found when the session starts. A folder hib can't list completely is refused rather than half protected.
     - Without a working OS sandbox (Linux without bubblewrap, or a kernel that blocks it), a sensitive session doesn't start, and hib says why.
     - Commands that obviously try (`head`/`cat`/`awk` on a data file, inline `python -c`/`node -e`) are refused up front, with a message pointing the agent to Read.
@@ -188,6 +190,24 @@ Pattern matching catches emails, keys and IPs, but not "Marija Horvat", "Podravk
 - `hib egress last` or `hib egress <id>` prints the exact text that was sent.
 
 The log stores the redacted text locally in `~/.hib/hib.db`, so anything the guard missed is in there too.
+
+## Performance
+
+Synthetic 10,000-row files with planted values, generated and measured by `bun test/manual/bench.ts 10000 --ner` (rerun it to check your machine). Measured on an Apple M3 Pro (11 cores, 36 GB), macOS 27, Bun 1.4.3.
+
+| Stage | customers.csv (1.3 MB) | siem.jsonl (5.5 MB, ECS-style) |
+|---|---:|---:|
+| Load and parse | 48 ms | 28 ms |
+| Pseudonymise by column | 73 ms | 85 ms |
+| Pseudonymise plus the regex guard on each text cell (what a sensitive folder's Read gets) | 248 ms | 434 ms |
+| Profile (all `hib analyze` sends) | 15 ms | 15 ms |
+| Name model load (once) | 260 ms, +470 MB | — |
+| Name detection | ≈ 23 ms a row, on ~4–5 cores | — |
+
+- Without name detection both files are guarded in under half a second each, and the whole benchmark peaks at about 200 MB. With it the process peaks around 650–850 MB, and 10k rows would take about 4 minutes.
+- `hib ask -f` refuses tables over 400,000 characters (about 1,900 rows of the CSV above), and name detection stops at 200,000 characters, after which the guard asks before sending. Bigger files go through `hib analyze`, which sends only the schema.
+- **customers.csv:** every planted name, email, phone number and IP is hidden, including names repeated in the free-text `notes` column.
+- **siem.jsonl:** usernames, hostnames, domains, internal and public IPs, emails, Windows SIDs, URL tokens and passwords on command lines are hidden, including inside `message` and `process.command_line`. A person's name that appears only in `message` (in no identifying field) stays readable without name detection.
 
 ## Security model
 

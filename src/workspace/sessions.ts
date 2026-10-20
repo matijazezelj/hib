@@ -74,7 +74,7 @@ function isDataFile(path: string): boolean {
   }
 }
 
-const DATA_EXTS = ["csv", "tsv", "jsonl", "ndjson", "xls", "xlsx", "parquet", "sqlite", "sqlite3"];
+const DATA_EXTS = ["csv", "tsv", "jsonl", "ndjson", "log", "xls", "xlsx", "parquet", "sqlite", "sqlite3"];
 // JSON that build tools read. Every other .json in a sensitive folder is denied to commands, table or not; Read still
 // reaches it (pseudonymised when it's a table).
 const CONFIG_JSON = [
@@ -724,12 +724,22 @@ export class WorkspaceSessions {
     if (!key) return { behavior: "allow", updatedInput: real };
     const src = realTarget(l.root, real[key]); // through any symlink, as tabularTarget judged it
     try {
-      const table = loadTable(src);
-      const cols = columnsToHide(table);
+      let text: string, cols: string[];
+      try {
+        const table = loadTable(src);
+        cols = columnsToHide(table);
+        // Columns first, then the guard over each readable cell, for an email or key typed into a free-text column.
+        text = pseudonymize(table, cols, l.vault, (t) => obfuscateText(l.vault, t, "standard", this.cfg));
+      } catch (e) {
+        // A plain-text log has no columns: it gets the guard alone (IPs, emails, users, secrets), not raw.
+        if (!/\.log$/i.test(src) || statSync(src).size > 50 * 1024 * 1024) throw e;
+        text = obfuscateText(l.vault, readFileSync(src, "utf8"), "standard", this.cfg);
+        cols = [];
+      }
       const dir = join(tmpdir(), `hib-pseudo-${process.getuid?.() ?? "u"}`, l.id);
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       const copy = join(dir, basename(src));
-      writeFileSync(copy, pseudonymize(table, cols, l.vault), { mode: 0o600 });
+      writeFileSync(copy, text, { mode: 0o600 });
       const ev = { type: "pseudonymised" as const, file: real[key], columns: cols, callId: call.id };
       this.record(l.id, ev);
       this.emit(l.id, ev); // live viewers mark the tool card

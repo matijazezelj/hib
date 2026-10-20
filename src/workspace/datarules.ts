@@ -5,8 +5,8 @@ import { isAbsolute, resolve } from "node:path";
  * Read tool, which hands it a pseudonymised copy. Returns why a command is blocked, or null.
  */
 // JSON is data only when it's a table (passed in via dataFiles); package.json and friends stay readable.
-const DATA_EXT = /\.(csv|tsv|jsonl|ndjson|xlsx?|parquet|sqlite3?)\b/i;
-const DATA_GLOB = /\*[^\s]*\.(csv|tsv|jsonl|ndjson|xlsx?|parquet)\b/i;
+const DATA_EXT = /\.(csv|tsv|jsonl|ndjson|log|xlsx?|parquet|sqlite3?)\b/i;
+const DATA_GLOB = /\*[^\s]*\.(csv|tsv|jsonl|ndjson|log|xlsx?|parquet)\b/i;
 // Programs that only list or count files, never print their contents.
 const METADATA_ONLY = new Set(["ls", "find", "stat", "file", "du", "wc", "tree"]);
 const INTERPRETERS = /(^|[\s;&|(])(python3?|node|bun|deno|ruby|perl|php|Rscript|julia|duckdb|sqlite3|jq|mlr|xsv|qsv|csvlook|csvcut|csvgrep|awk|gawk)\b/;
@@ -14,7 +14,7 @@ const INLINE_CODE = /(^|[\s;&|(])(python3?|node|bun|deno|ruby|perl|php|Rscript)\
 const HEREDOC_INTO_INTERPRETER = /(python3?|node|bun|deno|ruby|perl|php|Rscript|duckdb|sqlite3)\s*<</;
 
 export const DATA_RULE_NOTE =
-  "This folder is marked sensitive. Read data files (CSV, TSV, JSON…) only with the Read tool: you will receive a pseudonymised copy " +
+  "This folder is marked sensitive. Read data files (CSV, TSV, JSON, logs…) only with the Read tool: you will receive a pseudonymised copy " +
   "in which people, accounts, IPs and similar values are placeholders like [HIB…-USER-3]. Shell commands that read data files, inline scripts " +
   "(python -c, node -e, heredocs) and scripts written outside this folder are blocked. To compute something over a data file, read it with Read and reason over it, " +
   "or write a script inside this folder that the user can review.";

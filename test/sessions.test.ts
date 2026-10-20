@@ -480,7 +480,7 @@ test("egress shows the guard decision and one entry per action, with its final d
 
 test("sensitive workspaces hand Claude a pseudonymised copy when it reads a CSV", async () => {
   const { writeFileSync, readFileSync } = await import("node:fs");
-  writeFileSync(join(root, "users.csv"), "username,email,salary\njsmith,john@acme.io,72000\n");
+  writeFileSync(join(root, "users.csv"), "username,email,salary,notes\njsmith,john@acme.io,72000,ask JSmith or dana@northwind.test\nmkovac,m@acme.io,65000,none\nlnovak,l@acme.io,61000,none\nipetric,i@acme.io,58000,none\n");
   engine.workspaces.register(root);
   engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@work" });
   script.current = async (_t, d, q) => {
@@ -494,7 +494,25 @@ test("sensitive workspaces hand Claude a pseudonymised copy when it reads a CSV"
   expect(copy).not.toContain("jsmith");
   expect(copy).not.toContain("acme.io");
   expect(copy).toContain("72000");
+  expect(copy).not.toMatch(/jsmith|dana@|northwind/i); // free text: a hidden value, then an address no column holds
   expect(sessions.egress(r.sid)[0]!.actions.map((a) => a.title).join()).toContain("pseudonymised copy of");
+});
+
+test("sensitive workspaces hand Claude a guarded copy of a plain-text log", async () => {
+  const { writeFileSync, readFileSync } = await import("node:fs");
+  writeFileSync(join(root, "auth.log"), "Oct 16 10:00:01 gw sshd[812]: Failed password for jdoe from 185.220.101.34\nOct 16 10:00:09 gw sudo: user=jdoe ran id, mail to soc@acme-corp.io\n");
+  engine.workspaces.register(root);
+  engine.workspaces.setPolicy(root, { sensitive: true, account: "alpha@work" });
+  script.current = async (_t, d, q) => {
+    q.push({ type: "permission", id: "l1", ruleKey: "read:.", call: { id: "c1", name: "Read", kind: "read", title: "Read auth.log", path: "auth.log" }, input: { file_path: join(root, "auth.log") } });
+    await d.ask("l1");
+  };
+  await turn("summarise auth.log", undefined, () => "allow", "hib/auto");
+  const d = drivers[0]!.decisions.get("l1") as any;
+  expect(d.updatedInput.file_path).not.toBe(join(root, "auth.log"));
+  const copy = readFileSync(d.updatedInput.file_path, "utf8");
+  for (const real of ["185.220.101.34", "soc@acme-corp.io", "user=jdoe"]) expect(copy).not.toContain(real);
+  expect(copy).toContain("Failed password for");
 });
 
 test("text is guarded whole before it's cut, so a cut can't strip a key's BEGIN line and let its body out", async () => {
@@ -572,7 +590,7 @@ describe("sensitive workspaces: shell reads of data", () => {
     const r = await turn("look at the data", undefined, (e) => (prompted.push(e.id), "allow"), "hib/auto");
     expect(prompted).toEqual([]); // never offered to the user
     expect(drivers[0]!.decisions.get("b1")).toMatchObject({ behavior: "deny", message: expect.stringContaining("Read tool") });
-    expect(drivers[0]!.started[0]!.system).toContain("Read data files (CSV, TSV, JSON…) only with the Read tool");
+    expect(drivers[0]!.started[0]!.system).toContain("Read data files (CSV, TSV, JSON, logs…) only with the Read tool");
     expect(sessions.egress(r.sid)[0]!.actions).toEqual([{ kind: "command", title: "$ head logins.csv", status: "denied" }]);
   });
   test("non-table JSON (package.json) is read normally, not 'pseudonymised'", async () => {

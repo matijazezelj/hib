@@ -57,6 +57,30 @@ describe("standard level", () => {
   });
 });
 
+describe("passwords on command lines (process logs)", () => {
+  const values = (text: string) => detect(text, { level: "minimal" }).filter((f) => f.category === "PASSWORD").map((f) => f.value);
+  const caught: [string, string][] = [
+    ["net use \\\\fs02\\share /user:CORP\\jdoe Hunter2!0", "Hunter2!0"],
+    ["net user jdoe S3cret! /add", "S3cret!"],
+    ["mysql -u root -pS3cretPw db", "S3cretPw"],
+    ["sshpass -p 'Tr0ub4dor' ssh host", "Tr0ub4dor"],
+    ["psexec \\\\h -u admin -p Pa55word cmd", "Pa55word"],
+    ["sqlcmd -S srv -U sa -P Str0ng!", "Str0ng!"],
+    ["curl --password hunter22 https://x", "hunter22"],
+    ["openssl enc -pass pass:mysecretpw", "mysecretpw"],
+    ["cmdkey /add:srv /user:jdoe /pass:Winter2026", "Winter2026"],
+    ['"command_line":"net user jdoe S3cret! /add"', "S3cret!"],
+    ["net user jdoe S3cret!9,next csv cell", "S3cret!9"],
+  ];
+  for (const [cmd, pw] of caught) test(`catches: ${cmd}`, () => expect(values(cmd)).toEqual([pw]));
+  const fine = ["net use x: \\\\fs\\s /user:jdoe /persistent:no", "net user jdoe /domain", "mysql -u root -p db", "docker login --password-stdin",
+    "msbuild /p:Configuration=Release", "-Password $env:PW", "--password=$PASS", "--passes 3", "use --password <pw>"];
+  for (const cmd of fine) test(`leaves: ${cmd}`, () => expect(values(cmd)).toEqual([]));
+  test("Windows home folders hide the username", () => {
+    expect(detect("C:\\Users\\jdoe\\AppData and C:\\\\Users\\\\a.kovac\\\\x and C:\\Users\\Public", { level: "standard" }).map((f) => f.value)).toEqual(["jdoe", "a.kovac"]);
+  });
+});
+
 describe("code survives (false-positive fixtures)", () => {
   const code = `
 import { useState } from "react";

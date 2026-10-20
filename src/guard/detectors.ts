@@ -74,6 +74,15 @@ const SECRETS: Detector[] = [
     /(?:password|passwd|pwd|secret|secret[_-]?key|api[_-]?key|apikey|access[_-]?key|auth[_-]?key|auth[_-]?token|access[_-]?token|private[_-]?key|encryption[_-]?key|client[_-]?secret|token)["']?\s*[=:]\s*["']?([^\s"'`,;]{8,})/gi,
     1,
   ),
+  // Passwords passed on command lines, as process logs record them. The value can't start like the next switch ("/",
+  // "-"), a prompt ("*") or a reference ($PASS, %PASS%, <password>, ${PW}); quotes stay outside the token so CSV and
+  // JSON quoting survive; a comma ends it (in unquoted CSV it is the cell boundary).
+  secret("PASSWORD", /\/user:\S+\s+["']?([^\s"'`,/*$%<{-][^\s"'`,]{2,})/gi, 1), // net use \\srv\share /user:DOM\u PASSWORD
+  secret("PASSWORD", /\bnet(?:\.exe)?\s+user\s+\S+\s+["']?([^\s"'`,/*$%<{-][^\s"'`,]{2,})/gi, 1), // net user jdoe PASSWORD /add
+  secret("PASSWORD", /(?:^|[\s"'])(?:--?pass(?:word|wd)?(?![\w-])[=:\s]+|\/pass(?:word)?:)["']?(?:pass:)?([^\s"'`,*$%<{-][^\s"'`,]{2,})/gim, 1), // --password X, -Password X, -pass pass:X, /pass:X
+  secret("PASSWORD", /\b(?:sshpass|psexec(?:64)?(?:\.exe)?)\b[^\n]*?\s-p\s*["']?([^\s"'`,*$%<{-][^\s"'`,]{2,})/gi, 1),
+  secret("PASSWORD", /\bmysql(?:dump|admin)?\b[^\n]*?\s-p([^\s"'`,$%<{][^\s"'`,]{2,})/g, 1), // mysql -pPASSWORD (attached)
+  secret("PASSWORD", /\bsqlcmd\b[^\n]*?\s-P\s*["']?([^\s"'`,*$%<{-][^\s"'`,]{2,})/g, 1),
   secret("SSH-PUBLIC-KEY", /\bssh-(?:rsa|dss|ed25519|ecdsa)\s+[A-Za-z0-9+/]{40,}={0,2}/g),
 ];
 
@@ -105,6 +114,7 @@ const STANDARD: Detector[] = [
   { category: "IP-EXTERNAL", kind: "infra", re: /\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b/g },
   { category: "EMAIL", kind: "pii", re: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, keep: (v) => /@(example\.(com|org)|users\.noreply\.github\.com)$/i.test(v) || v.startsWith("noreply@") },
   { category: "USER", kind: "pii", path: true, re: /\/(?:Users|home)\/([A-Za-z0-9._-]+)/g, group: 1, keep: (v) => v === "Shared" || SYSTEM_USERS.has(v) },
+  { category: "USER", kind: "pii", path: true, re: /\b[A-Za-z]:\\{1,2}Users\\{1,2}([A-Za-z0-9._-]+)/gi, group: 1, keep: (v) => /^(Public|Default|All Users|Default User)$/i.test(v) },
   { category: "USER", kind: "pii", re: /\b(?:user|username|login|uid)=["']?([A-Za-z0-9._-]+)/gi, group: 1, keep: (v) => SYSTEM_USERS.has(v.toLowerCase()) },
   { category: "USER", kind: "pii", re: /\bby user ([A-Za-z0-9._-]+)/gi, group: 1, keep: (v) => SYSTEM_USERS.has(v.toLowerCase()) },
 ];

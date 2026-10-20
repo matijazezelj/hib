@@ -35,7 +35,7 @@ export function loadTables(paths: string[]): Table {
   return { columns, rows };
 }
 
-export const TABLE_FILE = /\.(csv|tsv|json|jsonl|ndjson)$/i;
+export const TABLE_FILE = /\.(csv|tsv|json|jsonl|ndjson|log)$/i;
 
 /** RFC 4180-style CSV: quoted fields, doubled quotes, newlines inside quotes. */
 export function parseDelimited(text: string, delim: string): string[][] {
@@ -101,15 +101,28 @@ function convert(x: string, t: ColType): Cell {
 
 export function loadTable(path: string): Table {
   // Any other file would have its first line sent as "column names".
-  if (!TABLE_FILE.test(path)) throw new Error(`${basename(path)} is not a CSV, TSV, JSON or JSONL file`);
+  if (!TABLE_FILE.test(path)) throw new Error(`${basename(path)} is not a CSV, TSV, JSON, JSONL or JSON-lines .log file`);
   if (statSync(path).size > MAX_BYTES) throw new Error(`${basename(path)} is larger than 50 MB`);
   const text = readFileSync(path, "utf8").replace(/^﻿/, "");
   const ext = extname(path).toLowerCase();
-  if (ext === ".json" || ext === ".jsonl" || ext === ".ndjson") {
-    const records: any[] = ext === ".json" ? JSON.parse(text) : text.split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l));
-    if (!Array.isArray(records)) throw new Error("JSON must be an array of objects");
-    const columns = [...new Set(records.flatMap((r) => Object.keys(r ?? {})))];
-    const rows = records.map((r) => Object.fromEntries(columns.map((c) => [c, typeof r?.[c] === "object" && r?.[c] !== null ? JSON.stringify(r[c]) : (r?.[c] ?? null)])));
+  if (ext === ".json" || ext === ".jsonl" || ext === ".ndjson" || ext === ".log") {
+    let records: any;
+    if (ext === ".json") records = JSON.parse(text);
+    else
+      records = text.split("\n").filter((l) => l.trim()).map((l, i) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          throw new Error(`${basename(path)} line ${i + 1} isn't JSON (hib reads ${ext} files as one JSON object per line)`);
+        }
+      });
+    // An Elasticsearch / OpenSearch search response: the events are hits.hits[]._source.
+    if (!Array.isArray(records) && Array.isArray(records?.hits?.hits)) records = records.hits.hits.map((h: any) => h?._source ?? h);
+    if (!Array.isArray(records)) throw new Error("JSON must be an array of objects (or an Elasticsearch hits export)");
+    // Nested objects become dotted columns (user.name, source.ip), so each field is judged and hidden on its own.
+    const flat = records.map((r) => flatten(r));
+    const columns = [...new Set(flat.flatMap((r) => Object.keys(r)))];
+    const rows = flat.map((r) => Object.fromEntries(columns.map((c) => [c, r[c] ?? null])));
     return { columns, rows };
   }
   const delim = ext === ".tsv" ? "\t" : sniffDelimiter(text.split("\n", 1)[0] ?? "");
@@ -120,6 +133,18 @@ export function loadTable(path: string): Table {
   const types = header.map((_, i) => inferType(body.map((r) => (r[i] ?? "").trim())));
   const rows = body.map((r) => Object.fromEntries(header.map((h, i) => [h, convert((r[i] ?? "").trim(), types[i]!)])));
   return { columns: header, rows };
+}
+
+function flatten(value: any, prefix = "", out: Record<string, Cell> = {}): Record<string, Cell> {
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    for (const [k, v] of Object.entries(value)) flatten(v, prefix ? `${prefix}.${k}` : k, out);
+    return out;
+  }
+  const key = prefix || "value";
+  // A one-element list of scalars (ECS host.ip: ["10.0.0.5"]) is that scalar; anything else stays JSON in one cell.
+  if (Array.isArray(value)) out[key] = value.length === 1 && (value[0] === null || typeof value[0] !== "object") ? value[0] : JSON.stringify(value);
+  else out[key] = value ?? null;
+  return out;
 }
 
 const IDENTIFYING_NAME = /user|login|name|e-?mail|mail|phone|mobile|tel|\bip\b|ip_?addr|address|addr|street|zip|postal|ssn|oib|jmbg|iban|account|card|passport|birth|dob|token|password|secret|host|device|mac_?addr|uuid|guid|person|employee|customer|client|owner/i;
@@ -135,7 +160,8 @@ function columnType(rows: Record<string, Cell>[], col: string): ColType {
 /** Identifying columns: by name, or because their values look like emails, IPs or phone numbers. */
 export function isIdentifying(name: string, rows: Record<string, Cell>[]): boolean {
   if (columnType(rows, name) === "boolean") return false; // a yes/no flag ("known_abuser") identifies no one
-  if (IDENTIFYING_NAME.test(name)) return true;
+  // A nested field is judged by its path without a trailing ".name": user.name and host.name identify, process.name doesn't.
+  if (IDENTIFYING_NAME.test(name.includes(".") ? name.replace(/\.name$/i, "") : name)) return true;
   if (columnType(rows, name) !== "string") return false; // numbers and ISO dates aren't emails, IPs or phones
   const sample = rows.slice(0, 200).map((r) => r[name]).filter((x): x is string => typeof x === "string");
   return sample.length > 0 && sample.filter((x) => IDENTIFYING_VALUE.test(x)).length / sample.length > 0.3;

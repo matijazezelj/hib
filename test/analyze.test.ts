@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTable, parseDelimited, profile } from "../src/analyze/table";
+import { columnsToHide } from "../src/analyze/pseudo";
 import { runAnalysis } from "../src/analyze/sandbox";
 
 const CSV = `username,full_name,email,department,phone,last_login_ip,salary,active,joined
@@ -32,6 +33,18 @@ describe("table loading", () => {
     expect(loadTable(file("a.tsv", "x\ty\n1\t2\n")).rows).toEqual([{ x: 1, y: 2 }]);
     expect(loadTable(file("a.json", '[{"x":1},{"x":2,"y":"z"}]')).rows).toEqual([{ x: 1, y: null }, { x: 2, y: "z" }]);
     expect(loadTable(file("a.jsonl", '{"x":1}\n{"x":2}\n')).rows.length).toBe(2);
+  });
+  test("nested JSON becomes dotted columns; one-element lists are their value", () => {
+    const t = loadTable(file("e.jsonl", '{"user":{"name":"jdoe","roles":["a","b"]},"host":{"ip":["10.0.0.5"]},"process":{"name":"cmd.exe"}}\n'));
+    expect(t.columns).toEqual(["user.name", "user.roles", "host.ip", "process.name"]);
+    expect(t.rows[0]).toEqual({ "user.name": "jdoe", "user.roles": '["a","b"]', "host.ip": "10.0.0.5", "process.name": "cmd.exe" });
+    expect(columnsToHide(t)).toEqual(["user.name", "user.roles", "host.ip"]); // process.name is a program, not a person
+  });
+  test("Elasticsearch exports and JSON-lines .log files load; a plain-text log says why it doesn't", () => {
+    const es = { took: 3, hits: { total: { value: 2 }, hits: [{ _id: "1", _source: { user: { name: "jdoe" } } }, { _id: "2", _source: { user: { name: "ana" } } }] } };
+    expect(loadTable(file("export.json", JSON.stringify(es))).rows).toEqual([{ "user.name": "jdoe" }, { "user.name": "ana" }]);
+    expect(loadTable(file("events.log", '{"a":1}\n{"a":2}\n')).rows.length).toBe(2);
+    expect(() => loadTable(file("syslog.log", "Oct 16 10:00:01 host sshd[1]: Accepted password for jdoe\n"))).toThrow("line 1 isn't JSON");
   });
   test("ids with leading zeros stay strings", () => {
     expect(loadTable(file("z.csv", "zip\n01000\n10000\n")).rows[0]!.zip).toBe("01000");
@@ -97,7 +110,7 @@ describe("sandboxed run", () => {
 });
 
 describe("pseudonymise by column", async () => {
-  const { pseudonymize, columnsToHide, categoryFor } = await import("../src/analyze/pseudo");
+  const { pseudonymize, categoryFor } = await import("../src/analyze/pseudo");
   const { Vault } = await import("../src/guard/vault");
   const t = loadTable(file("users.csv", CSV));
 
@@ -116,6 +129,35 @@ describe("pseudonymise by column", async () => {
     const csv = pseudonymize(t, ["email"], v);
     expect(csv.match(/@\[HIBab12-DOMAIN-1\]/g)!.length).toBe(3);
     expect(v.restore("[HIBab12-EMAIL-2]@[HIBab12-DOMAIN-1]")).toBe("marija.kovac@acme.io");
+  });
+  test("a hidden value written into another column gets the same token there", () => {
+    const v = new Vault("ab12");
+    const notes = loadTable(
+      file("notes.csv", 'full_name,email,city,notes\nJosip Müller,josip@acme.io,Zagreb,"follow up with josip   müller (re: josip@acme.io); ask Ana"\nAna Horvat,ana@acme.io,Split,"Called Ana Horvat. Josipa says hi"\n'),
+    );
+    const csv = pseudonymize(notes, ["full_name", "email"], v);
+    const [, r1, r2] = csv.split("\n");
+    expect(r1).toBe('[HIBab12-FULL-NAME-1],[HIBab12-EMAIL-1]@[HIBab12-DOMAIN-1],Zagreb,follow up with [HIBab12-FULL-NAME-1] (re: [HIBab12-EMAIL-1]@[HIBab12-DOMAIN-1]); ask Ana');
+    expect(r2).toBe("[HIBab12-FULL-NAME-2],[HIBab12-EMAIL-2]@[HIBab12-DOMAIN-1],Split,Called [HIBab12-FULL-NAME-2]. Josipa says hi");
+    expect(v.restore(r1!)).toContain("follow up with Josip Müller (re: josip@acme.io)");
+  });
+  test("SIEM events: users and hosts are hidden in messages, domains, paths and command lines too", () => {
+    const ev = (u: string, h: string) =>
+      JSON.stringify({ user: { name: u, domain: "CORP" }, host: { name: h }, process: { name: "net.exe", command_line: `C:\\Users\\${u}\\x.exe /user:CORP\\${u}` }, message: `CORP\\${u} logon to ${h.toLowerCase()}.` });
+    const t = loadTable(file("siem.jsonl", `${ev("a.kovac", "WS-ZG-0142")}\n${ev("jdoe", "WS-ZG-0142")}\n`));
+    const v = new Vault("ab12");
+    const csv = pseudonymize(t, columnsToHide(t), v);
+    for (const real of ["a.kovac", "jdoe", "WS-ZG-0142", "ws-zg-0142", "CORP"]) expect(csv).not.toContain(real);
+    expect(csv).toContain("net.exe");
+    expect(csv.split("\n")[1]).toContain("[HIBab12-USER-DOMAIN-1]\\[HIBab12-USER-NAME-1] logon to [HIBab12-HOST-NAME-1].");
+  });
+  test("the guard runs per cell, so a password at the end of a cell can't swallow the next one", async () => {
+    const { obfuscateText } = await import("../src/guard");
+    const { parseConfig, DEFAULT_TOML } = await import("../src/config");
+    const cfg = parseConfig(Bun.TOML.parse(DEFAULT_TOML) as any, "/tmp/hib-test");
+    const t = loadTable(file("p.jsonl", JSON.stringify({ process: { command_line: "net user jdoe S3cret!9 /add" }, message: "next cell" }) + "\n"));
+    const v = new Vault("ab12");
+    expect(pseudonymize(t, [], v, (x) => obfuscateText(v, x, "standard", cfg)).split("\n")[1]).toBe("net user jdoe [HIBab12-PASSWORD-1] /add,next cell");
   });
   test("hide and keep override the defaults; categories are token-safe", () => {
     expect(columnsToHide(t, ["salary"], ["phone"])).toEqual(["username", "full_name", "email", "last_login_ip", "salary"]);
