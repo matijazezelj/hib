@@ -5,6 +5,7 @@ export interface VaultState {
   entries: [string, string][]; // value -> token core
   counters: [string, number][];
   nets: [string, number][];
+  aliases?: [string, string][]; // name key -> token core
 }
 
 /**
@@ -18,6 +19,7 @@ export class Vault {
   private toValue = new Map<string, string>();
   private counters = new Map<string, number>();
   private nets = new Map<string, number>();
+  private aliases = new Map<string, string>();
 
   constructor(tag = crypto.getRandomValues(new Uint8Array(2)).reduce((s, b) => s + b.toString(16).padStart(2, "0"), "")) {
     this.tag = tag;
@@ -27,20 +29,30 @@ export class Vault {
     const v = new Vault(state.tag);
     for (const [value, core] of state.entries) {
       v.toToken.set(value, core);
-      v.toValue.set(core, value);
+      if (!v.toValue.has(core)) v.toValue.set(core, value); // the first form a token was made for; later forms are aliases
     }
     v.counters = new Map(state.counters);
     v.nets = new Map(state.nets);
+    v.aliases = new Map(state.aliases ?? []);
     return v;
   }
 
   state(): VaultState {
-    return { tag: this.tag, entries: [...this.toToken], counters: [...this.counters], nets: [...this.nets] };
+    return { tag: this.tag, entries: [...this.toToken], counters: [...this.counters], nets: [...this.nets], aliases: [...this.aliases] };
   }
 
-  token(category: string, value: string): string {
+  /**
+   * The token for a value. With a name `key`, every form of one name (`Ivana Babić`, `ivana_babic`, `IvanaBabic`) gets
+   * the token the first form got; restoring it gives that first form back.
+   */
+  token(category: string, value: string, key?: string): string {
     const existing = this.toToken.get(value);
     if (existing) return existing;
+    const alias = key ? this.aliases.get(key) : undefined;
+    if (alias) {
+      this.toToken.set(value, alias);
+      return alias;
+    }
     if (category.startsWith("IP-") && /^\d+\.\d+\.\d+\.\d+$/.test(value)) {
       const net = value.split(".").slice(0, 3).join(".");
       if (!this.nets.has(net)) this.nets.set(net, this.nets.size + 1);
@@ -51,7 +63,19 @@ export class Vault {
     const core = `HIB${this.tag}-${category}-${n}`;
     this.toToken.set(value, core);
     this.toValue.set(core, value);
+    if (key) this.aliases.set(key, core);
     return core;
+  }
+
+  /** `text` with each finding's span replaced by its token. Findings must not overlap and be sorted by start. */
+  replace(text: string, findings: Finding[]): string {
+    let out = "";
+    let pos = 0;
+    for (const f of findings) {
+      out += text.slice(pos, f.start) + `[${this.token(f.category, f.value, f.key)}]`;
+      pos = f.end;
+    }
+    return out + text.slice(pos);
   }
 
   lookup(core: string): string | undefined {
@@ -64,13 +88,7 @@ export class Vault {
 
   obfuscate(text: string, opts: DetectOptions): { text: string; findings: Finding[] } {
     const findings = detect(text, opts);
-    let out = "";
-    let pos = 0;
-    for (const f of findings) {
-      out += text.slice(pos, f.start) + `[${this.token(f.category, f.value)}]`;
-      pos = f.end;
-    }
-    return { text: out + text.slice(pos), findings };
+    return { text: this.replace(text, findings), findings };
   }
 
   /** Matches tokens with or without brackets, since models sometimes drop them. */

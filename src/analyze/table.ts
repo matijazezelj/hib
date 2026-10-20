@@ -204,7 +204,11 @@ const THING_NAME = /^(?:method|service|log|event|program|process|app|application
 const DESCRIPTOR = /[_-](?:type|kind|version|count|status|TYPE|KIND|VERSION|COUNT|STATUS)$|[a-z](?:Type|Kind|Version|Count|Status)$/;
 // A client's software, not a customer: client_id (an OAuth app), client_type, clientOsVersion.
 const CLIENT_META = /^client[_-]?(?:id|type|os|version|app|platform|software|lib|agent|build|locale|lang)/i;
-const IDENTIFYING_VALUE = /@[\w-]+\.\w|^\d{1,3}(\.\d{1,3}){3}$|^\+?\d[\d\s()-]{7,}$/;
+// Internal FQDNs (dc01.corp.acme.local) name a machine, whatever the column is called.
+const IDENTIFYING_VALUE = /@[\w-]+\.\w|^\d{1,3}(\.\d{1,3}){3}$|^\+?\d[\d\s()-]{7,}$|^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:internal|local|lan|corp|intra|intranet|private|home|localdomain)$/i;
+// Machine names in SIEM events: Wazuh's agent.name and manager.name, ECS observer.name. Only the name leaf: agent.version
+// and agent.type say nothing about a machine.
+const MACHINE_NAME = /(?:^|\.)(?:agent|manager|observer)\.(?:name|hostname)$/i;
 
 /** The part of a column path its name is judged by: no trailing ".name", no thing names or descriptors. */
 function judgedName(column: string): string {
@@ -217,7 +221,7 @@ function judgedName(column: string): string {
 /** Identifying by name alone: hard identifiers always, soft words for strings, and for numbers and dates only as ids. */
 function identifyingName(column: string, type: ColType): boolean {
   const judged = judgedName(column);
-  if (HARD_NAME.test(judged)) return true;
+  if (HARD_NAME.test(judged) || (MACHINE_NAME.test(column) && type === "string")) return true;
   if (!SOFT_NAME.test(judged) && !CAMEL_IP.test(judged)) return false;
   return type === "string" || ID_LIKE.test(column.split(".").pop()!);
 }

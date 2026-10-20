@@ -2,7 +2,7 @@ import type { Infer, RawToken } from "../../src/guard/ner";
 
 /** Stand-in for the model: tags known entities (case-sensitive, like the cased BERT) in order of appearance. */
 const KNOWN: [string, string][] = [
-  ["Marija Horvat", "PER"], ["Ivan Kovačević", "PER"], ["Luka Novak", "PER"], ["Ivo Ivić", "PER"], ["Petra Learner", "PER"], ["Zagreb", "LOC"], ["Pula", "LOC"],
+  ["Marija Horvat", "PER"], ["Ivan Kovačević", "PER"], ["Luka Novak", "PER"], ["Ivo Ivić", "PER"], ["Petra Learner", "PER"], ["Ivana Babić", "PER"], ["Ivana Babic", "PER"],["Zagreb", "LOC"], ["Pula", "LOC"],
   ["Infobip", "ORG"], ["Redis", "ORG"], ["Acme", "ORG"],
 ];
 export const fakeInfer: Infer = async (text) => {

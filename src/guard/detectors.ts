@@ -11,6 +11,7 @@ export interface Finding {
   category: string; // token label, e.g. AWS-KEY, IP-INTERNAL, USER
   kind: Kind;
   absorbed?: string[]; // categories of overlapping findings merged into this one, so policies still see them
+  key?: string; // a person's name folded ("ivana babic"): every written form of it shares one token
 }
 
 interface Detector {

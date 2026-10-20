@@ -49,14 +49,17 @@ export function pseudonymizeWithSpans(
   vault: Vault,
   keep: string[],
   guard: (text: string) => string = (t) => t,
-): { csv: string; kept: [number, number][]; text: [number, number][] } {
+  guardKept = false, // Read copies: kept columns stay readable but still get the guard; `kept` then only spares them name detection
+): { csv: string; kept: [number, number][]; text: [number, number][]; cells: [number, number][] } {
   const kept: [number, number][] = [];
   const text: [number, number][] = []; // readable free-text cells (4+ words): tokenised whole if name detection can't reach them
+  const all: [number, number][] = []; // every cell, so findings made over the whole CSV can be held to one cell
   const keepSet = new Set(keep);
   let csv = "";
   const line = (cells: string[], keepFlags: boolean[]) => {
     cells.forEach((c, i) => {
       if (i) csv += ",";
+      all.push([csv.length, csv.length + c.length]);
       if (keepFlags[i] && c) kept.push([csv.length, csv.length + c.length]);
       else if (c.trim().split(/\s+/).length >= 4) text.push([csv.length, csv.length + c.length]);
       csv += c;
@@ -93,11 +96,11 @@ export function pseudonymizeWithSpans(
         const v = r[c];
         if (v === null || v === undefined || v === "") return csvCell(v);
         if (hidden.has(c)) return csvCell(tok(c, String(v)));
-        return csvCell(typeof v === "string" && !keepSet.has(c) ? guard(replaceKnownEncoded(replaceKnown(v, known, maxWords), known, maxWords, vault)) : v);
+        return csvCell(typeof v === "string" && (guardKept || !keepSet.has(c)) ? guard(replaceKnownEncoded(replaceKnown(v, known, maxWords), known, maxWords, vault)) : v);
       }),
       flags,
     );
-  return { csv, kept, text };
+  return { csv, kept, text, cells: all };
 }
 
 /** An encoded blob (`python3 -c <base64>`) that decodes to text naming a hidden value goes out as one token. */

@@ -277,6 +277,17 @@ describe("SIEM columns: what happened stays readable, who stays hidden", () => {
     })));
     expect(Object.entries(got).filter(([, by]) => by !== "name")).toEqual([]);
   });
+  test("machine-name columns are hidden by name (agent.name, manager.name, observer.name…), and internal FQDNs by value", async () => {
+    const got = await judge([0, 1].map((i) => ({
+      agent: { name: `ws-zg-014${i}`, version: "v4.7.2", type: "wazuh" }, manager: { name: "wazuh-mgr-01" }, predecoder: { hostname: `fw0${i}` },
+      host: { hostname: `LAPTOP-8KQ2M${i}` }, observer: { name: `edge-fw-0${i}` }, device: { name: `iPhone-${i}` }, decoder: { name: "sshd" },
+      peer: `dc0${i + 1}.corp.acme.local`, site: "Zagreb office, second floor",
+    })));
+    expect(got).toEqual({
+      "agent.name": "name", "agent.version": null, "agent.type": null, "manager.name": "name", "predecoder.hostname": "name", "host.hostname": "name",
+      "observer.name": "name", "device.name": "name", "decoder.name": null, peer: "value", site: null,
+    });
+  });
   test("JSON stored in a string cell (Wazuh full_log) is flattened, each field judged on its own", async () => {
     const { obfuscateText } = await import("../src/guard");
     const { parseConfig, DEFAULT_TOML } = await import("../src/config");
@@ -289,7 +300,7 @@ describe("SIEM columns: what happened stays readable, who stays hidden", () => {
     expect(t.columns).not.toContain("full_log");
     expect(t.columns).toContain("full_log.protoPayload.requestMetadata.callerIp");
     const hide = columnsToHide(t);
-    expect(hide).toEqual(["full_log.protoPayload.authenticationInfo.principalEmail", "full_log.protoPayload.requestMetadata.callerIp"]);
+    expect(hide).toEqual(["agent.name", "full_log.protoPayload.authenticationInfo.principalEmail", "full_log.protoPayload.requestMetadata.callerIp"]);
     const v = new Vault("ab12");
     const csv = pseudonymize(t, hide, v, (x) => obfuscateText(v, x, "standard", cfg));
     for (const real of ["ana.kovac", "jdoe", "acme-corp", "198.51.100"]) expect(csv).not.toContain(real);

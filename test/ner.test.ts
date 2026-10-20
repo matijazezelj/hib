@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { isLowerProse, mergeTokens, nerFindings, nerScan, proseSegments } from "../src/guard/ner";
+import { deslug, fold, isLowerProse, mergeTokens, nerFindings, nerScan, proseSegments } from "../src/guard/ner";
+import { Vault } from "../src/guard/vault";
 import { fakeInfer } from "./helpers/fake-ner";
 
 describe("NER helpers", () => {
@@ -124,4 +125,77 @@ test("a lowercase name next to a capitalised city in the same clause is still fo
   expect(values).toContain("Zagreb");
   // the title-cased pass never adds capitalised words of its own
   expect(values).not.toContain("Met");
+});
+
+describe("names in slugs, URLs and code", () => {
+  const guard = async (text: string) => {
+    const v = new Vault("ab12");
+    return { v, out: v.obfuscate(text, { level: "standard", extra: await nerFindings(text, fakeInfer) }).text };
+  };
+  const persons = (out: string) => [...new Set(out.match(/\[HIBab12-PERSON-\d+\]/g) ?? [])];
+
+  test("a Slack file's title, stored name and URL: the slug form gets the token the title got", async () => {
+    const text = [
+      "title: #3077649 - Ivana Babić Learner - new contact form from the website Contact page",
+      "name: _3077649_-_ivana_babic_learner_-_new_contact_form_from_the_website_contact_page.pdf",
+      "url: https://files.slack.com/files-pri/T0XXXX-F0XXXX/_3077649_-_ivana_babic_learner_-_new_contact_form_from_the_website_contact_page.pdf",
+    ].join("\n");
+    const { v, out } = await guard(text);
+    expect(out).not.toMatch(/ivana|babi/i);
+    expect(persons(out)).toEqual(["[HIBab12-PERSON-1]"]);
+    expect(out.match(/\[HIBab12-PERSON-1\]/g)!.length).toBe(3);
+    expect(out).toContain("_3077649_-_[HIBab12-PERSON-1]_learner_-_new_contact_form");
+    // the vault keeps the alias, and the token restores to the readable form
+    const again = Vault.from(v.state());
+    expect(again.token("PERSON", "IVANA-BABIC", "ivana babic")).toBe("HIBab12-PERSON-1");
+    expect(again.restore("[HIBab12-PERSON-1]")).toBe("Ivana Babić");
+  });
+
+  test("the slug pass alone: a kebab-case URL and a percent-encoded file name, with no readable form anywhere", async () => {
+    for (const text of ["see https://intranet.example.org/people/ivana-babic-cv for details", "attached /files/Ivana%20Babi%C4%87.pdf yesterday"]) {
+      const { out } = await guard(text);
+      expect(out).not.toMatch(/ivana|babi/i);
+    }
+    const f = await nerFindings("see https://intranet.example.org/people/ivana-babic-cv", fakeInfer);
+    expect(f.map((x) => [x.value, x.category, x.key])).toEqual([["ivana-babic", "PERSON", "ivana babic"]]);
+  });
+
+  test("a camelCase variant gets the same token through spreading", async () => {
+    const { out } = await guard('Ticket from Ivana Babić.\nconst IvanaBabicRecord = load("IvanaBabic");');
+    expect(out).not.toMatch(/ivana|babi/i);
+    expect(out).toContain('const [HIBab12-PERSON-1]Record = load("[HIBab12-PERSON-1]");');
+  });
+
+  test("a name in a code string literal is caught through spreading, though code is never scanned", async () => {
+    const { out } = await guard('Ivana Babić asked for a refund.\n```py\nif "ivana babic" in s:\n    refund(s)\n```');
+    expect(out).toContain('if "[HIBab12-PERSON-1]" in s:');
+    expect(persons(out)).toEqual(["[HIBab12-PERSON-1]"]);
+  });
+
+  test("a name inside a decoded payload spreads to the rest of the input", async () => {
+    const blob = Buffer.from('print("lookup Ivana Babić")').toString("base64");
+    const { out } = await guard(`python3 -c ${blob}\nuser=IvanaBabic`);
+    expect(out).not.toMatch(/ivana|babi/i);
+  });
+
+  test("single words never spread: a lone 'dover' or 'turner' stays readable, and so does one part of a found name", async () => {
+    expect(await nerFindings("cd dover && grep turner build.log", fakeInfer)).toEqual([]);
+    const { out } = await guard("Ivana Babić called.\nfind . -name babic; echo ivana; ship to dover, ask turner");
+    for (const word of ["babic", "ivana", "dover", "turner"]) expect(out).toContain(word);
+  });
+
+  test("out of budget, every file name it didn't de-slug goes whole, before the point prose scanning reached too", async () => {
+    // The code line isn't prose, so the prose scan "reaches" past it before the budget stops it.
+    const text = 'const p = load("/files/ivana-babic-cv.pdf");\nplease check this file again today';
+    const r = await nerScan(text, fakeInfer, { deadline: Date.now() - 1 });
+    expect(r.scannedTo).toBeGreaterThan(text.indexOf("/files"));
+    expect(r.findings.map((f) => [f.value, f.category])).toContainEqual(["/files/ivana-babic-cv.pdf", "TEXT"]);
+  });
+
+  test("diacritics fold one-to-one, and a de-slugged copy maps back to the exact span", async () => {
+    expect(fold("Babić Đurđević Łódź")).toBe("babic durdevic lodz");
+    const d = deslug("_ivana_babi%C4%87.pdf");
+    expect(d.text).toBe(" Ivana Babić Pdf");
+    expect([d.from[d.text.indexOf("ć")], d.to[d.text.indexOf("ć")]]).toEqual([11, 17]);
+  });
 });
