@@ -47,6 +47,52 @@ function resultText(content: unknown): string {
   return "";
 }
 
+/** The command line and environment a Claude session starts with. */
+export function claudeLaunch(opts: StartOptions): { args: string[]; env: Record<string, string> } {
+  const args = [
+    "claude", "-p",
+    "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+    "--model", opts.model,
+    "--permission-prompts", "host", "--permission-prompt-tool", "stdio",
+    // Ask mode whatever your settings' defaultMode says, and only your own settings: a repo's .claude/ settings could
+    // add allow rules that decide calls before hib sees them, or hooks that run outside the sandbox.
+    "--permission-mode", "manual", "--setting-sources", "user",
+  ];
+  if (opts.resume) args.push("--resume", opts.resume);
+  if (opts.system) args.push("--append-system-prompt", opts.system);
+  // Agents never read hib's or the CLIs' credentials, whatever else is allowed.
+  // Nor do they write git internals (hooks and config run outside any sandbox); Claude checks this itself too.
+  // Web tools send data off the machine: they always come to hib for approval, whatever allow rules or pre-approved
+  // sites the user's own Claude settings have (ask rules win over allow rules).
+  // `//` makes a rule path absolute; each entry may be a file or a folder.
+  const denyReads = (opts.denyReads ?? []).flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]);
+  const permissions: Record<string, string[]> = { deny: [...SECRET_READS, ...denyReads, ...GIT_WRITES], ask: ["WebFetch", "WebSearch"] };
+  if (opts.askReads) {
+    // Reads (and read-only Bash like `cat`) are normally auto-allowed; asking shows every file before its content leaves.
+    permissions.ask = ["Read", "Grep", "Glob", "NotebookRead", "Bash", "Task", "Agent", "WebFetch", "WebSearch"];
+    // Sensitive sessions also ignore every MCP server but hib's own.
+    args.push("--strict-mcp-config");
+  }
+  if (opts.mcp) {
+    const { name, ...server } = opts.mcp;
+    args.push("--mcp-config", JSON.stringify({ mcpServers: { [name]: { type: "stdio", ...server } } }));
+    permissions.allow = [`mcp__${name}`]; // hib's own tool: no prompt
+  }
+  // Claude Code's Bash sandbox (Seatbelt on macOS, bubblewrap on Linux) confines every command and whatever it starts:
+  // writes stay in the folder, the network is closed, and the denied paths can't be read. Approval still goes through hib
+  // (autoAllowBashIfSandboxed off), and a command can't ask to leave the sandbox (allowUnsandboxedCommands off).
+  const sandbox = opts.sandbox
+    ? { enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, filesystem: { denyRead: opts.sandbox.denyRead, ...(opts.sandbox.allowRead ? { allowRead: opts.sandbox.allowRead } : {}) }, network: { allowedDomains: [] } }
+    : undefined;
+  const env = accountEnv(opts.account);
+  // Sensitive sessions don't load or write auto-memory: notes from earlier work (names, case details) would go out
+  // unguarded in every session, and the agent could write new ones. Both switches, as Claude Code checks either.
+  const memory = opts.askReads ? { autoMemoryEnabled: false } : {};
+  if (opts.askReads) env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+  args.push("--settings", JSON.stringify({ permissions, ...memory, ...(sandbox ? { sandbox } : {}) }));
+  return { args, env };
+}
+
 /**
  * Claude Code as a long-lived stream-json process. `--permission-prompt-tool stdio` routes every
  * permission prompt to us as a `can_use_tool` control request (without it they are denied silently).
@@ -66,43 +112,8 @@ export class ClaudeDriver implements AgentDriver {
 
   async start(opts: StartOptions) {
     this.cwd = opts.cwd;
-    const args = [
-      "claude", "-p",
-      "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-      "--model", opts.model,
-      "--permission-prompts", "host", "--permission-prompt-tool", "stdio",
-      // Ask mode whatever your settings' defaultMode says, and only your own settings: a repo's .claude/ settings could
-      // add allow rules that decide calls before hib sees them, or hooks that run outside the sandbox.
-      "--permission-mode", "manual", "--setting-sources", "user",
-    ];
-    if (opts.resume) args.push("--resume", opts.resume);
-    if (opts.system) args.push("--append-system-prompt", opts.system);
-    // Agents never read hib's or the CLIs' credentials, whatever else is allowed.
-    // Nor do they write git internals (hooks and config run outside any sandbox); Claude checks this itself too.
-    // Web tools send data off the machine: they always come to hib for approval, whatever allow rules or pre-approved
-    // sites the user's own Claude settings have (ask rules win over allow rules).
-    // `//` makes a rule path absolute; each entry may be a file or a folder.
-    const denyReads = (opts.denyReads ?? []).flatMap((p) => [`Read(/${p})`, `Read(/${p}/**)`]);
-    const permissions: Record<string, string[]> = { deny: [...SECRET_READS, ...denyReads, ...GIT_WRITES], ask: ["WebFetch", "WebSearch"] };
-    if (opts.askReads) {
-      // Reads (and read-only Bash like `cat`) are normally auto-allowed; asking shows every file before its content leaves.
-      permissions.ask = ["Read", "Grep", "Glob", "NotebookRead", "Bash", "Task", "Agent", "WebFetch", "WebSearch"];
-      // Sensitive sessions also ignore every MCP server but hib's own.
-      args.push("--strict-mcp-config");
-    }
-    if (opts.mcp) {
-      const { name, ...server } = opts.mcp;
-      args.push("--mcp-config", JSON.stringify({ mcpServers: { [name]: { type: "stdio", ...server } } }));
-      permissions.allow = [`mcp__${name}`]; // hib's own tool: no prompt
-    }
-    // Claude Code's Bash sandbox (Seatbelt on macOS, bubblewrap on Linux) confines every command and whatever it starts:
-    // writes stay in the folder, the network is closed, and the denied paths can't be read. Approval still goes through hib
-    // (autoAllowBashIfSandboxed off), and a command can't ask to leave the sandbox (allowUnsandboxedCommands off).
-    const sandbox = opts.sandbox
-      ? { enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, filesystem: { denyRead: opts.sandbox.denyRead, ...(opts.sandbox.allowRead ? { allowRead: opts.sandbox.allowRead } : {}) }, network: { allowedDomains: [] } }
-      : undefined;
-    args.push("--settings", JSON.stringify({ permissions, ...(sandbox ? { sandbox } : {}) }));
-    this.proc = Bun.spawn(args, { cwd: opts.cwd, env: accountEnv(opts.account), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const { args, env } = claudeLaunch(opts);
+    this.proc = Bun.spawn(args, { cwd: opts.cwd, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     this.readLoop();
   }
 

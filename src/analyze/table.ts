@@ -118,9 +118,11 @@ export function loadTable(path: string): Table {
       });
     // An Elasticsearch / OpenSearch search response: the events are hits.hits[]._source.
     if (!Array.isArray(records) && Array.isArray(records?.hits?.hits)) records = records.hits.hits.map((h: any) => h?._source ?? h);
-    if (!Array.isArray(records)) throw new Error("JSON must be an array of objects (or an Elasticsearch hits export)");
+    // Any other object: the records inside it ({"rows": [...]}, or {"1.2.3.4": {...}, ...} keyed by id).
+    if (!Array.isArray(records)) records = recordsIn(records) as any;
+    if (!records) throw new Error("JSON holds no list of records (an array of objects, or an object of objects)");
     // Nested objects become dotted columns (user.name, source.ip), so each field is judged and hidden on its own.
-    const flat = records.map((r) => flatten(r));
+    const flat = (records as unknown[]).map((r) => flatten(r));
     const columns = [...new Set(flat.flatMap((r) => Object.keys(r)))];
     const rows = flat.map((r) => Object.fromEntries(columns.map((c) => [c, r[c] ?? null])));
     return { columns, rows };
@@ -133,6 +135,26 @@ export function loadTable(path: string): Table {
   const types = header.map((_, i) => inferType(body.map((r) => (r[i] ?? "").trim())));
   const rows = body.map((r) => Object.fromEntries(header.map((h, i) => [h, convert((r[i] ?? "").trim(), types[i]!)])));
   return { columns: header, rows };
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+
+/** The largest set of records anywhere in a JSON value: an array of objects, or an object whose values are all objects. */
+function recordsIn(value: unknown, depth = 0): Record<string, unknown>[] | null {
+  if (depth > 4) return null;
+  let best: Record<string, unknown>[] | null = null;
+  const consider = (r: Record<string, unknown>[] | null) => {
+    if (r && r.length > (best?.length ?? 0)) best = r;
+  };
+  if (Array.isArray(value)) {
+    if (value.length && value.every(isRecord)) consider(value);
+    for (const v of value.slice(0, 50)) consider(recordsIn(v, depth + 1));
+  } else if (isRecord(value)) {
+    const entries = Object.entries(value);
+    if (entries.length >= 2 && entries.every(([, v]) => isRecord(v))) consider(entries.map(([k, v]) => ({ _key: k, ...(v as object) })));
+    for (const [, v] of entries) consider(recordsIn(v, depth + 1));
+  }
+  return best;
 }
 
 function flatten(value: any, prefix = "", out: Record<string, Cell> = {}): Record<string, Cell> {
@@ -159,12 +181,22 @@ function columnType(rows: Record<string, Cell>[], col: string): ColType {
 
 /** Identifying columns: by name, or because their values look like emails, IPs or phone numbers. */
 export function isIdentifying(name: string, rows: Record<string, Cell>[]): boolean {
-  if (columnType(rows, name) === "boolean") return false; // a yes/no flag ("known_abuser") identifies no one
+  return identifyingBy(name, rows) !== null;
+}
+
+/**
+ * Why a column identifies people or systems: its name, its values, or "text" when it's free text (log lines,
+ * descriptions) that merely contains an email here and there. Text is pseudonymised identifier by identifier, not as
+ * whole cells, so the model can still read what each row says.
+ */
+export function identifyingBy(name: string, rows: Record<string, Cell>[]): "name" | "value" | "text" | null {
+  if (columnType(rows, name) === "boolean") return null; // a yes/no flag ("known_abuser") identifies no one
   // A nested field is judged by its path without a trailing ".name": user.name and host.name identify, process.name doesn't.
-  if (IDENTIFYING_NAME.test(name.includes(".") ? name.replace(/\.name$/i, "") : name)) return true;
-  if (columnType(rows, name) !== "string") return false; // numbers and ISO dates aren't emails, IPs or phones
-  const sample = rows.slice(0, 200).map((r) => r[name]).filter((x): x is string => typeof x === "string");
-  return sample.length > 0 && sample.filter((x) => IDENTIFYING_VALUE.test(x)).length / sample.length > 0.3;
+  if (IDENTIFYING_NAME.test(name.includes(".") ? name.replace(/\.name$/i, "") : name)) return "name";
+  if (columnType(rows, name) !== "string") return null; // numbers and ISO dates aren't emails, IPs or phones
+  const sample = rows.slice(0, 200).map((r) => r[name]).filter((x): x is string => typeof x === "string" && x !== "");
+  if (!sample.length || sample.filter((x) => IDENTIFYING_VALUE.test(x)).length / sample.length <= 0.3) return null;
+  return sample.filter((x) => x.trim().split(/\s+/).length >= 4).length / sample.length >= 0.5 ? "text" : "value";
 }
 
 function synthetic(col: ColumnProfile, i: number): Cell {

@@ -26,6 +26,8 @@ const HELP = `hib — harness in a box
                               pin a folder to one account: no handoff/failover/advisor/arena,
                               no browser terminal, secrets blocked, every read needs approval
   hib workspace normal [dir]  lift that
+  hib workspace keep [col,col | none] [dir]
+                              columns a sensitive folder's Read copies leave readable (geo fields…)
   hib workspace egress [session]    what left the machine in a session (default: latest here)
   hib guard ner setup|status|off    local name/place/company detection (one-time ~180 MB model download)
   hib geo setup                     offline gazetteer for hib analyze (GeoNames cities/countries, ~3 MB download)
@@ -155,6 +157,22 @@ async function main() {
         const { Workspaces } = await import("./workspace/registry");
         const root = new Workspaces(openDb(hibHome()), loadConfig()).setPolicy(dir, null);
         console.log(`${root} is a normal workspace again (running sessions switch on their next turn)`);
+      } else if (sub === "keep") {
+        // hib workspace keep [col,col | none] [dir]. Written straight to the database, like `normal`: it loosens.
+        const arg = rest[1];
+        const target = resolve(rest[2] ?? process.cwd());
+        const { openDb } = await import("./db");
+        const { loadConfig } = await import("./config");
+        const { Workspaces } = await import("./workspace/registry");
+        const ws = new Workspaces(openDb(hibHome()), loadConfig());
+        if (!arg) {
+          const p = ws.effectivePolicy(target);
+          console.log(p ? (p.keep?.length ? `kept readable in Read copies: ${p.keep.join(", ")}` : "no columns kept; identifying columns are tokenized") : `${target} isn't sensitive`);
+        } else {
+          const keep = arg === "none" ? [] : arg.split(",").map((c) => c.trim()).filter(Boolean);
+          const root = ws.setKeep(target, keep);
+          console.log(keep.length ? `${root}: Read copies keep ${keep.join(", ")} readable (IPs, emails and keys inside them are still replaced)` : `${root}: no columns kept`);
+        }
       } else if (sub === "egress") {
         const { eligible } = await import("./workspace/registry");
         const here = eligible(process.cwd());

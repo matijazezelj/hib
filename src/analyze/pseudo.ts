@@ -1,5 +1,5 @@
 import type { Vault } from "../guard/vault";
-import { isIdentifying, type Table } from "./table";
+import { identifyingBy, type Table } from "./table";
 
 const EMAIL = /^([^@\s]+)@([^@\s]+\.[^@\s]+)$/;
 
@@ -14,9 +14,17 @@ function csvCell(v: unknown): string {
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
-/** Columns to pseudonymise by default: the identifying ones, plus `hide`, minus `keep`. */
+/**
+ * Columns to pseudonymise whole by default: the identifying ones, plus `hide`, minus `keep`. Free text that only
+ * contains identifiers stays readable here; the identifiers inside it are replaced cell by cell.
+ */
 export function columnsToHide(table: Table, hide: string[] = [], keep: string[] = []): string[] {
-  return table.columns.filter((c) => !keep.includes(c) && (hide.includes(c) || isIdentifying(c, table.rows)));
+  return table.columns.filter((c) => {
+    if (keep.includes(c)) return false;
+    if (hide.includes(c)) return true;
+    const by = identifyingBy(c, table.rows);
+    return by === "name" || by === "value";
+  });
 }
 
 /**

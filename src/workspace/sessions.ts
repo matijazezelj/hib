@@ -63,15 +63,14 @@ interface Live {
   approvedProtected: Set<string>; // protected files you approved edits to in the running turn (real paths)
 }
 
-/** A data file: CSV/TSV always; JSON only when it loads as a table (an array of records), not config like package.json. */
+/**
+ * A data file: tables and logs always, and every .json but build config, whatever its shape. That matches what the
+ * sandbox denies to commands; a JSON object or a file too large to load must not pass through Read raw instead.
+ */
 function isDataFile(path: string): boolean {
   if (!TABLE_FILE.test(path)) return false;
-  if (!/\.(json|jsonl|ndjson)$/i.test(path)) return true;
-  try {
-    return loadTable(path).rows.length > 0;
-  } catch {
-    return false;
-  }
+  if (!/\.json$/i.test(path)) return true;
+  return !CONFIG_JSON_NAME.test(basename(path)) && !/(^|[\\/])node_modules[\\/]/.test(path);
 }
 
 const DATA_EXTS = ["csv", "tsv", "jsonl", "ndjson", "log", "xls", "xlsx", "parquet", "sqlite", "sqlite3"];
@@ -81,6 +80,7 @@ const CONFIG_JSON = [
   "package.json", "package-lock.json", "tsconfig*.json", "jsconfig*.json", "composer.json", "deno.json", "biome.json",
   "turbo.json", "nx.json", "lerna.json", ".eslintrc*.json", ".prettierrc*.json", "vercel.json", "renovate.json", "angular.json",
 ];
+const CONFIG_JSON_NAME = new RegExp(`^(${CONFIG_JSON.map((n) => n.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")).join("|")})$`, "i");
 
 /**
  * A sensitive session's sandbox: commands can't read data files in the folder. On macOS that's patterns Seatbelt checks
@@ -727,12 +727,13 @@ export class WorkspaceSessions {
       let text: string, cols: string[];
       try {
         const table = loadTable(src);
-        cols = columnsToHide(table);
+        cols = columnsToHide(table, [], this.engine.workspaces.effectivePolicy(l.root)?.keep);
         // Columns first, then the guard over each readable cell, for an email or key typed into a free-text column.
         text = pseudonymize(table, cols, l.vault, (t) => obfuscateText(l.vault, t, "standard", this.cfg));
       } catch (e) {
-        // A plain-text log has no columns: it gets the guard alone (IPs, emails, users, secrets), not raw.
-        if (!/\.log$/i.test(src) || statSync(src).size > 50 * 1024 * 1024) throw e;
+        // A plain-text log or JSON that holds no records has no columns: it gets the guard alone (IPs, emails, users,
+        // secrets), never raw. Too large to load means refused.
+        if (!/\.(log|json)$/i.test(src) || statSync(src).size > 50 * 1024 * 1024) throw e;
         text = obfuscateText(l.vault, readFileSync(src, "utf8"), "standard", this.cfg);
         cols = [];
       }

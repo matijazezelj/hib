@@ -80,6 +80,7 @@ The browser home page `/` lists your workspaces, and `/?router` is the multi-mod
 ```sh
 cd ~/code/client-project
 hib workspace sensitive --account claude@work   # pin this folder (and every folder inside it) to one vendor account
+hib workspace keep source.geo.city_name,source.geo.country_name   # columns Read copies leave readable (still guarded)
 hib workspace egress                            # what left the machine in the latest session, and to whom
 hib workspace normal                            # lift it
 ```
@@ -89,8 +90,11 @@ A sensitive folder is seen by exactly one vendor account, and it must be a Claud
 - **Nothing that copies data elsewhere:** no handoff, failover, advisor, arena, or classifier call.
 - **Reads need approval.** Every file read, search, Bash command and subagent asks first, so you see each file before its contents go out. "Always" for a read covers only that directory.
 - **Secrets are blocked** in prompts outright, not just tokenized.
+- **No auto-memory.** Sensitive sessions start with Claude Code's auto-memory off (`autoMemoryEnabled: false` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), so notes from earlier work aren't sent unguarded and the agent can't write new ones. Your `CLAUDE.md` files still load: keep IDs, not names, in them.
 - **Data stays pseudonymised.** Data files (CSV/TSV, table-shaped JSON, JSON lines, Elasticsearch exports, `.log` files) reach the agent only through the Read tool, which hands it a pseudonymised copy.
   - Nested JSON is flattened into dotted columns (`user.name`, `source.ip`), so each field is judged on its own. A value hidden in one column gets the same token wherever it appears in other text (`CORP\jdoe` in a message, `C:\Users\jdoe\…` in a path), and every readable cell also goes through the regex guard.
+  - Every `.json` except build config (`package.json`, `tsconfig*.json`…, anything under `node_modules`) counts as data, whatever its shape. An object loads as the largest list of records inside it (`{"rows": [...]}`) or as an object of records keyed by id (`{"1.2.3.4": {...}}`); JSON with no records gets a regex-guarded copy; a file over 50 MB is refused. None of these is read raw.
+  - Free text (log lines, descriptions) is never tokenized as a whole cell just because some cells contain an email: the identifiers inside are replaced and the words stay, so the model can still read what each event was. Columns identifying by name (`user`, `address`, `city_name`) are tokenized whole; `hib workspace keep col,col` leaves chosen ones readable for this folder (set only at the terminal, since it loosens protection; IPs, emails and keys inside are still replaced). A name that appears only in free text stays readable: Read copies don't run name detection.
   - A `.log` that isn't JSON lines has no columns: its copy gets the regex guard alone (IPs, emails, `user=`, home folders, keys, passwords on command lines). A bare username in free text ("Failed password for jdoe") stays readable there.
   - The agent's commands can't read data files; the OS sandbox enforces it.
     - On macOS the sandbox denies data files by pattern (`*.csv`, `*.tsv`, `*.log`, `*.xlsx`, `*.parquet`, `*.sqlite`… and every `*.json` except build config like `package.json` and `tsconfig*.json`). That covers any depth, any case, files created later, symlinks, hard links, renames and copies.

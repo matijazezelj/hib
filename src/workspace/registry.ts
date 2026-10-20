@@ -12,6 +12,7 @@ export interface Policy {
   sensitive: true;
   account: string; // "claude@work": the only provider@account allowed to see this folder
   model?: string; // default model on that account
+  keep?: string[]; // columns a Read copy leaves untokenized (the guard still runs over them); set only from the CLI
 }
 
 /**
@@ -86,6 +87,20 @@ export class Workspaces {
       if (policy.model && !policy.model.startsWith(policy.account + "/")) throw new Error(`model must be on ${policy.account}, e.g. ${policy.account}/sonnet`);
     }
     this.db.run("UPDATE workspaces SET policy = ? WHERE root = ?", [policy ? JSON.stringify(policy) : null, root]);
+    return root;
+  }
+
+  /**
+   * Columns a sensitive folder's Read copies keep readable (e.g. geo fields for impossible-travel work). Loosening, so
+   * it's set only from the CLI, like lifting a policy; re-applying the policy over the API clears it.
+   */
+  setKeep(dir: string, keep: string[]): string {
+    const root = this.resolve(dir);
+    const policy = root ? this.policy(root) : null;
+    if (!root || !policy) throw new Error(`${dir} isn't a sensitive workspace itself; run this in the folder you marked with hib workspace sensitive`);
+    const next: Policy = { ...policy, ...(keep.length ? { keep } : {}) };
+    if (!keep.length) delete next.keep;
+    this.db.run("UPDATE workspaces SET policy = ? WHERE root = ?", [JSON.stringify(next), root]);
     return root;
   }
 
