@@ -171,6 +171,33 @@ test("claude: 'always' for an MCP or unknown tool covers only that exact call (n
   expect(keyFor("Grep", { pattern: "x" })).toBe("Grep"); // known tools keep their usual scope
 });
 
+test("claude: sensitive sessions start with auto-memory off (setting and env); others keep it", () => {
+  const { claudeLaunch } = require("../src/workspace/claude-driver") as typeof import("../src/workspace/claude-driver");
+  const account = { id: "claude@work", provider: "claude", name: "work", env: { CLAUDE_CONFIG_DIR: "/tmp/cfg" }, limits: {}, dirs: [] };
+  const launch = (askReads: boolean) => {
+    const { args, env } = claudeLaunch({ cwd: "/work", model: "sonnet", account, askReads } as any);
+    return { settings: JSON.parse(args[args.indexOf("--settings") + 1]!), env };
+  };
+  const sensitive = launch(true);
+  expect(sensitive.settings.autoMemoryEnabled).toBe(false);
+  expect(sensitive.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe("1");
+  expect(sensitive.env.CLAUDE_CONFIG_DIR).toBe("/tmp/cfg");
+  const normal = launch(false);
+  expect(normal.settings.autoMemoryEnabled).toBeUndefined();
+  expect(normal.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBeUndefined();
+});
+
+test("a keep-list needs the folder's own sensitive policy", async () => {
+  const { Workspaces } = await import("../src/workspace/registry");
+  const { memoryDb } = await import("../src/db");
+  const { parseConfig, DEFAULT_TOML } = await import("../src/config");
+  const { realpathSync } = await import("node:fs");
+  const reg = new Workspaces(memoryDb(), parseConfig(Bun.TOML.parse(DEFAULT_TOML) as any, tmpdir()));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "hib-keep-")));
+  reg.register(dir);
+  expect(() => reg.setKeep(dir, ["city"])).toThrow("isn't a sensitive workspace");
+});
+
 test("the registry refuses relative paths: the daemon's working directory isn't the caller's", async () => {
   const { Workspaces } = await import("../src/workspace/registry");
   const { memoryDb } = await import("../src/db");

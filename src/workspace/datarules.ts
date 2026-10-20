@@ -15,7 +15,7 @@ const HEREDOC_INTO_INTERPRETER = /(python3?|node|bun|deno|ruby|perl|php|Rscript|
 
 export const DATA_RULE_NOTE =
   "This folder is marked sensitive. Read data files (CSV, TSV, JSON, logs…) only with the Read tool: you will receive a pseudonymised copy " +
-  "in which people, accounts, IPs and similar values are placeholders like [HIB…-USER-3]. Shell commands that read data files, inline scripts " +
+  "in which people, accounts, IPs and similar values are placeholders like [HIB…-USER-3]. A JSON file that isn't a list arrives as the largest list of records inside it. Shell commands that read data files, inline scripts " +
   "(python -c, node -e, heredocs) and scripts written outside this folder are blocked. To compute something over a data file, read it with Read and reason over it, " +
   "or write a script inside this folder that the user can review.";
 

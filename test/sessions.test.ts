@@ -565,6 +565,55 @@ describe("sensitive table reads", () => {
     expect(d.updatedInput.path).not.toBe(join(root, "users.csv"));
     expect(d.updatedInput.pattern).toBe("j");
   });
+  const readOf = async (name: string) => {
+    script.current = async (_t, d, q) => {
+      q.push({ type: "permission", id: "j1", ruleKey: "read:.", call: { id: "c1", name: "Read", kind: "read", title: `Read ${name}` }, input: { file_path: join(root, name) } });
+      await d.ask("j1");
+    };
+    await turn(`read ${name}`, undefined, () => "allow", "hib/auto");
+    return drivers[drivers.length - 1]!.decisions.get("j1") as any;
+  };
+  test("a JSON object is data too: its records are pseudonymised, and JSON with no records gets a guarded copy", async () => {
+    const { writeFileSync, readFileSync } = await import("node:fs");
+    await setup();
+    writeFileSync(join(root, "report_data.json"), JSON.stringify({ meta: { by: "x" }, rows: [{ email: "jdoe@acme-corp.io", n: 1 }, { email: "ana@acme-corp.io", n: 2 }] }));
+    const report = readFileSync((await readOf("report_data.json")).updatedInput.file_path, "utf8");
+    expect(report).not.toContain("acme-corp.io");
+    expect(report).toContain("email,n");
+    writeFileSync(join(root, "notes.json"), JSON.stringify({ note: "ping soc@acme-corp.io about 185.220.101.34" }));
+    const d = await readOf("notes.json");
+    expect(d.updatedInput.file_path).not.toBe(join(root, "notes.json"));
+    const notes = readFileSync(d.updatedInput.file_path, "utf8");
+    expect(notes).not.toMatch(/acme-corp|185\.220/);
+    expect(notes).toContain("ping");
+  });
+  test("a JSON file too large to load is refused, never read raw; build config is still read normally", async () => {
+    const { writeFileSync, truncateSync, mkdirSync } = await import("node:fs");
+    await setup();
+    writeFileSync(join(root, "events.json"), "[");
+    truncateSync(join(root, "events.json"), 51 * 1024 * 1024); // sparse: no 51 MB written
+    expect(await readOf("events.json")).toMatchObject({ behavior: "deny", message: expect.stringContaining("larger than 50 MB") });
+    writeFileSync(join(root, "tsconfig.app.json"), '{"compilerOptions":{}}');
+    expect(await readOf("tsconfig.app.json")).toEqual({ behavior: "allow", updatedInput: { file_path: join(root, "tsconfig.app.json") } });
+    mkdirSync(join(root, "node_modules", "x"), { recursive: true });
+    writeFileSync(join(root, "node_modules", "x", "data.json"), '{"a":1}');
+    expect(await readOf("node_modules/x/data.json")).toEqual({ behavior: "allow", updatedInput: { file_path: join(root, "node_modules/x/data.json") } });
+  });
+  test("a folder's keep-list leaves those columns readable in Read copies, still guarded", async () => {
+    const { writeFileSync, readFileSync } = await import("node:fs");
+    await setup();
+    writeFileSync(join(root, "logins.csv"), "user,source.geo.city_name,note\njsmith,Zagreb,from 10.1.2.3\nmkovac,Vienna,ok\n");
+    const before = readFileSync((await readOf("logins.csv")).updatedInput.file_path, "utf8");
+    expect(before).not.toContain("Zagreb"); // "city_name" is identifying by name
+    engine.workspaces.setKeep(root, ["source.geo.city_name", "note"]);
+    const after = readFileSync((await readOf("logins.csv")).updatedInput.file_path, "utf8");
+    expect(after).toContain("Zagreb");
+    expect(after).toContain("Vienna");
+    expect(after).not.toContain("jsmith");
+    expect(after).not.toContain("10.1.2.3"); // kept, not exempt from the guard
+    engine.workspaces.setKeep(root, []);
+    expect(engine.workspaces.policy(root)!.keep).toBeUndefined();
+  });
   test("if the copy can't be made, the read is denied instead of falling back to the real file", async () => {
     await setup();
     script.current = async (_t, d, q) => {

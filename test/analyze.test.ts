@@ -46,6 +46,15 @@ describe("table loading", () => {
     expect(loadTable(file("events.log", '{"a":1}\n{"a":2}\n')).rows.length).toBe(2);
     expect(() => loadTable(file("syslog.log", "Oct 16 10:00:01 host sshd[1]: Accepted password for jdoe\n"))).toThrow("line 1 isn't JSON");
   });
+  test("a JSON object loads as the largest list of records inside it, or as an object of records keyed by id", () => {
+    const report = { generated: "2026-10-20", summary: { total: 3 }, rows: [{ user: "jdoe" }, { user: "ana" }, { user: "tnovak" }], tags: [{ t: "x" }] };
+    expect(loadTable(file("report_data.json", JSON.stringify(report))).rows).toEqual([{ user: "jdoe" }, { user: "ana" }, { user: "tnovak" }]);
+    const ipdata = { "185.220.101.34": { country: "DE", asn: "AS1" }, "45.155.205.99": { country: "NL", asn: "AS2" } };
+    const t = loadTable(file("ipdata.json", JSON.stringify(ipdata)));
+    expect(t.rows[0]).toEqual({ _key: "185.220.101.34", country: "DE", asn: "AS1" });
+    expect(columnsToHide(t)).toEqual(["_key"]); // the IPs, by their values
+    expect(() => loadTable(file("note.json", '{"note":"hello","n":1}'))).toThrow("no list of records");
+  });
   test("ids with leading zeros stay strings", () => {
     expect(loadTable(file("z.csv", "zip\n01000\n10000\n")).rows[0]!.zip).toBe("01000");
   });
@@ -158,6 +167,23 @@ describe("pseudonymise by column", async () => {
     const t = loadTable(file("p.jsonl", JSON.stringify({ process: { command_line: "net user jdoe S3cret!9 /add" }, message: "next cell" }) + "\n"));
     const v = new Vault("ab12");
     expect(pseudonymize(t, [], v, (x) => obfuscateText(v, x, "standard", cfg)).split("\n")[1]).toBe("net user jdoe [HIBab12-PASSWORD-1] /add,next cell");
+  });
+  test("free text that contains emails keeps its words; only the identifiers inside are replaced", async () => {
+    const { obfuscateText } = await import("../src/guard");
+    const { parseConfig, DEFAULT_TOML } = await import("../src/config");
+    const { identifyingBy } = await import("../src/analyze/table");
+    const cfg = parseConfig(Bun.TOML.parse(DEFAULT_TOML) as any, "/tmp/hib-test");
+    const log = (to: string) => `postfix/smtp: delivered message to ${to} after content filter`;
+    const t = loadTable(file("alerts.jsonl", [log("a@acme-corp.io"), log("b@acme-corp.io"), "sshd: session opened for a service account"]
+      .map((full_log, i) => JSON.stringify({ rule: { description: "Mail delivered", level: 3 }, full_log, contact: `c${i}@acme-corp.io` })).join("\n")));
+    expect(identifyingBy("full_log", t.rows)).toBe("text");
+    expect(identifyingBy("contact", t.rows)).toBe("value");
+    expect(columnsToHide(t)).toEqual(["contact"]);
+    const v = new Vault("ab12");
+    const row = pseudonymize(t, columnsToHide(t), v, (x) => obfuscateText(v, x, "standard", cfg)).split("\n")[1]!;
+    expect(row).toContain("postfix/smtp: delivered message to [HIBab12-EMAIL-");
+    expect(row).toContain("Mail delivered");
+    expect(row).not.toContain("acme-corp");
   });
   test("hide and keep override the defaults; categories are token-safe", () => {
     expect(columnsToHide(t, ["salary"], ["phone"])).toEqual(["username", "full_name", "email", "last_login_ip", "salary"]);
