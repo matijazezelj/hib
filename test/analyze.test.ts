@@ -3,8 +3,9 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadTable, parseDelimited, profile } from "../src/analyze/table";
-import { columnsToHide } from "../src/analyze/pseudo";
+import { columnsToHide, pseudonymize } from "../src/analyze/pseudo";
 import { runAnalysis } from "../src/analyze/sandbox";
+import { Vault } from "../src/guard/vault";
 
 const CSV = `username,full_name,email,department,phone,last_login_ip,salary,active,joined
 jsmith,John Smith,john.smith@acme.io,Finance,+385 91 234 5678,10.0.4.17,72000,true,2023-04-10
@@ -253,4 +254,58 @@ test("several files combine into one table with a source_file column", async () 
     { source_file: "investigation-1.csv", time: "2026-01-01T00:00:00Z", ip: "1.2.3.4", city: null },
     { source_file: "investigation-2.csv", time: "2026-01-01T01:00:00Z", ip: "5.6.7.8", city: "Tokyo" },
   ]);
+});
+
+describe("SIEM columns: what happened stays readable, who stays hidden", () => {
+  const judge = async (rows: Record<string, unknown>[]) => {
+    const { identifyingBy } = await import("../src/analyze/table");
+    const t = loadTable(file("events.jsonl", rows.map((r) => JSON.stringify(r)).join("\n")));
+    return Object.fromEntries(t.columns.map((c) => [c, identifyingBy(c, t.rows)]));
+  };
+  test("activity columns aren't identifying: <thing>Name, client software, counts and dates", async () => {
+    const got = await judge([0, 1].map((i) => ({
+      data: { gcp: { protoPayload: { methodName: "google.login.LoginService.loginSuccess", serviceName: "login.googleapis.com", resourceName: "projects/p1/logs/audit" }, logName: "projects/p1/logs/activity" } },
+      eventName: "user_login", predecoder: { program_name: i ? "sshd" : "sudo" }, client_type: "WEB", client_id: "1234567890.apps", clientOsVersion: "14.1",
+      sides: { X: { interactive_kinds: { loginSuccess: 3 + i } } }, user_type: "member", account_status: "active", last_login: "2026-10-0" + (i + 1),
+    })));
+    expect(Object.entries(got).filter(([, by]) => by !== null)).toEqual([]);
+  });
+  test("people and their machines stay hidden, by name alone (numbers and dates too for hard identifiers and ids)", async () => {
+    const got = await judge([0, 1].map((i) => ({
+      user: { name: `u${i}`, id: 100 + i }, userName: `u${i}`, displayName: `Person ${i}`, full_name: `Person ${i}`, principalEmail: "redacted", callerIp: "redacted", sourceIP: "redacted",
+      data: { srcuser: `u${i}` }, oib: 12345678901 + i, dob: `1990-01-0${i + 1}`, phone: 385911234567 + i, client: `Client ${i}`, clientName: `Client ${i}`, source_ip: "redacted",
+    })));
+    expect(Object.entries(got).filter(([, by]) => by !== "name")).toEqual([]);
+  });
+  test("JSON stored in a string cell (Wazuh full_log) is flattened, each field judged on its own", async () => {
+    const { obfuscateText } = await import("../src/guard");
+    const { parseConfig, DEFAULT_TOML } = await import("../src/config");
+    const cfg = parseConfig(Bun.TOML.parse(DEFAULT_TOML) as any, "/tmp/hib-test");
+    const alert = (who: string, ip: string) => ({
+      rule: { level: 3, description: "GCP login" }, agent: { name: "wazuh-manager" }, decoder: { name: "json" },
+      full_log: JSON.stringify({ protoPayload: { methodName: "google.login.LoginService.loginSuccess", authenticationInfo: { principalEmail: who }, requestMetadata: { callerIp: ip } }, severity: "NOTICE" }),
+    });
+    const t = loadTable(file("alerts.json", JSON.stringify({ hits: { hits: [{ _source: alert("ana.kovac@acme-corp.io", "198.51.100.7") }, { _source: alert("jdoe@acme-corp.io", "198.51.100.8") }] } })));
+    expect(t.columns).not.toContain("full_log");
+    expect(t.columns).toContain("full_log.protoPayload.requestMetadata.callerIp");
+    const hide = columnsToHide(t);
+    expect(hide).toEqual(["full_log.protoPayload.authenticationInfo.principalEmail", "full_log.protoPayload.requestMetadata.callerIp"]);
+    const v = new Vault("ab12");
+    const csv = pseudonymize(t, hide, v, (x) => obfuscateText(v, x, "standard", cfg));
+    for (const real of ["ana.kovac", "jdoe", "acme-corp", "198.51.100"]) expect(csv).not.toContain(real);
+    expect(csv).toContain("google.login.LoginService.loginSuccess");
+    expect(csv).toContain("NOTICE");
+    // A CSV export with the same column flattens too; a plain-text full_log stays one column.
+    const c = loadTable(file("alerts.csv", `id,full_log\n1,"${alert("x@acme-corp.io", "198.51.100.9").full_log.replace(/"/g, '""')}"\n2,sshd: session opened\n`));
+    expect(c.columns).toEqual(["id", "full_log.protoPayload.methodName", "full_log.protoPayload.authenticationInfo.principalEmail", "full_log.protoPayload.requestMetadata.callerIp", "full_log.severity", "full_log"]);
+    expect(c.rows[1]!.full_log).toBe("sshd: session opened");
+  });
+  test("an encoded payload naming a hidden value goes out as one token, even when no detector would match inside it", () => {
+    const blob = Buffer.from("ssh mhorvat at the bastion then tail logs").toString("base64");
+    const t = loadTable(file("sudo.jsonl", [`{"user":"mhorvat","command":"/bin/sh -c ${blob}"}`, `{"user":"ana","command":"/bin/ls -la"}`].join("\n")));
+    const v = new Vault("ab12");
+    const csv = pseudonymize(t, columnsToHide(t), v);
+    expect(csv).not.toContain(blob);
+    expect(csv).toContain("/bin/sh -c [HIBab12-BASE64-ENCODED-1]");
+  });
 });

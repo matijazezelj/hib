@@ -1,4 +1,5 @@
 // Ported from ../sib/analysis/obfuscator.py (TruffleHog-derived patterns), adapted for code-heavy prompts.
+import { encodedBlobs, encodedCategory } from "./encoded";
 
 export type Level = "minimal" | "standard" | "paranoid";
 type Kind = "secret" | "pii" | "infra" | "term";
@@ -179,6 +180,24 @@ export interface DetectOptions {
   keepPaths?: boolean; // agent mode: the CLI must open real paths, and its tool output reveals them anyway
   extra?: Finding[]; // precomputed findings for this exact text (local NER)
   exempt?: [number, number][]; // spans to leave exactly as they are (e.g. table columns the user chose to keep)
+  depth?: number; // internal: how many encodings deep this text was found
+}
+
+// Inside a decoded payload any address counts, example.org too: nobody typed it there as a documentation example.
+const ANY_EMAIL = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/;
+
+/** One finding per encoded blob whose decoded text has findings of its own (two encodings deep at most). */
+function encodedFindings(text: string, opts: DetectOptions): Finding[] {
+  const depth = opts.depth ?? 0;
+  if (depth >= 2) return [];
+  const out: Finding[] = [];
+  for (const b of encodedBlobs(text)) {
+    const inner = detect(b.decoded, { ...opts, extra: undefined, exempt: undefined, depth: depth + 1 });
+    if (!inner.length && !ANY_EMAIL.test(b.decoded)) continue;
+    const absorbed = [...new Set(inner.flatMap((f) => [f.category, ...(f.absorbed ?? [])]))];
+    out.push({ start: b.start, end: b.end, value: b.value, category: encodedCategory(b), kind: inner.some((f) => f.kind === "secret") ? "secret" : "pii", ...(absorbed.length ? { absorbed } : {}) });
+  }
+  return out;
 }
 
 /**
@@ -207,6 +226,8 @@ export function detect(text: string, opts: DetectOptions): Finding[] {
     for (const d of PARANOID.filter(use)) raw.push(...run(text, d));
     raw.push(...highEntropy(text));
   }
+  // An encoded blob with anything inside goes whole; the merge below absorbs detectors that matched part of it.
+  raw.push(...encodedFindings(text, opts));
   // Local NER goes last, so a name inside an email address or a path keeps the structured match's label.
   raw.push(...(opts.extra ?? []));
 
@@ -228,7 +249,7 @@ export function detect(text: string, opts: DetectOptions): Finding[] {
     const { start, end, members } = group;
     if (members.length === 1) return void out.push(members[0]!.f);
     const best = label(members);
-    const absorbed = [...new Set(members.map((m) => m.f.category).filter((c) => c !== best.category))];
+    const absorbed = [...new Set(members.flatMap((m) => [m.f.category, ...(m.f.absorbed ?? [])]).filter((c) => c !== best.category))];
     out.push({ ...best, start, end, value: text.slice(start, end), ...(absorbed.length ? { absorbed } : {}) });
   };
   for (const k of kept) {

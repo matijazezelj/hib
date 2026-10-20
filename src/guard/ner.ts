@@ -1,10 +1,12 @@
 // Local name/place/organisation detection: a multilingual NER model plus rules for what it misses.
 // Runs only on prose (code is skipped), entirely on this machine; findings feed the guard's vault.
 import type { Finding } from "./detectors";
+import { encodedBlobs, encodedCategory, stringLiterals } from "./encoded";
 
 export const NER_MODEL = "Xenova/bert-base-multilingual-cased-ner-hrl";
 export const NER_REVISION = "263e82c06569c8c2ac46238a7ae5107598934234"; // pinned: a model update can't change what's detected
-const MAX_CHARS = 200_000;
+const MAX_PIECE = 1000; // the model reads ~512 tokens; longer prose segments are split at a space or separator
+const MAX_RSS_GROWTH = 1024 * 1024 * 1024; // memory budget for one scan
 const LABEL: Record<string, string> = { PER: "PERSON", ORG: "ORG", LOC: "PLACE" };
 
 /** Tech names the model tends to call organisations or places; never sensitive on their own. */
@@ -108,11 +110,56 @@ export type Infer = (text: string) => Promise<RawToken[]>;
 export interface NerOptions {
   minScore?: number;
   ignore?: string[]; // user-configured terms that are never findings
+  deadline?: number; // Date.now() after which no more prose is scanned (shared across texts by runNer)
+  cells?: [number, number][]; // free-text table cells: what gets tokenised whole if the budget runs out
+  depth?: number; // internal: inside a decoded payload
+}
+
+export interface NerScan {
+  findings: Finding[];
+  scannedTo: number; // text.length when every segment was scanned; else where the budget ran out
+  tokenised: number; // free-text cells or lines tokenised whole because they weren't scanned
 }
 
 /** Findings for one text: model entities in prose plus rule-based companies and addresses. */
 export async function nerFindings(text: string, infer: Infer, opts: NerOptions = {}): Promise<Finding[]> {
-  if (text.length > MAX_CHARS) throw new Error(`text too large for name detection (${text.length} > ${MAX_CHARS} chars)`);
+  return (await nerScan(text, infer, opts)).findings;
+}
+
+/** Prose segments cut to what the model reads at once, at a space or separator where possible. */
+function chunks(segs: Segment[]): Segment[] {
+  const out: Segment[] = [];
+  for (const seg of segs) {
+    let s = 0;
+    while (seg.text.length - s > MAX_PIECE) {
+      const window = seg.text.slice(s, s + MAX_PIECE);
+      const cut = Math.max(window.lastIndexOf(" "), window.lastIndexOf(","), window.lastIndexOf("\t"));
+      const end = cut > MAX_PIECE / 2 ? s + cut + 1 : s + MAX_PIECE;
+      out.push({ start: seg.start + s, text: seg.text.slice(s, end) });
+      s = end;
+    }
+    out.push({ start: seg.start + s, text: seg.text.slice(s) });
+  }
+  return out.filter((c) => /\p{L}{2}/u.test(c.text));
+}
+
+const wordCount = (s: string) => s.trim().split(/\s+/).filter(Boolean).length;
+
+/**
+ * Name detection over any length of text, segment by segment, within a time and memory budget. What the budget doesn't
+ * reach is never passed through: free-text cells (4+ words) there are tokenised whole, and so are free-text lines outside
+ * the tables. `scannedTo` and `tokenised` say what happened, for the approval reason.
+ */
+export async function nerScan(text: string, model: Infer, opts: NerOptions = {}): Promise<NerScan> {
+  const depth = opts.depth ?? 0;
+  // Memory is measured from the first model call on, so loading the model (~500 MB) isn't charged to the scan.
+  let rss0: number | undefined;
+  const overBudget = () => (opts.deadline !== undefined && Date.now() > opts.deadline) || (rss0 !== undefined && process.memoryUsage().rss - rss0 > MAX_RSS_GROWTH);
+  const infer: Infer = async (t) => {
+    const r = await model(t);
+    rss0 ??= process.memoryUsage().rss;
+    return r;
+  };
   const ignore = new Set([...TECH, ...(opts.ignore ?? []).map((s) => s.toLowerCase())]);
   const found: Finding[] = [];
   const isWord = (c: string | undefined) => !!c && /[\p{L}\p{N}]/u.test(c);
@@ -124,7 +171,22 @@ export async function nerFindings(text: string, infer: Infer, opts: NerOptions =
     if (value.length < 2 || ignore.has(value.toLowerCase()) || /^\[?HIB[0-9a-f]{4}-/.test(value)) return;
     found.push({ start, end, value, category, kind: "pii" });
   };
-  for (const seg of proseSegments(text)) {
+  // Encoded payloads: names in a decoded script (its string literals too, since code lines aren't read as prose) hide
+  // the whole blob. A payload the budget didn't reach goes whole as well: it wasn't read, so it can't be passed.
+  const encoded: Finding[] = [];
+  for (const b of depth < 2 ? encodedBlobs(text) : []) {
+    const inner = overBudget() ? null : await nerScan(`${b.decoded}\n${stringLiterals(b.decoded)}`, infer, { ...opts, cells: undefined, depth: depth + 1 });
+    if (inner && !inner.findings.length) continue;
+    const absorbed = [...new Set(inner?.findings.map((f) => f.category) ?? [])];
+    encoded.push({ start: b.start, end: b.end, value: b.value, category: encodedCategory(b), kind: "pii", ...(absorbed.length ? { absorbed } : {}) });
+  }
+  const segs = proseSegments(text);
+  let scannedTo = text.length;
+  for (const seg of chunks(segs)) {
+    if (overBudget()) {
+      scannedTo = seg.start;
+      break;
+    }
     // Pass 1: the text as written. Pass 2: lowercase stretches title-cased, since the cased model needs capitals.
     const passes: [Segment, string, number, boolean][] = [[seg, seg.text, opts.minScore ?? 0.6, false]];
     for (const piece of lowercasePieces(seg)) passes.push([piece, piece.text.replace(/(?<![\p{L}\p{N}])\p{Ll}/gu, (c) => c.toUpperCase()), 0.9, true]);
@@ -144,26 +206,49 @@ export async function nerFindings(text: string, infer: Infer, opts: NerOptions =
     for (const m of seg.text.matchAll(ADDRESS)) add(seg.start + m.index!, seg.start + m.index! + m[0].length, "ADDRESS");
   }
   // Consistency: once a value is found, every occurrence in the prose is a finding, so a single miss by the model
-  // can't leave "Split" tokenized in one row and in clear text in the next.
-  const segs = proseSegments(text);
-  for (const v of new Map(found.map((f) => [f.value, f.category])).entries()) {
-    const [value, category] = v;
-    if (value.length < 3) continue;
-    const re = new RegExp(`(?<![\\p{L}\\p{N}])${esc(value)}(?![\\p{L}\\p{N}])`, "gu");
-    for (const seg of segs) for (const m of seg.text.matchAll(re)) add(seg.start + m.index!, seg.start + m.index! + m[0].length, category);
+  // can't leave "Split" tokenized in one row and in clear text in the next. This covers the whole text, including any
+  // part the budget didn't reach. One pass with every value, longest first.
+  const values = new Map(found.filter((f) => f.value.length >= 3).map((f) => [f.value, f.category]));
+  if (values.size) {
+    const re = new RegExp(`(?<![\\p{L}\\p{N}])(?:${[...values.keys()].sort((a, b) => b.length - a.length).map(esc).join("|")})(?![\\p{L}\\p{N}])`, "gu");
+    for (const seg of segs) for (const m of seg.text.matchAll(re)) add(seg.start + m.index!, seg.start + m.index! + m[0].length, values.get(m[0])!);
   }
+  // Out of budget: what wasn't scanned is tokenised whole. Table cells with 4+ words, and lines of 4+ words outside the
+  // tables; short cells (codes, numbers, single names) are left to the column rules and the regex guard.
+  let tokenised = 0;
+  if (scannedTo < text.length) {
+    const whole = (s: number, e: number) => {
+      found.push({ start: s, end: e, value: text.slice(s, e), category: "TEXT", kind: "pii" });
+      tokenised++;
+    };
+    const cells = opts.cells ?? [];
+    for (const [s, e] of cells) if (e > scannedTo) whole(s, e);
+    const lo = cells.reduce((m, c) => Math.min(m, c[0]), Infinity);
+    const hi = cells.reduce((m, c) => Math.max(m, c[1]), -Infinity);
+    let pos = 0;
+    for (const line of text.split("\n")) {
+      const start = pos + (line.length - line.trimStart().length);
+      const end = pos + line.trimEnd().length;
+      pos += line.length + 1;
+      if (end <= scannedTo || (start < hi && end > lo) || wordCount(line) < 4) continue;
+      whole(start, end);
+    }
+  }
+  found.push(...encoded);
   // One finding per span; adjacent same-kind findings separated only by spaces merge ("Ericsson" "Nikola Tesla"
   // -> one ORG); longest first so "Acme d.o.o." wins over "Acme" (the guard resolves remaining overlaps).
   const unique = [...new Map(found.map((f) => [`${f.start}:${f.end}`, f])).values()].sort((a, b) => a.start - b.start || b.end - a.end);
   const merged: Finding[] = [];
   for (const f of unique) {
     const last = merged[merged.length - 1];
-    if (last && last.category === f.category && f.start >= last.end && /^ +$/.test(text.slice(last.end, f.start))) {
+    // Withheld blobs and cells are one value each: two on a line keep two tokens.
+    const whole = /-ENCODED$|^TEXT$/.test(f.category);
+    if (last && !whole && last.category === f.category && f.start >= last.end && /^ +$/.test(text.slice(last.end, f.start))) {
       last.end = f.end;
       last.value = text.slice(last.start, last.end);
     } else merged.push({ ...f });
   }
-  return merged.sort((a, b) => b.end - b.start - (a.end - a.start));
+  return { findings: merged.sort((a, b) => b.end - b.start - (a.end - a.start)), scannedTo, tokenised };
 }
 
 /** Loads the pinned model on first use. Never downloads unless `allowDownload` (hib guard ner setup). */

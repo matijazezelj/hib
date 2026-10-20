@@ -346,7 +346,7 @@ test("attached tables go out pseudonymised and the answer comes back with real v
   expect(wire).toContain("Finance");
   expect(r.text).toBe("top earner: mkovac");
   const conv = engine.getConversation(r.of("conversation")[0]!.id);
-  expect(conv.messages[0].content).toContain("[attached u.csv: 2 rows; pseudonymised: username, email]");
+  expect(conv.messages[0].content).toContain("[attached attachment-1.csv: 2 rows; pseudonymised: username, email]");
   expect(conv.messages[0].content).not.toContain("jsmith");
 });
 
@@ -477,6 +477,78 @@ test("egress log: every model call is recorded with exactly what was sent (redac
   expect(full.guard).toContain("EMAIL×1");
   expect(engine.egressList({ cwd: "/tmp/somewhere" }).length).toBe(3);
   expect((engine.egressGet("last") as any).part).toBe("revision");
+});
+
+describe("SIEM exports through hib ask -f", () => {
+  const SCRIPT = 'print("lookup jane.roe@example.org and Ivo Ivić")';
+  const encodings: [string, string][] = [
+    ["base64", Buffer.from(SCRIPT).toString("base64")],
+    ["hex", Buffer.from(SCRIPT).toString("hex")],
+    ["percent", encodeURIComponent(SCRIPT)],
+  ];
+  async function attach(name: string, csv: string, extra: Partial<Parameters<Engine["chat"]>[0]> = {}) {
+    const { loadTable } = await import("../src/analyze/table");
+    const { writeFileSync } = await import("node:fs");
+    const p = join(mkdtempSync(join(tmpdir(), "hib-siem-")), name);
+    writeFileSync(p, csv);
+    return run({ messages: [{ role: "user", content: "what happened?" }], model: "alpha/fast", attachments: [{ name, path: p, table: loadTable(p) }], ...extra });
+  }
+  for (const ner of [false, true])
+    for (const [enc, blob] of encodings)
+      test(`an encoded script in a cell never reaches the wire (${enc}, name detection ${ner ? "on" : "off"})`, async () => {
+        const { fakeInfer } = await import("./helpers/fake-ner");
+        engine.cfg.guard.ner = ner;
+        engine.nerInfer = fakeInfer;
+        await attach("sudo.csv", `time,program,message\n2026-10-01T10:00:00Z,sudo,"jdoe : TTY=pts/0 ; COMMAND=/bin/python3 -c ${blob}"\n`);
+        engine.cfg.guard.ner = false;
+        const wire = JSON.stringify(sent);
+        expect(sent.length).toBe(1);
+        for (const real of [blob, "jane.roe", "Ivić", "Iv%C4%87", Buffer.from("jane.roe").toString("hex")]) expect(wire).not.toContain(real);
+        expect(wire).toMatch(/COMMAND=\/bin\/python3 -c \[HIB\w+-(BASE64|HEX|URL)-ENCODED-1\]/);
+      });
+
+  test("a 250,000-character table is scanned for names in chunks: a name only in free text isn't readable", async () => {
+    const { fakeInfer } = await import("./helpers/fake-ner");
+    engine.cfg.guard.ner = true;
+    engine.nerInfer = fakeInfer;
+    const rows = Array.from({ length: 3200 }, (_, i) => `${i},2026-10-01T10:00:00Z,"routine nightly sync finished with no changes ${i}"`);
+    rows[2500] = `2500,2026-10-01T10:00:00Z,"#3077649 - Petra Learner - new contact form"`;
+    const csv = `id,time,title\n${rows.join("\n")}\n`;
+    expect(csv.length).toBeGreaterThan(200_000);
+    const r = await attach("files.csv", csv);
+    engine.cfg.guard.ner = false;
+    expect(r.of("approval")).toEqual([]); // fully scanned: nothing to ask about
+    const wire = JSON.stringify(sent);
+    expect(wire).not.toContain("Petra Learner");
+    expect(wire).toMatch(/#3077649 - \[HIB\w+-PERSON-1\] - new contact form/);
+  });
+
+  test("out of budget, the free-text cells it didn't reach are tokenised whole and the approval says so", async () => {
+    const { fakeInfer } = await import("./helpers/fake-ner");
+    engine.cfg.guard.ner = true;
+    engine.cfg.guard.nerBudgetSec = -1;
+    engine.nerInfer = fakeInfer;
+    const p = attach("files.csv", `id,title\n1,"#3077649 - Petra Learner - new contact form"\n2,short\n`);
+    await Bun.sleep(30);
+    const [a] = engine.pendingApprovals();
+    expect(a!.reasons.join()).toMatch(/name detection ran out of budget after 0 of [\d,]+ characters; the 1 free-text cell or line it didn't reach was tokenised whole/);
+    engine.decideApproval(a!.id, true);
+    await p;
+    engine.cfg.guard.ner = false;
+    engine.cfg.guard.nerBudgetSec = 120;
+    const wire = JSON.stringify(sent);
+    expect(wire).not.toContain("Petra Learner");
+    expect(wire).toMatch(/\\n1,\[HIB\w+-TEXT-1\]\\n2,short\\n/);
+  });
+
+  test("the attachment's file name goes out neutral, in the table and in history", async () => {
+    const r = await attach("jdoe_ssh_logs.csv", "time,event\n2026-10-01T10:00:00Z,session opened\n", { persist: true });
+    const wire = JSON.stringify(sent);
+    expect(wire).not.toContain("jdoe");
+    expect(wire).toContain('<table name=\\"attachment-1.csv\\" rows=\\"1\\">');
+    const conv = engine.getConversation(r.of("conversation")[0]!.id);
+    expect(JSON.stringify(conv.messages)).not.toContain("jdoe");
+  });
 });
 
 test("--keep columns go out exactly as they are, even with name detection on; other columns stay protected", async () => {

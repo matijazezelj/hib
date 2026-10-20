@@ -92,7 +92,8 @@ A sensitive folder is seen by exactly one vendor account, and it must be a Claud
 - **Secrets are blocked** in prompts outright, not just tokenized.
 - **No auto-memory.** Sensitive sessions start with Claude Code's auto-memory off (`autoMemoryEnabled: false` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), so notes from earlier work aren't sent unguarded and the agent can't write new ones. Your `CLAUDE.md` files still load: keep IDs, not names, in them.
 - **Data stays pseudonymised.** Data files (CSV/TSV, table-shaped JSON, JSON lines, Elasticsearch exports, `.log` files) reach the agent only through the Read tool, which hands it a pseudonymised copy.
-  - Nested JSON is flattened into dotted columns (`user.name`, `source.ip`), so each field is judged on its own. A value hidden in one column gets the same token wherever it appears in other text (`CORP\jdoe` in a message, `C:\Users\jdoe\…` in a path), and every readable cell also goes through the regex guard.
+  - Nested JSON is flattened into dotted columns (`user.name`, `source.ip`), so each field is judged on its own. So is JSON stored inside a string cell, like Wazuh's `full_log`: it becomes `full_log.protoPayload.requestMetadata.callerIp` and so on, and the original column goes away. A value hidden in one column gets the same token wherever it appears in other text (`CORP\jdoe` in a message, `C:\Users\jdoe\…` in a path), and every readable cell also goes through the regex guard.
+  - Encoded payloads are opened: a base64, hex or percent-encoded run that decodes to text (`sudo … COMMAND=/bin/python3 -c <base64>`) is guarded as that text. If anything is found inside, the whole blob goes out as one placeholder (`[…-BASE64-ENCODED-1]`), never in part. Hashes and binary blobs stay as they are.
   - Every `.json` except build config (`package.json`, `tsconfig*.json`…, anything under `node_modules`) counts as data, whatever its shape. An object loads as the largest list of records inside it (`{"rows": [...]}`) or as an object of records keyed by id (`{"1.2.3.4": {...}}`); JSON with no records gets a regex-guarded copy; a file over 50 MB is refused. None of these is read raw.
   - Free text (log lines, descriptions) is never tokenized as a whole cell just because some cells contain an email: the identifiers inside are replaced and the words stay, so the model can still read what each event was. Columns identifying by name (`user`, `address`, `city_name`) are tokenized whole; `hib workspace keep col,col` leaves chosen ones readable for this folder (set only at the terminal, since it loosens protection; IPs, emails and keys inside are still replaced). A name that appears only in free text stays readable: Read copies don't run name detection.
   - A `.log` that isn't JSON lines has no columns: its copy gets the regex guard alone (IPs, emails, `user=`, home folders, keys, passwords on command lines). A bare username in free text ("Failed password for jdoe") stays readable there.
@@ -124,6 +125,8 @@ hib ask -f users.csv "which 3 people in Engineering earn the most?"
 
 **`hib analyze`: send code, not data.** The model gets only a profile of the table: column names and types, row, null and distinct counts, and three made-up rows showing the shape.
 - Columns that look identifying are marked so; their values are never shown. That means anything with a name like user, email, phone, IP or address, or values that look like emails, IPs or phone numbers.
+  - Names of things aren't people: `methodName`, `serviceName`, `logName`, `eventName`, `resourceName`, `program_name`, and descriptors like `user_type`, `client_id` (an OAuth app) or `clientOsVersion`, stay readable. `user.name`, `userName`, `displayName`, `full_name`, `principalEmail`, `callerIp` and `srcuser` stay hidden.
+  - A number or date column is identifying by name only if it looks like an id (`user_id`, `userId`) or is a hard identifier (phone, OIB, card, birth date…), so counts like `loginSuccess` stay readable.
 - `--share department` adds the real distinct values of a non-identifying column, so the model can filter on them.
 - The model writes an `analyze(rows)` function. You see it and approve it, and it runs **on your machine**:
   - in a separate process, with no `eval` or imports;
@@ -138,6 +141,8 @@ hib ask -f users.csv "which 3 people in Engineering earn the most?"
 **`hib ask -f`: pseudonymise by column**, for questions that need the model to see rows.
 - Identifying columns become stable tokens (`[…-USERNAME-7]`). An email becomes two tokens, one for the name and one for the domain, so grouping by domain still works without revealing it.
 - Numbers and categories stay readable.
+- The file goes out as `attachment-1.csv`: a name like `jdoe_ssh_logs.csv` would name a person no detector catches.
+- Encoded payloads in cells are opened and hidden whole if anything is inside, as in sensitive folders.
 - The answer comes back with real values restored.
 - `--hide col` and `--keep col` adjust which columns are tokenized.
 
@@ -167,6 +172,7 @@ Limits:
 3. **Guard** replaces secrets, IPs, emails, usernames, home paths and your configured terms with per-conversation tokens such as `[HIB3fa2-IP-INTERNAL-NET1-2]`.
    - The same value always gets the same token, and IPs that share a `NETn` share a /24, so models can still reason about relationships.
    - Private keys, DB URIs, AWS keys and your configured terms trigger **ask-first**: you approve or edit the exact text before it is sent.
+   - Base64, hex and percent-encoded runs that decode to text are guarded as that text; a blob with anything inside becomes one token (`[…-BASE64-ENCODED-1]`), and a secret inside still triggers ask-first.
 4. **Run** the CLI in chat mode, in an empty scratch dir with every tool disabled.
 5. **Restore** the real values in the streamed answer.
 6. **Advisor** (set per route): a different provider critiques the answer, and the primary model revises it if problems are found.
@@ -184,7 +190,9 @@ Pattern matching catches emails, keys and IPs, but not "Marija Horvat", "Podravk
 - **Covers:** router prompts, `hib ask -f` tables, the LLM classifier's excerpt, and prompts in sensitive workspaces.
 - **Prose only:** fenced code, inline code and code-looking lines are skipped, and a built-in list keeps tech names like Redis and Grafana from being treated as companies. Add your own with `nerIgnore = [...]` in `[guard]`.
 - **Lowercase chat** ("luka novak from infobip") gets a second pass on a title-cased copy.
-- **Fails closed:** if the model is missing or errors, the request waits for your approval and is not sent as-is. Inputs over 200 KB are refused rather than partly scanned.
+- **Fails closed:** if the model is missing or errors, the request waits for your approval and is not sent as-is.
+- **Any size, within a budget:** long input is scanned line by line in pieces the model can read, within `nerBudgetSec` (120 s by default) and a memory limit. What the budget doesn't reach is never passed through: free-text cells (4+ words) and free-text lines there become one `[…-TEXT-n]` token each, and the request waits for your approval with a reason saying how far detection got.
+- **Encoded payloads:** a base64, hex or percent-encoded blob is decoded and scanned too (its string literals as well, since code lines are skipped); a name inside hides the whole blob.
 - **Measured** on two small hand-labelled sets in English, Croatian, Serbian and German: 24/24 and 19/20 entities found, 0 and 2 code false positives, about 20 ms per typical prompt, about 600 MB of memory once loaded. It's a model, so it will miss things; it adds to the rules and doesn't replace them.
 
 ## What left the machine
@@ -202,16 +210,17 @@ Synthetic 10,000-row files with planted values, generated and measured by `bun t
 | Stage | customers.csv (1.3 MB) | siem.jsonl (5.5 MB, ECS-style) |
 |---|---:|---:|
 | Load and parse | 48 ms | 28 ms |
-| Pseudonymise by column | 73 ms | 85 ms |
-| Pseudonymise plus the regex guard on each text cell (what a sensitive folder's Read gets) | 248 ms | 434 ms |
-| Profile (all `hib analyze` sends) | 15 ms | 15 ms |
+| Pseudonymise by column | 93 ms | 154 ms |
+| Pseudonymise plus the regex guard on each text cell (what a sensitive folder's Read gets) | 280 ms | 567 ms |
+| Profile (all `hib analyze` sends) | 10 ms | 14 ms |
 | Name model load (once) | 260 ms, +470 MB | — |
 | Name detection | ≈ 23 ms a row, on ~4–5 cores | — |
 
 - Without name detection both files are guarded in under half a second each, and the whole benchmark peaks at about 200 MB. With it the process peaks around 650–850 MB, and 10k rows would take about 4 minutes.
-- `hib ask -f` refuses tables over 400,000 characters (about 1,900 rows of the CSV above), and name detection stops at 200,000 characters, after which the guard asks before sending. Bigger files go through `hib analyze`, which sends only the schema.
+- `hib ask -f` refuses tables over 400,000 characters (about 1,900 rows of the CSV above). Name detection scans all of it within its time budget; past the budget, free-text cells are tokenised whole and the guard asks before sending. Bigger files go through `hib analyze`, which sends only the schema.
 - **customers.csv:** every planted name, email, phone number and IP is hidden, including names repeated in the free-text `notes` column.
-- **siem.jsonl:** usernames, hostnames, domains, internal and public IPs, emails, Windows SIDs, URL tokens and passwords on command lines are hidden, including inside `message` and `process.command_line`. A person's name that appears only in `message` (in no identifying field) stays readable without name detection.
+- **siem.jsonl:** usernames, hostnames, domains, internal and public IPs, emails, Windows SIDs, URL tokens and passwords on command lines are hidden, including inside `message` and `process.command_line`. So are base64-encoded `python3 -c` scripts that mention a third party's address (row "encoded payload"; the regex guard alone finds the address, name detection also finds names). A person's name that appears only in `message` (in no identifying field) stays readable without name detection.
+- The pseudonymise and regex-guard rows above were rerun on 2026-10-20 after encoded payloads were added to the guard and to `siem.jsonl` (`bun test/manual/bench.ts 10000`, no name detection); the name-detection rows are from the earlier run.
 
 ## Security model
 

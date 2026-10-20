@@ -33,6 +33,7 @@ export interface GuardConfig {
   patterns: { category: string; regex: string; flags?: string }[]; // added by guard plugins
   ner: boolean; // local name/place/organisation detection (hib guard ner setup)
   nerIgnore: string[]; // words the NER should never treat as names
+  nerBudgetSec: number; // time for name detection per request; what it doesn't reach is tokenised whole, and hib asks
 }
 
 export interface Config {
@@ -121,6 +122,7 @@ askIfFindingsOver = 10
 approvalTimeoutSec = 300
 ner = false                     # local name/place/company detection; run "hib guard ner setup" first
 nerIgnore = []                  # words never treated as names (product or tech names)
+nerBudgetSec = 120              # name detection time per request; free text it doesn't reach is tokenised whole
 `;
 
 function expandHome(p: string): string {
@@ -192,6 +194,7 @@ export function parseConfig(raw: any, home: string): Config {
       patterns: [],
       ner: !!g.ner,
       nerIgnore: g.nerIgnore ?? [],
+      nerBudgetSec: g.nerBudgetSec ?? 120,
     },
   };
 }
