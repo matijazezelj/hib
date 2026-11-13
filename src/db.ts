@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE TABLE IF NOT EXISTS browser_sessions (hash TEXT PRIMARY KEY, created INTEGER); -- sha256 of a browser's session id
 CREATE TABLE IF NOT EXISTS arena (id TEXT PRIMARY KEY, ts INTEGER, class TEXT, run_a TEXT, run_b TEXT, text_b TEXT, winner TEXT);
+CREATE TABLE IF NOT EXISTS pipe_vaults (
+  name TEXT PRIMARY KEY, vault TEXT, size INTEGER, updated INTEGER -- vault: AES-GCM sealed VaultState of a hib pipe
+);
 `;
 
 export function openDb(home: string): Database {

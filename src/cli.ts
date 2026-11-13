@@ -39,6 +39,11 @@ const HELP = `hib — harness in a box
   hib analyze <file> "question" [-m model] [--share col,col] [-y]
                               analyse a CSV/TSV/JSON locally: the model sees only the schema and
                               writes code; you approve it; it runs here in a sandbox
+  hib pipe [--vault name] [--hide f,f] [--keep f,f] [--format auto|ndjson|text] [--on-error drop|redact|fail]
+                              log filter: events (NDJSON or text lines) on stdin, the same events
+                              on stdout with PII and secrets as stable tokens kept in a sealed vault
+  hib pipe restore [--vault name]   tokens on stdin back to real values (e.g. an LLM's answer)
+  hib pipe vaults | forget <name>   list the pipe vaults, or delete one
   hib conversations           list saved conversations
   hib usage                   quota per account
   hib stats                   learned scores per task class
@@ -66,6 +71,9 @@ const { values, positionals } = parseArgs({
     yes: { type: "boolean", short: "y" },
     "show-sent": { type: "boolean" },
     all: { type: "boolean" },
+    vault: { type: "string" },
+    format: { type: "string" },
+    "on-error": { type: "string" },
     help: { type: "boolean", short: "h" },
   },
 });
@@ -258,6 +266,8 @@ async function main() {
       return pluginCmd(rest);
     case "egress":
       return egressCmd(rest[0]);
+    case "pipe":
+      return pipeCmd(rest);
     case "geo": {
       if (rest[0] !== "setup") throw new Error("usage: hib geo setup");
       const { setupGeo } = await import("./analyze/geo");
@@ -423,6 +433,55 @@ async function egressCmd(which?: string) {
     if (r.guard) console.log(dim(`        guard: ${r.guard}`));
   }
   console.log(dim(`\nfull text of one: hib egress <id>   ·   latest: hib egress last`));
+}
+
+/** hib pipe: a filter between a log shipper and whatever calls an LLM. Runs locally, no daemon. Output goes to stdout only. */
+async function pipeCmd([sub, arg]: string[]) {
+  const { loadConfig } = await import("./config");
+  const { VaultStore } = await import("./guard/vaultstore");
+  const cfg = loadConfig();
+  const store = await VaultStore.open(hibHome());
+  const name = String(values.vault ?? "default");
+  if (sub === "vaults") {
+    const list = store.list();
+    if (!list.length) return console.log("no pipe vaults yet");
+    for (const v of list) console.log(`${v.name.padEnd(24)} ${String(v.size).padStart(7)} tokens  ${new Date(v.updated).toLocaleString()}`);
+    return;
+  }
+  if (sub === "forget") {
+    if (!arg) throw new Error("usage: hib pipe forget <name>");
+    if (!(await confirm(`Delete pipe vault ${arg}? Tokens already sent can't be restored afterwards.`))) return;
+    return console.log(store.delete(arg) ? `forgot ${arg}` : `no pipe vault named ${arg}`);
+  }
+  const stdout = Bun.stdout.writer();
+  const write = async (s: string) => {
+    stdout.write(s);
+    await stdout.flush();
+  };
+  if (sub === "restore") {
+    const { runRestore } = await import("./pipe");
+    await runRestore(Bun.stdin.stream(), write, await store.load(name));
+    await stdout.end();
+    return;
+  }
+  if (sub) throw new Error(`unknown pipe command ${sub}; use restore, vaults or forget`);
+  const format = String(values.format ?? "auto");
+  const onError = String(values["on-error"] ?? "redact");
+  if (!["auto", "ndjson", "text"].includes(format)) throw new Error("--format must be auto, ndjson or text");
+  if (!["drop", "redact", "fail"].includes(onError)) throw new Error("--on-error must be drop, redact or fail");
+  const list = (v: unknown) => (v ? String(v).split(",").map((s) => s.trim()).filter(Boolean) : []);
+  const { runPipe, formatStats } = await import("./pipe");
+  const { GuardState, defaultPolicy } = await import("./guard/record");
+  const vault = await store.load(name);
+  const state = new GuardState(vault);
+  const policy = defaultPolicy({ hide: list(values.hide), keep: list(values.keep), terms: cfg.guard.terms, patterns: cfg.guard.patterns });
+  const opts = { format: format as "auto" | "ndjson" | "text", onError: onError as "drop" | "redact" | "fail", saveEvery: 1000 };
+  try {
+    const stats = await runPipe(Bun.stdin.stream(), write, state, policy, opts, () => store.save(name, vault));
+    console.error(formatStats(stats, name));
+  } finally {
+    await stdout.end();
+  }
 }
 
 /** y/N question. A fresh readline per question: returning out of `for await (… of console)` closes stdin for good. */

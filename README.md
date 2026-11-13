@@ -165,6 +165,52 @@ Limits:
 - Detecting identifying columns is heuristic, so check the "identifying" list and use `--hide` for anything it missed.
 - Only Claude reads can be redirected, not Bash `cat`. In sensitive mode Bash asks, so deny it.
 
+## Log pipelines (hib pipe)
+
+`hib pipe` is a filter for log streams. It reads events on stdin (JSON lines, or plain text lines) and writes the same events on stdout with PII and secrets replaced by stable `[HIB…-CATEGORY-n]` tokens. The token map lives in a persistent sealed vault, so a value gets the same token today, tomorrow and in another run, and `hib pipe restore` turns an LLM's answer back into real values. hib doesn't call any model here: you choose what sits after the filter.
+
+```sh
+# in front of Vector (or Fluent Bit): read the guarded stream with a stdin source, then route it on as usual
+tail -F /var/log/app.jsonl | hib pipe --vault soc | vector --config vector.toml
+
+# plain shell: guard, ask a model, restore
+tail -F app.jsonl | hib pipe --vault soc | your-llm-script | hib pipe restore --vault soc
+```
+
+- **One line in, one line out**, same order. Blank lines pass through. Input is never buffered whole, so it works on a live `tail -F`.
+- **Format.** `--format auto` (default) treats a line that parses as a JSON object as an event and anything else as text. `ndjson` makes a non-JSON line an error; `text` sends every line through the text guard.
+- **Tokens are stable across runs.** The vault is named (`--vault soc`, default `default`) and stored sealed in `~/.hib/hib.db` with the same key as conversations. It's saved every 1,000 lines and when the stream ends. `hib pipe vaults` lists them, `hib pipe forget <name>` deletes one (restore stops working for its tokens).
+- **Restore.** `hib pipe restore --vault soc` rewrites tokens back to real values as the text streams through, so it can sit at the end of a pipe or read a saved answer.
+
+**How fields are classified.** Each event is judged on its own, unlike a Read copy, which looks at the whole file. A field is hidden whole when:
+- its name says it identifies someone or something (`user.name`, `source.ip`, `host.hostname`, `agent.name`, `callerIp`; the same rules as `hib analyze`, so `process.name` and `methodName` stay readable);
+- its value is an email, an IPv4 address, a phone number or an internal host name;
+- you listed it with `--hide a,b`. `--keep a,b` leaves fields readable; they still go through the regex guard.
+
+Everything else:
+- Nested JSON is flattened into dotted keys (`user.name`), JSON stored inside a string field is opened too, and the output event is flat.
+- Every readable string field goes through the regex guard on its own, so nothing is matched across two fields. Field names are schema and stay as they are.
+- A hidden value is remembered and replaced wherever it shows up later in readable text, in the same event or a later one (`CORP\jdoe`, `C:\Users\jdoe`, `jdoe@host`). A new run starts from the values already in its vault. A hidden email becomes two tokens, name and domain, so grouping by domain still works.
+- An IP address is an `IP-INTERNAL` or `IP-EXTERNAL` token whatever its field is called, with its `NETn` group, so `source.ip`, `destination.ip` and an address in a message line up.
+- Your `guard.terms` and plugin patterns apply.
+
+**When guarding a line fails**, hib never lets the original through. `--on-error` picks what goes out instead:
+- `redact` (default): `{"hib_redacted":true}` for a JSON event, `[HIB-REDACTED-LINE]` for text, so the output keeps one line per input line;
+- `drop`: nothing for that line;
+- `fail`: stop, save the vault and exit with status 1.
+
+A line that fails to parse under `--format ndjson` is handled the same way. Counts (lines, events, text lines, dropped, redacted, tokens, time) go to stderr as one line at the end.
+
+Limits:
+- No name detection in the pipe. A person's name that appears only in free text (a message, a file name) stays readable. The model that finds names takes about 80 ms an event, which a pipeline can't afford for now.
+- A bare username in a plain-text line ("Failed password for jdoe") stays readable, unless the same value was hidden earlier in a field. Structured events with a `user.name` field don't have this problem.
+- The vault grows with every new value. There's no rotation or expiry yet; `hib pipe forget` and starting a new vault name are the only ways to cut it.
+- Free text gets only the regex guard and the remembered values. An internal host name inside a command line (`-h db01.corp.acme.local`) or a password after a username (`curl -u user:pass`) stays readable unless `guard.terms` or a plugin pattern covers it.
+- Field names are judged by the same rules as tables, so some fields are hidden that needn't be (`host.os.family`, because of `host`). Use `--keep` for those.
+- Input is stdin only: no HTTP ingest yet, and no syslog or grok parsing (a syslog line is a text line).
+- The vault holds real values, sealed. Anyone who can read `~/.hib` (and `vault.key`) can restore them.
+- Tokens only mean something in the vault that made them. Restore with the same `--vault`.
+
 ## How a router request flows
 
 1. **Classify** the request as chat, code, review or long. Heuristics come first; Haiku is asked only when they're unsure. Plugin routes can add classes.

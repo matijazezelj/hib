@@ -2,7 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { basename, extname } from "node:path";
 
 export type Cell = string | number | boolean | null;
-type ColType = "integer" | "number" | "boolean" | "date" | "string";
+export type ColType = "integer" | "number" | "boolean" | "date" | "string";
 
 export interface Table {
   columns: string[];
@@ -81,7 +81,7 @@ const INT = /^-?\d+$/;
 const DATE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
 const BOOL = /^(true|false)$/i;
 
-function inferType(values: string[]): ColType {
+export function inferType(values: string[]): ColType {
   const v = values.filter((x) => x !== "");
   if (!v.length) return "string";
   if (v.some((x) => /^-?0\d/.test(x))) return "string"; // leading zeros (ids, zip codes) must survive
@@ -175,7 +175,7 @@ function jsonObjectIn(value: unknown): Record<string, unknown> | null {
 }
 const MAX_JSON_CELL = 1024 * 1024;
 
-function flatten(value: any, prefix = "", out: Record<string, Cell> = {}, depth = 0): Record<string, Cell> {
+export function flatten(value: any, prefix = "", out: Record<string, Cell> = {}, depth = 0): Record<string, Cell> {
   // JSON stored in a string is flattened like nested JSON (full_log.callerIp), so each field is judged on its own
   // instead of the whole document as one value. The original column goes away; its fields replace it.
   const inner = depth < 3 ? jsonObjectIn(value) : null;
@@ -205,7 +205,7 @@ const DESCRIPTOR = /[_-](?:type|kind|version|count|status|TYPE|KIND|VERSION|COUN
 // A client's software, not a customer: client_id (an OAuth app), client_type, clientOsVersion.
 const CLIENT_META = /^client[_-]?(?:id|type|os|version|app|platform|software|lib|agent|build|locale|lang)/i;
 // Internal FQDNs (dc01.corp.acme.local) name a machine, whatever the column is called.
-const IDENTIFYING_VALUE = /@[\w-]+\.\w|^\d{1,3}(\.\d{1,3}){3}$|^\+?\d[\d\s()-]{7,}$|^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:internal|local|lan|corp|intra|intranet|private|home|localdomain)$/i;
+export const IDENTIFYING_VALUE = /@[\w-]+\.\w|^\d{1,3}(\.\d{1,3}){3}$|^\+?\d[\d\s()-]{7,}$|^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:internal|local|lan|corp|intra|intranet|private|home|localdomain)$/i;
 // Machine names in SIEM events: Wazuh's agent.name and manager.name, ECS observer.name. Only the name leaf: agent.version
 // and agent.type say nothing about a machine.
 const MACHINE_NAME = /(?:^|\.)(?:agent|manager|observer)\.(?:name|hostname)$/i;
@@ -219,7 +219,7 @@ function judgedName(column: string): string {
 }
 
 /** Identifying by name alone: hard identifiers always, soft words for strings, and for numbers and dates only as ids. */
-function identifyingName(column: string, type: ColType): boolean {
+export function identifyingName(column: string, type: ColType): boolean {
   const judged = judgedName(column);
   if (HARD_NAME.test(judged) || (MACHINE_NAME.test(column) && type === "string")) return true;
   if (!SOFT_NAME.test(judged) && !CAMEL_IP.test(judged)) return false;
@@ -250,8 +250,11 @@ export function identifyingBy(name: string, rows: Record<string, Cell>[]): "name
   if (type !== "string") return null; // numbers and ISO dates aren't emails, IPs or phones
   const sample = rows.slice(0, 200).map((r) => r[name]).filter((x): x is string => typeof x === "string" && x !== "");
   if (!sample.length || sample.filter((x) => IDENTIFYING_VALUE.test(x)).length / sample.length <= 0.3) return null;
-  return sample.filter((x) => x.trim().split(/\s+/).length >= 4).length / sample.length >= 0.5 ? "text" : "value";
+  return sample.filter(isFreeText).length / sample.length >= 0.5 ? "text" : "value";
 }
+
+/** Free text (a log line, a description): 4+ words. Identifiers inside it are replaced one by one, not the whole cell. */
+export const isFreeText = (s: string) => s.trim().split(/\s+/).length >= 4;
 
 function synthetic(col: ColumnProfile, i: number): Cell {
   switch (col.type) {
