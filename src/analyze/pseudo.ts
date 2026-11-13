@@ -9,6 +9,13 @@ export function categoryFor(column: string): string {
   return column.toUpperCase().replace(/[^A-Z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "COL";
 }
 
+/** A hidden value as a token. Emails keep their shape: [name-token]@[DOMAIN-token], so grouping by domain still works. */
+export function tokenFor(vault: Vault, column: string, value: string): string {
+  const m = EMAIL.exec(value);
+  if (m) return `[${vault.token(categoryFor(column), m[1]!)}]@[${vault.token("DOMAIN", m[2]!)}]`;
+  return `[${vault.token(categoryFor(column), value)}]`;
+}
+
 function csvCell(v: unknown): string {
   if (v === null || v === undefined) return "";
   const s = String(v);
@@ -67,11 +74,7 @@ export function pseudonymizeWithSpans(
     csv += "\n";
   };
   const hidden = new Set(columns);
-  const tok = (col: string, v: string) => {
-    const m = EMAIL.exec(v);
-    if (m) return `[${vault.token(categoryFor(col), m[1]!)}]@[${vault.token("DOMAIN", m[2]!)}]`;
-    return `[${vault.token(categoryFor(col), v)}]`;
-  };
+  const tok = (col: string, v: string) => tokenFor(vault, col, v);
   // Tokenize the hidden columns first, so a hidden value written into another cell ("follow up with josip müller")
   // gets the same token there instead of going out readable.
   const known = new Map<string, string>();
@@ -81,12 +84,10 @@ export function pseudonymizeWithSpans(
       const v = r[c];
       if (v === null || v === undefined || v === "") continue;
       const t = tok(c, String(v));
-      const key = norm(String(v));
-      if (key.length < 3 || known.has(key)) continue;
-      const n = pieces(key).length;
-      if (n > MAX_PIECES) continue;
-      known.set(key, t);
-      maxWords = Math.max(maxWords, n);
+      const k = knownKey(String(v));
+      if (!k || known.has(k.key)) continue;
+      known.set(k.key, t);
+      maxWords = Math.max(maxWords, k.words);
     }
   line(table.columns.map((c) => csvCell(guard(c))), table.columns.map(() => false));
   const flags = table.columns.map((c) => keepSet.has(c));
@@ -104,7 +105,7 @@ export function pseudonymizeWithSpans(
 }
 
 /** An encoded blob (`python3 -c <base64>`) that decodes to text naming a hidden value goes out as one token. */
-function replaceKnownEncoded(text: string, known: Map<string, string>, maxWords: number, vault: Vault): string {
+export function replaceKnownEncoded(text: string, known: Map<string, string>, maxWords: number, vault: Vault): string {
   if (!known.size) return text;
   let out = "";
   let pos = 0;
@@ -116,15 +117,23 @@ function replaceKnownEncoded(text: string, known: Map<string, string>, maxWords:
   return out + text.slice(pos);
 }
 
-const norm = (s: string) => s.trim().replace(/\s+/g, " ").toLowerCase();
+export const norm = (s: string) => s.trim().replace(/\s+/g, " ").toLowerCase();
 // Words for matching: split on spaces and on the separators logs put around names (CORP\jdoe, C:\Users\jdoe, jdoe@host,
 // user=jdoe), but not on dots or dashes, so "a.kovac" and "WS-ZG-0142" stay whole and only match whole.
 const PIECE = /[^\s\\/:=,;()"'<>|@[\]{}]+/g;
-const pieces = (s: string) => [...s.matchAll(PIECE)].map((m) => ({ start: m.index!, end: m.index! + m[0].length }));
-const MAX_PIECES = 8;
+export const pieces = (s: string) => [...s.matchAll(PIECE)].map((m) => ({ start: m.index!, end: m.index! + m[0].length }));
+export const MAX_PIECES = 8;
+
+/** How a hidden value is looked up in free text, or null when it's too short or too long to look for. */
+export function knownKey(value: string): { key: string; words: number } | null {
+  const key = norm(value);
+  if (key.length < 3) return null;
+  const words = pieces(key).length;
+  return words > MAX_PIECES ? null : { key, words };
+}
 
 /** Replaces whole-word occurrences of known values (any case, any spacing) with their tokens. Longest match wins. */
-function replaceKnown(text: string, known: Map<string, string>, maxWords: number): string {
+export function replaceKnown(text: string, known: Map<string, string>, maxWords: number): string {
   if (!known.size) return text;
   const words = pieces(text);
   let out = "";

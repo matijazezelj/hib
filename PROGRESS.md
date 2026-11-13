@@ -8,7 +8,7 @@ _Last updated: 2026-10-20_
 ## Where it stands
 
 hib is usable day to day: a local daemon, a terminal agent (`hib`), a web workspace (`hib serve`), a multi-model chat, and an
-OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (338 tests,
+OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (389 tests,
 2 of them Linux-only) on Ubuntu and macOS.
 
 A full security audit ran on 2026-10-09 (daemon surface, agent permissions, guard/egress, analyze/plugins/web). All of
@@ -94,6 +94,11 @@ Known issues and in order under Next.
   - Encoded payloads: a base64 run glued to a path (`/tmp/<base64>`, `/upload/<base64>/raw`) is tried in pieces cut at slashes, longest first; gzip and zlib (magic bytes) are inflated with `maxOutputLength` = min(10× input, 1 MB).
   - Machine-name columns: `agent.name`, `manager.name`, `observer.name` (and `.hostname`) are hidden by name (`MACHINE_NAME`, only those leaves, so `agent.version` stays readable); `host.hostname`, `predecoder.hostname` and `device.name` already were. Values that are internal FQDNs (`.local`, `.corp`, `.internal`, `.lan`…) make a column identifying.
   - Benchmark: `siem.jsonl` has a `file.name` slug per row; with `--ner` both files are recounted after name detection on a 500-row sample (README: slug names 3/3 readable without it, 0/3 with it). It covers an allow-listed MCP proxy run by the daemon with the session vault, and guarding Bash output. The recommendation is a FIFO relay to a filter outside the sandbox, so nothing in the sandbox reaches the daemon or vault.
+- **`hib pipe`** (branch `feat/hib-pipe`). A stdin→stdout filter for log pipelines (Vector, Fluent Bit, a script). NDJSON events or plain text lines in, same lines out with `[HIB…]` tokens, one line per line, streaming.
+  - `src/guard/record.ts`: per-event guarding (`guardRecord`, `guardLine`, `GuardState`). Fields are flattened and hidden by name, by value shape (email, IPv4, phone, internal FQDN) or `--hide`; hidden values are remembered and replaced in later text; every readable string field gets the regex guard on its own.
+  - `src/guard/vaultstore.ts` + `pipe_vaults` table: named, sealed, persistent vaults, so tokens are stable across runs.
+  - `src/pipe.ts` and the CLI (`hib pipe`, `restore`, `vaults`, `forget`): `--on-error redact|drop|fail` fails closed and never emits the original line; the vault is saved every 1,000 lines and at the end.
+  - Not built: name detection in the pipe (about 80 ms an event), HTTP ingest, vault rotation or TTL, syslog/grok parsing. Bare usernames in plain text lines stay readable. Measured about 14,000 ECS-like events/s on one core (scratch bench, 20k events, Linux arm64), not yet in `test/manual/bench.ts`.
 - **Overlapping findings merge.** When findings overlap (a term, your username or a plugin pattern inside an email address; a username inside a path; NER inside an email), they become one placeholder covering all of them, so no part of any match goes out in the clear. The label is the secret's if one is involved, otherwise the widest match's (EMAIL, PATH); the other categories are kept in `absorbed`, and ask-first rules still see them. Before, the first detector won and the rest of the address leaked (`dana.horvat@[TERM-1]-logistics.io`).
 - **Guard order and coverage.**
   - Text is guarded whole, then cut (handoff transcript, PROGRESS.md, the advisor's transcript and diff, the classifier excerpt), so a cut can't strip a key's BEGIN line. The classifier gets plugin patterns and machine identities too.
