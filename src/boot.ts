@@ -29,6 +29,7 @@ export async function serve(port?: number) {
   const problem = sandboxProblem();
   events.emit("daemon.start", { mode: "daemon" }, { bind: server.hostname, port: server.port, sandbox: problem ? "unavailable" : "available" });
   if (problem) events.emit("sandbox.unavailable", { mode: "daemon" }, { reason: problem });
+  events.startHeartbeat();
   // `hib daemon stop` records its own daemon.stop; a signal (Ctrl-C on `hib serve`, systemd, kill) is a clean stop too.
   for (const sig of ["SIGTERM", "SIGINT"] as const)
     process.once(sig, () => {

@@ -41,6 +41,7 @@ export interface EventsConfig {
   dir: string; // event files only: a log collector mounts this directory alone
   maxMb: number;
   keep: number;
+  heartbeatSec: number; // daemon.alive every this many seconds; 0 = off
 }
 
 export interface Config {
@@ -137,6 +138,7 @@ enabled = true                  # security events as JSON lines, for a log colle
 # dir = "~/.hib/events"         # holds event files only; never point it at ~/.hib itself
 max_mb = 20                     # rotate events.jsonl at this size
 keep = 5                        # rotated files kept: events.jsonl.1 … .5
+heartbeat_sec = 300             # daemon.alive every 5 minutes, so a crash shows; 0 = off
 `;
 
 function expandHome(p: string): string {
@@ -220,6 +222,7 @@ export function parseConfig(raw: any, home: string): Config {
       dir: eventsDir,
       maxMb: Number(ev.max_mb ?? 20),
       keep: Number(ev.keep ?? 5),
+      heartbeatSec: Number(ev.heartbeat_sec ?? 300),
     },
   };
 }
