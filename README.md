@@ -253,6 +253,22 @@ Pattern matching catches emails, keys and IPs, but not "Marija Horvat", "Podravk
 
 The log stores the redacted text locally in `~/.hib/hib.db`, so anything the guard missed is in there too.
 
+## Security event log
+
+The daemon writes security events as JSON lines to `~/.hib/events/events.jsonl`, for a log collector to ship and alert on (the contract SIB implements is schema 1 in its `docs/hib-events-spec.md`).
+- **Events:** daemon start and stop, refused requests (bad token, Host or Origin), guard decisions, approvals waiting, tool permissions (allowed, always, denied; by you, a rule or auto mode), sandboxed commands reaching a new host, raw data reads blocked in sensitive folders, reverted changes to git hooks or tool config (critical), browser terminals opened, agent sessions starting and ending, and a missing OS sandbox.
+- **Never in it:** prompts, model or tool output, file contents, diffs, the token or vault values. Commands, URLs and guard reasons go through the guard (identifiers and secrets become `[CATEGORY]`) and are cut to 300 characters; paths are relative to the workspace.
+- Refused requests are logged once per reason and peer per minute, with a count.
+- The folder holds event files only, so a collector can mount it alone; hib refuses an `[events] dir` that is, or contains, `~/.hib`. Folder 0700, files 0600.
+
+```toml
+[events]
+enabled = true          # default
+dir = "~/.hib/events"   # default
+max_mb = 20             # rotate at this size: events.jsonl.1 … .keep
+keep = 5
+```
+
 ## Performance
 
 Synthetic 10,000-row files with planted values, generated and measured by `bun test/manual/bench.ts 10000 --ner` (rerun it to check your machine). Measured on an Apple M3 Pro (11 cores, 36 GB), macOS 27, Bun 1.4.3.

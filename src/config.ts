@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type { Level } from "./guard/detectors";
 
 export type TaskClass = "chat" | "code" | "review" | "long" | (string & {}); // plugins add more
@@ -36,6 +36,13 @@ export interface GuardConfig {
   nerBudgetSec: number; // time for name detection per request; what it doesn't reach is tokenised whole, and hib asks
 }
 
+export interface EventsConfig {
+  enabled: boolean;
+  dir: string; // event files only: a log collector mounts this directory alone
+  maxMb: number;
+  keep: number;
+}
+
 export interface Config {
   home: string;
   port: number;
@@ -48,6 +55,7 @@ export interface Config {
   accounts: Account[];
   routes: Record<string, Route> & Record<"chat" | "code" | "review" | "long", Route>;
   guard: GuardConfig;
+  events: EventsConfig;
 }
 
 export const DEFAULT_TOML = `# hib config. Model ids: <provider>[@account]/<model>, e.g. claude@work/sonnet
@@ -123,6 +131,12 @@ approvalTimeoutSec = 300
 ner = false                     # local name/place/company detection; run "hib guard ner setup" first
 nerIgnore = []                  # words never treated as names (product or tech names)
 nerBudgetSec = 120              # name detection time per request; free text it doesn't reach is tokenised whole
+
+[events]
+enabled = true                  # security events as JSON lines, for a log collector (SIB)
+# dir = "~/.hib/events"         # holds event files only; never point it at ~/.hib itself
+max_mb = 20                     # rotate events.jsonl at this size
+keep = 5                        # rotated files kept: events.jsonl.1 … .5
 `;
 
 function expandHome(p: string): string {
@@ -169,6 +183,11 @@ export function parseConfig(raw: any, home: string): Config {
     ask: !!r?.ask,
   });
   const g = raw.guard ?? {};
+  const ev = raw.events ?? {};
+  const eventsDir = resolve(expandHome(ev.dir ?? join(home, "events")));
+  // The collector mounts this directory: if it were hib's home (or held it), the token, vault key and database would go too.
+  const rel = relative(eventsDir, resolve(home));
+  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) throw new Error(`[events] dir ${eventsDir} must not be or contain hib's home (${home}): use a directory of its own`);
   return {
     home,
     port: raw.port ?? 4141,
@@ -195,6 +214,12 @@ export function parseConfig(raw: any, home: string): Config {
       ner: !!g.ner,
       nerIgnore: g.nerIgnore ?? [],
       nerBudgetSec: g.nerBudgetSec ?? 120,
+    },
+    events: {
+      enabled: ev.enabled ?? true,
+      dir: eventsDir,
+      maxMb: Number(ev.max_mb ?? 20),
+      keep: Number(ev.keep ?? 5),
     },
   };
 }

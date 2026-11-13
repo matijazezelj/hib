@@ -110,6 +110,10 @@ beforeEach(async () => {
   );
 });
 
+/** Security events written so far (the event log, as SIB reads it). */
+const logged = (type?: string) =>
+  (existsSync(engine.events.file) ? readFileSync(engine.events.file, "utf8").trim().split("\n").map((l) => JSON.parse(l)) : []).filter((e: any) => !type || e.event === type);
+
 /** Runs a turn, answering permissions with `choose` as they arrive. */
 async function turn(text: string, sessionId?: string, choose: (e: Extract<WsEvent, { type: "permission" }>) => "allow" | "always" | "deny" | null = () => "allow", model = "alpha/big") {
   const events: WsEvent[] = [];
@@ -138,6 +142,12 @@ describe("workspace sessions", () => {
     expect(seen).not.toContain("ProjectFalcon");
     const d = drivers[0]!.decisions.get("p1")!;
     expect(d).toEqual({ behavior: "allow", updatedInput: { file_path: `${root}/a.txt`, content: "name: ProjectFalcon" } });
+    // Event log: the session, the guard's decision (counts only) and the user's answer, with nothing of the content.
+    expect(logged("session.start")).toEqual([expect.objectContaining({ mode: "workspace", workspace: root, model: "alpha@main/big", agent: "alpha", sensitive: false })]);
+    expect(logged("guard.decision")[0]).toMatchObject({ action: "redacted", decided_by: "policy", severity: "info", findings: { TERM: 1 } });
+    expect(logged("approval.pending")[0]).toMatchObject({ kind: "tool", tool: "Write", path: "a.txt" });
+    expect(logged("tool.permission")).toEqual([expect.objectContaining({ tool: "Write", path: "a.txt", decision: "allow", decided_by: "user" })]);
+    expect(readFileSync(engine.events.file, "utf8")).not.toContain("ProjectFalcon");
   });
 
   test("'always' covers edits inside the folder only", async () => {
@@ -232,6 +242,15 @@ describe("workspace sessions", () => {
     expect(drivers[0]!.started[0]!.denyReads).toContain(join(homedir(), ".npmrc")); // the CLI's own Read tool, outside the sandbox
     expect(prompted).toEqual(["exfil"]);
     expect(drivers[0]!.decisions.get("npm")!.behavior).toBe("allow");
+    expect(logged("sandbox.network").map((e) => [e.net_host, e.decision, e.severity])).toEqual([
+      ["registry.npmjs.org", "allow", "info"],
+      ["attacker.example", "deny", "warning"],
+    ]);
+    expect(logged("tool.permission").map((e) => [e.net_host, e.decided_by])).toEqual([
+      ["registry.npmjs.org", "auto"],
+      ["attacker.example", "user"],
+    ]);
+    expect(logged("approval.pending")).toEqual([expect.objectContaining({ kind: "network", net_host: "attacker.example" })]);
   });
 
   test("unapproved changes to git hooks or tool config are put back after the turn; approved ones stay", async () => {
@@ -249,6 +268,7 @@ describe("workspace sessions", () => {
     expect(existsSync(join(root, ".git/hooks/post-commit"))).toBe(false);
     expect(readFileSync(join(root, ".claude/settings.json"), "utf8")).toBe('{"x":1}');
     expect(events.find((e) => e.type === "protected_reverted")).toMatchObject({ changes: [{ path: ".git/hooks/post-commit", change: "added" }] });
+    expect(logged("protected.reverted")).toEqual([expect.objectContaining({ severity: "critical", changes: [{ path: ".git/hooks/post-commit", change: "added" }], failed: [] })]);
   });
 
   test("web calls show destination and payload, flag secrets, and send placeholders, never real values", async () => {
@@ -717,6 +737,8 @@ describe("sensitive workspaces: shell reads of data", () => {
     expect(drivers[0]!.decisions.get("b1")).toMatchObject({ behavior: "deny", message: expect.stringContaining("Read tool") });
     expect(drivers[0]!.started[0]!.system).toContain("Read data files (CSV, TSV, JSON, logs…) only with the Read tool");
     expect(sessions.egress(r.sid)[0]!.actions).toEqual([{ kind: "command", title: "$ head logins.csv", status: "denied" }]);
+    expect(logged("data.block")).toEqual([expect.objectContaining({ severity: "warning", command: "head -c 3000 logins.csv", reason: expect.any(String) })]);
+    expect(logged("session.start")[0]).toMatchObject({ sensitive: true, account: "alpha@work" });
   });
   test("non-table JSON (package.json) is read normally, not 'pseudonymised'", async () => {
     const { writeFileSync } = await import("node:fs");

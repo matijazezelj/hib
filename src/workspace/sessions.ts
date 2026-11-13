@@ -1,5 +1,6 @@
 import type { Config } from "../config";
 import type { Engine } from "../engine";
+import type { Context } from "../events";
 import { inspect, obfuscateText, runNer, StreamRestorer, tokenNote, Vault } from "../guard";
 import type { VaultState } from "../guard/vault";
 import type { Sealer } from "../guard/seal";
@@ -251,6 +252,40 @@ export class WorkspaceSessions {
   private get db() {
     return this.engine.db;
   }
+  private get events() {
+    return this.engine.events;
+  }
+
+  /** Common fields for a session's security events. */
+  private evCtx(id: string, root: string, c: Candidate): Context {
+    return { mode: "workspace", session_id: id, workspace: root, account: c.account.id, model: c.id };
+  }
+
+  /** What a tool call is, for the event log: never its output or a file's contents; user text redacted, paths relative. */
+  private toolFields(l: Live, call: ToolCall): Record<string, unknown> {
+    const f: Record<string, unknown> = { tool: call.name };
+    if (call.command) f.command = this.events.redact(call.command);
+    const path = call.path ?? call.paths?.[0];
+    if (path) f.path = this.events.path(path, l.root);
+    if (call.outbound?.url) f.url = this.events.redact(call.outbound.url);
+    const host = call.host ?? call.outbound?.host;
+    if (host) f.net_host = host;
+    return f;
+  }
+
+  /** A permission decided: tool.permission, plus sandbox.network when a sandboxed command wants a new host. */
+  private permissionEvent(l: Live, call: ToolCall, decision: "allow" | "always" | "deny", by: "user" | "policy" | "auto") {
+    const ctx = this.evCtx(l.id, l.root, l.candidate);
+    this.events.emit("tool.permission", ctx, { ...this.toolFields(l, call), decision, decided_by: by });
+    if (call.host !== undefined) this.events.emit("sandbox.network", ctx, { net_host: call.host, decision: decision === "deny" ? "deny" : "allow" });
+  }
+
+  /** Stops a session's CLI and records the end of that agent session. */
+  private async endLive(l: Live) {
+    // Written first: on daemon exit closeAll doesn't wait for the close.
+    this.events.emit("session.end", this.evCtx(l.id, l.root, l.candidate), { agent: l.candidate.provider, sensitive: l.askReads });
+    await l.driver.close();
+  }
 
   onChange(fn: () => void) {
     this.listeners.add(fn);
@@ -419,6 +454,7 @@ export class WorkspaceSessions {
     await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools });
     const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox, approvedProtected: new Set() };
     this.live.set(id, l);
+    this.events.emit("session.start", this.evCtx(id, root, c), { agent: c.provider, sensitive: askReads });
     return l;
   }
 
@@ -473,10 +509,15 @@ export class WorkspaceSessions {
     const ner = policy ? await this.engine.ner([input.text]) : undefined;
     const insp = inspect([{ role: "user", content: input.text }], route, this.cfg, { cwd: root, vault, skipScan: !!row, ner });
     yield { type: "guard", findings: insp.findings, action: insp.blocked ? "block" : insp.decision.action, reasons: insp.blocked ? [insp.blocked] : insp.decision.reasons };
-    if (insp.blocked) return yield { type: "error", message: `blocked: ${insp.blocked}` };
+    const ctx = this.evCtx(id, root, c);
+    if (insp.blocked) {
+      this.engine.guardEvent(ctx, "rejected", "policy", insp.findings, [insp.blocked]);
+      return yield { type: "error", message: `blocked: ${insp.blocked}` };
+    }
     if (policy) {
       // Sensitive workspaces never send a secret, not even tokenized: the agent could still act on it.
       const secrets = [...new Set(detect(input.text, { level: "minimal" }).filter((f) => f.kind === "secret").map((f) => f.category))];
+      if (secrets.length) this.engine.guardEvent(ctx, "rejected", "policy", insp.findings, [`sensitive workspace: the message contains ${secrets.join(", ")}`]);
       if (secrets.length) return yield { type: "error", message: `blocked: this workspace is sensitive and your message contains ${secrets.join(", ")}. Remove it and send again.` };
     }
     let text = insp.messages[0]!.content;
@@ -484,7 +525,9 @@ export class WorkspaceSessions {
     if (insp.decision.action === "ask") {
       const aid = `ap_${crypto.randomUUID().slice(0, 12)}`;
       yield { type: "approval", id: aid, redacted: text, reasons: insp.decision.reasons };
+      this.events.emit("approval.pending", ctx, { kind: "guard", timeout_sec: this.cfg.guard.approvalTimeoutSec });
       const r = await this.engine.waitApproval({ id: aid, created: Date.now(), redacted: text, original: input.text, reasons: insp.decision.reasons, findings: insp.findings, model: c.id }, signal);
+      this.engine.guardEvent(ctx, r.ok ? "approved" : r.timedOut ? "timeout" : "rejected", "user", insp.findings, insp.decision.reasons);
       if (!r.ok) return yield { type: "error", message: "not sent: approval rejected or timed out" };
       if (r.edited !== undefined) {
         // An edit gets the same checks as the original: in sensitive folders no secret goes out, and names are tokenized.
@@ -497,7 +540,7 @@ export class WorkspaceSessions {
         text = obfuscateText(vault, r.edited, "minimal", this.cfg, "agent", edNer?.byText.get(r.edited));
         userText = vault.restore(text); // history (and later handoffs, the advisor's task) keep what you approved
       }
-    }
+    } else this.engine.guardEvent(ctx, "redacted", "policy", insp.findings, insp.decision.reasons);
 
     // Session bookkeeping happens only after the guard let the turn through.
     if (!row) {
@@ -509,7 +552,7 @@ export class WorkspaceSessions {
     let l = this.live.get(sid);
     if (l && !!policy !== l.askReads) {
       // The folder's sensitivity changed since this CLI started; restart it on its native session with the right permissions.
-      await l.driver.close();
+      await this.endLive(l);
       this.live.delete(sid);
       row.native_id = l.nativeId ?? row.native_id;
       l = undefined;
@@ -520,20 +563,21 @@ export class WorkspaceSessions {
     }
     if (l && this.advisorOn.has(sid) !== !!l.advisorKey) {
       // The advisor was switched on or off: restart the CLI on its native session with or without the tool.
-      await l.driver.close();
+      await this.endLive(l);
       this.live.delete(sid);
       row.native_id = l.nativeId ?? row.native_id;
       l = undefined;
     }
     if (l && !l.driver.alive) {
       // The CLI died (crash, stall, interrupt fallback); reopen it on the native session.
+      this.events.emit("session.end", this.evCtx(sid, root, l.candidate), { agent: l.candidate.provider, sensitive: l.askReads });
       this.live.delete(sid);
       row.native_id = l.nativeId ?? row.native_id;
       l = undefined;
     }
     let firstTurnPrefix = "";
     if (l && l.candidate.id !== c.id) {
-      await l.driver.close();
+      await this.endLive(l);
       this.live.delete(sid);
       // Same CLI and login: keep the native session, only the model changes. Otherwise hand over.
       const sameCli = l.candidate.provider === c.provider && l.candidate.account.id === c.account.id;
@@ -640,6 +684,7 @@ export class WorkspaceSessions {
                 l.driver.answer(e.id, { behavior: "deny", message });
                 const ev = { type: "tool_result" as const, id: call.id, ok: false, output: `denied: ${why}` };
                 this.record(sid, { type: "data_block", command: call.command, why });
+                this.events.emit("data.block", this.evCtx(sid, root, c), { command: this.events.redact(call.command), reason: why });
                 this.record(sid, { type: "tool_call", call });
                 this.record(sid, ev);
                 yield { type: "tool_call", call };
@@ -649,11 +694,15 @@ export class WorkspaceSessions {
             }
             if (policy && tabularTarget(call, e.input, root)) call.title += " (the agent gets a pseudonymised copy)";
             else if (policy && call.name === "Grep") call.title += " (may return raw rows from data files)";
-            if ((l.advisorKey && call.name === "mcp__hib__advisor") || this.autoAllowed(l, e.ruleKey, call) || (this.auto.has(sid) && this.autoModeCovers(l, call))) {
+            const advisorCall = !!l.advisorKey && call.name === "mcp__hib__advisor";
+            const byRule = !advisorCall && this.autoAllowed(l, e.ruleKey, call);
+            if (advisorCall || byRule || (this.auto.has(sid) && this.autoModeCovers(l, call))) {
+              this.permissionEvent(l, call, "allow", advisorCall || byRule ? "policy" : "auto");
               l.driver.answer(e.id, await this.allowDecision(l, call, e.input));
               break;
             }
             l.pending.set(e.id, { call, ruleKey: e.ruleKey, input: e.input });
+            this.events.emit("approval.pending", this.evCtx(sid, root, c), { kind: call.host !== undefined ? "network" : "tool", ...this.toolFields(l, call) });
             this.changed();
             yield { type: "permission", id: e.id, call, ruleKey: e.ruleKey };
             break;
@@ -698,6 +747,10 @@ export class WorkspaceSessions {
       protectedEv = { type: "protected_reverted", changes: [], failed: [`the check failed (${String(e?.message ?? e).slice(0, 160)}); inspect .git/hooks, .git/config, .claude/, .codex/ and .mcp.json by hand`] };
     }
     if (protectedEv) {
+      this.events.emit("protected.reverted", this.evCtx(sid, root, c), {
+        changes: protectedEv.changes,
+        failed: protectedEv.failed.map((f) => (isAbsolute(f) ? this.events.path(f, root) : this.events.redact(f))),
+      });
       this.record(sid, protectedEv);
       yield protectedEv;
     }
@@ -849,7 +902,7 @@ export class WorkspaceSessions {
     else this.auto.delete(sessionId);
     this.emit(sessionId, { type: "mode", auto: on });
     const l = this.live.get(sessionId);
-    if (on && l) for (const [id, p] of l.pending) if (this.autoModeCovers(l, p.call)) this.answer(sessionId, id, "allow");
+    if (on && l) for (const [id, p] of l.pending) if (this.autoModeCovers(l, p.call)) this.answer(sessionId, id, "allow", undefined, "auto");
   }
 
   /** A standing system note for a session's CLI, applied whenever it (re)starts. */
@@ -867,7 +920,7 @@ export class WorkspaceSessions {
     await this.interrupt(sessionId);
     const l = this.live.get(sessionId);
     this.live.delete(sessionId);
-    await l?.driver.close();
+    if (l) await this.endLive(l);
     this.auto.delete(sessionId);
     this.notes.delete(sessionId);
   }
@@ -909,12 +962,13 @@ export class WorkspaceSessions {
   }
 
   /** Allow once, allow this kind of call for the rest of the session, or deny. */
-  answer(sessionId: string, permissionId: string, choice: "allow" | "always" | "deny", message?: string): boolean {
+  answer(sessionId: string, permissionId: string, choice: "allow" | "always" | "deny", message?: string, by: "user" | "auto" = "user"): boolean {
     const l = this.live.get(sessionId);
     const p = l?.pending.get(permissionId);
     if (!l || !p) return false;
     l.pending.delete(permissionId);
     if (choice === "always") l.alwaysAllow.add(p.ruleKey);
+    this.permissionEvent(l, p.call, choice, by);
     // The CLI executes exactly what we return, so placeholders are swapped back to real values here. Making a Read
     // copy can take a while (name detection), so the CLI gets the answer when it's ready; it waits for it anyway.
     if (choice === "deny") l.driver.answer(permissionId, { behavior: "deny", message: message || "The user denied this action." });
@@ -936,7 +990,7 @@ export class WorkspaceSessions {
   }
 
   closeAll() {
-    for (const l of this.live.values()) void l.driver.close();
+    for (const l of this.live.values()) void this.endLive(l);
     this.live.clear();
   }
 }

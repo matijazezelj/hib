@@ -96,11 +96,26 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
     const origin = req.headers.get("origin");
     return hosts.has(req.headers.get("host") ?? "") && (!origin || origins.has(origin));
   };
-  function authorized(req: Request): boolean {
-    if (!sameSite(req)) return false;
+  /** Why a request is refused (null: it isn't): the Host check, then Origin, then the credential. */
+  const siteProblem = (req: Request): "host" | "origin" | null => {
+    if (!hosts.has(req.headers.get("host") ?? "")) return "host";
+    const origin = req.headers.get("origin");
+    return origin && !origins.has(origin) ? "origin" : null;
+  };
+  function rejection(req: Request): "host" | "origin" | "token" | null {
+    const site = siteProblem(req);
+    if (site) return site;
     const cred = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
-    return !!cred && (same(cred, token) || browserSession(cred));
+    return cred && (same(cred, token) || browserSession(cred)) ? null : "token";
   }
+  /** A refused request, recorded for the event log (rate-limited there per reason and peer). */
+  const refused = (why: "host" | "origin" | "token", req: Request, server: any) => {
+    let remote: string | undefined;
+    try {
+      remote = server?.requestIP?.(req)?.address;
+    } catch {}
+    engine.events.authFailure(why, new URL(req.url).pathname, remote);
+  };
   const same = (a: string, b: string) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
   const sidHash = (sid: string) => new Bun.CryptoHasher("sha256").update(sid).digest("hex");
   function browserSession(sid: string): boolean {
@@ -112,8 +127,12 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
     return true;
   }
 
-  const guarded = (fn: (req: Request & { params: Record<string, string> }) => Response | Promise<Response>) => async (req: any) => {
-    if (!authorized(req)) return json({ error: { message: "unauthorized" } }, 401);
+  const guarded = (fn: (req: Request & { params: Record<string, string> }) => Response | Promise<Response>) => async (req: any, server?: any) => {
+    const why = rejection(req);
+    if (why) {
+      refused(why, req, server);
+      return json({ error: { message: "unauthorized" } }, 401);
+    }
     try {
       return await fn(req);
     } catch (e: any) {
@@ -260,12 +279,16 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
       },
       // Called by the advisor MCP server inside an agent CLI: authorized by its per-session key only, which can do nothing else.
       "/ws/advise": {
-        POST: async (req) => {
-          if (!hosts.has(req.headers.get("host") ?? "") || req.headers.get("origin")) return json({ error: { message: "unauthorized" } }, 401);
+        POST: async (req, server) => {
+          if (!hosts.has(req.headers.get("host") ?? "") || req.headers.get("origin")) {
+            refused(hosts.has(req.headers.get("host") ?? "") ? "origin" : "host", req, server);
+            return json({ error: { message: "unauthorized" } }, 401);
+          }
           const b: any = await req.json();
           try {
             return json({ advice: await sessions.advise(String(b.sessionId ?? ""), req.headers.get("x-hib-advisor") ?? "", String(b.question ?? "")) });
           } catch (e: any) {
+            if (e?.message === "unauthorized") refused("token", req, server);
             return json({ error: { message: String(e?.message ?? e) } }, e?.message === "unauthorized" ? 401 : 502);
           }
         },
@@ -293,9 +316,14 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
         const t = tickets.get(q(req, "ticket"));
         tickets.delete(q(req, "ticket"));
         const root = workspaces.resolve(q(req, "root"));
-        if (!sameSite(req) || !t || t.exp < Date.now() || !root || t.root !== root) return new Response("unauthorized", { status: 401 });
+        if (!sameSite(req) || !t || t.exp < Date.now() || !root || t.root !== root) {
+          refused(siteProblem(req) ?? "token", req, server);
+          return new Response("unauthorized", { status: 401 });
+        }
         if (workspaces.effectivePolicy(root)) return new Response("the browser terminal is off in sensitive workspaces", { status: 403 });
-        return server.upgrade(req, { data: { kind: "terminal", cwd: root } }) ? undefined : new Response("upgrade failed", { status: 400 });
+        if (!server.upgrade(req, { data: { kind: "terminal", cwd: root } })) return new Response("upgrade failed", { status: 400 });
+        engine.events.emit("terminal.open", { mode: "workspace", workspace: root });
+        return undefined;
       },
       "/hib/workspaces": {
         GET: guarded(() => json(userWorkspaces())),
@@ -347,6 +375,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
         POST: guarded(() => {
           setTimeout(() => {
             sessions.closeAll();
+            engine.events.emit("daemon.stop", { mode: "daemon" });
             opts.onShutdown ? opts.onShutdown() : process.exit(0);
           }, 50);
           return json({ ok: true });
@@ -374,14 +403,23 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           else engine.db.run("DELETE FROM browser_sessions WHERE hash = ?", [sidHash(cred)]);
           return json({ ok: true });
         }),
-        POST: async (req) => {
-          if (!hosts.has(req.headers.get("host") ?? "")) return new Response("bad host", { status: 400 });
+        POST: async (req, server) => {
+          if (!hosts.has(req.headers.get("host") ?? "")) {
+            refused("host", req, server);
+            return new Response("bad host", { status: 400 });
+          }
           const origin = req.headers.get("origin");
-          if (origin && !origins.has(origin)) return json({ error: { message: "unauthorized" } }, 401);
+          if (origin && !origins.has(origin)) {
+            refused("origin", req, server);
+            return json({ error: { message: "unauthorized" } }, 401);
+          }
           const code = String(((await req.json().catch(() => ({}))) as any).code ?? "");
           const exp = logins.get(code);
           logins.delete(code);
-          if (!code || !exp || exp < Date.now()) return json({ error: { message: "this login link is used up or expired" } }, 401);
+          if (!code || !exp || exp < Date.now()) {
+            refused("token", req, server);
+            return json({ error: { message: "this login link is used up or expired" } }, 401);
+          }
           const sid = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
           const now = Date.now();
           engine.db.run("DELETE FROM browser_sessions WHERE created < ? OR coalesce(last_used, created) < ?", [now - BROWSER_SESSION_MAX, now - BROWSER_SESSION_IDLE]);

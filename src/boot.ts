@@ -9,6 +9,7 @@ import { applyPlugins, loadPlugins } from "./plugins";
 import { Registry } from "./providers/registry";
 import { apiToken, startServer } from "./server";
 import { HibClient } from "./client";
+import { sandboxProblem } from "./workspace/sandbox";
 
 async function boot(home = hibHome()) {
   process.umask(0o077); // db, wal, scratch dirs: owner-only
@@ -24,6 +25,16 @@ async function boot(home = hibHome()) {
 export async function serve(port?: number) {
   const b = await boot();
   const server = startServer(b.engine, { port: port ?? b.cfg.port, token: b.token });
+  const events = b.engine.events;
+  const problem = sandboxProblem();
+  events.emit("daemon.start", { mode: "daemon" }, { bind: server.hostname, port: server.port, sandbox: problem ? "unavailable" : "available" });
+  if (problem) events.emit("sandbox.unavailable", { mode: "daemon" }, { reason: problem });
+  // `hib daemon stop` records its own daemon.stop; a signal (Ctrl-C on `hib serve`, systemd, kill) is a clean stop too.
+  for (const sig of ["SIGTERM", "SIGINT"] as const)
+    process.once(sig, () => {
+      events.emit("daemon.stop", { mode: "daemon" }, { signal: sig });
+      process.exit(0);
+    });
   return { ...b, server, url: `http://127.0.0.1:${server.port}` };
 }
 
