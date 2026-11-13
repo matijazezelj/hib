@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseConfig } from "../src/config";
@@ -95,5 +95,24 @@ describe("sensitive folders over HTTP", () => {
     engine.workspaces.setPolicy(dir, { sensitive: true, account: "claude@main" });
     expect((await fetch(`${base}/hib/workspaces?root=${encodeURIComponent(dir)}`, { method: "DELETE", headers: h })).status).toBe(403);
     expect(engine.workspaces.policy(dir)).not.toBeNull();
+  });
+});
+
+describe("event log", () => {
+  const lines = () => readFileSync(engine.events.file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+
+  test("refused requests are logged by reason, once per peer per minute, never with the credential", async () => {
+    // Earlier tests here were refused too, all from this peer within the minute: those lines count for the limit.
+    await fetch(`${base}/hib/info`, { headers: { authorization: "Bearer wrong-guess-123" } });
+    await fetch(`${base}/hib/info`, { headers: { authorization: "Bearer wrong-guess-456" } });
+    await fetch(`${base}/hib/info`, { headers: { authorization: `Bearer ${TOKEN}`, origin: "https://evil.example" } });
+    const port = new URL(base).port;
+    await fetch(`${base}/hib/info`, { headers: { authorization: `Bearer ${TOKEN}`, host: `rebind.example:${port}` } });
+    const auth = lines().filter((l) => l.event === "auth.failure");
+    expect(new Set(auth.map((l) => l.reason))).toEqual(new Set(["token", "origin", "host"]));
+    expect(auth.find((l) => l.reason === "host")!.path).toBe("/hib/info");
+    for (const reason of ["token", "origin", "host"]) expect(auth.filter((l) => l.reason === reason && l.remote === auth[0].remote)).toHaveLength(1);
+    expect(auth[0]).toMatchObject({ severity: "warning", mode: "daemon", remote: expect.any(String) });
+    expect(readFileSync(engine.events.file, "utf8")).not.toContain("wrong-guess");
   });
 });

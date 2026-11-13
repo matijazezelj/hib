@@ -17,6 +17,7 @@ import { onPinnedAccount, pinnedModel, Workspaces } from "./workspace/registry";
 import { columnsToHide, pseudonymizeWithSpans } from "./analyze/pseudo";
 import { dirname, extname } from "node:path";
 import type { Table } from "./analyze/table";
+import { EventLog, type Context } from "./events";
 
 export interface ChatInput {
   conversationId?: string; // continue a saved conversation
@@ -101,12 +102,15 @@ export class Engine {
   private approvals = new Map<string, Approval>();
   private approvalListeners = new Set<() => void>();
 
+  readonly events: EventLog;
+
   constructor(readonly cfg: Config, readonly db: Database, readonly registry: Registry, readonly sealer: Sealer, readonly plugins: Plugins) {
     this.usage = new Usage(db, cfg);
     this.learner = new Learner(db);
     this.router = new Router(cfg, registry, this.usage, this.learner);
     this.workspaces = new Workspaces(db, cfg);
     this.nerModel = new NerModel(join(cfg.home, "models"));
+    this.events = new EventLog(cfg.events, cfg.guard);
   }
 
   /** Local NER over texts, cached per text so long conversations aren't re-scanned every turn. Tests swap `nerInfer`. */
@@ -196,15 +200,15 @@ export class Engine {
     return true;
   }
 
-  waitApproval(a: Omit<Approval, "resolve">, signal: AbortSignal): Promise<{ ok: boolean; edited?: string }> {
+  waitApproval(a: Omit<Approval, "resolve">, signal: AbortSignal): Promise<{ ok: boolean; edited?: string; timedOut?: boolean }> {
     return new Promise((resolve) => {
-      const done = (r: { ok: boolean; edited?: string }) => {
+      const done = (r: { ok: boolean; edited?: string; timedOut?: boolean }) => {
         clearTimeout(timer);
         this.approvals.delete(a.id);
         this.approvalListeners.forEach((f) => f());
         resolve(r);
       };
-      const timer = setTimeout(() => done({ ok: false }), this.cfg.guard.approvalTimeoutSec * 1000);
+      const timer = setTimeout(() => done({ ok: false, timedOut: true }), this.cfg.guard.approvalTimeoutSec * 1000);
       signal.addEventListener("abort", () => done({ ok: false }), { once: true });
       this.approvals.set(a.id, { ...a, resolve: done });
       this.approvalListeners.forEach((f) => f());
@@ -342,7 +346,11 @@ export class Engine {
     const ner = plan.route.level === "minimal" ? undefined : await this.ner(messages.map((m) => m.content), textCells);
     const insp = inspect(messages, plan.route, this.cfg, { cwd: input.cwd, vault, ner, exempt });
     yield { type: "guard", findings: insp.findings, action: insp.blocked ? "block" : insp.decision.action, reasons: insp.blocked ? [insp.blocked] : insp.decision.reasons };
-    if (insp.blocked) return yield { type: "error", message: `blocked: ${insp.blocked}` };
+    const evCtx = { mode: "router" as const, route: cls, model: plan.ordered[0]!.id, account: plan.ordered[0]!.account.id, workspace: input.cwd };
+    if (insp.blocked) {
+      this.guardEvent(evCtx, "rejected", "policy", insp.findings, [insp.blocked]);
+      return yield { type: "error", message: `blocked: ${insp.blocked}` };
+    }
     let outbound = insp.messages;
     const lastUserIdx = outbound.map((m) => m.role).lastIndexOf("user");
     let edited: string | undefined; // what you approved, if you changed it: history keeps that, not what you removed
@@ -350,11 +358,13 @@ export class Engine {
     if (insp.decision.action === "ask") {
       const id = newId("ap");
       yield { type: "approval", id, redacted: outbound[lastUserIdx]?.content ?? "", reasons: insp.decision.reasons };
+      this.events.emit("approval.pending", evCtx, { kind: "guard", timeout_sec: this.cfg.guard.approvalTimeoutSec });
       const r = await this.waitApproval(
         { id, created: Date.now(), redacted: outbound[lastUserIdx]?.content ?? "", original: messages[lastUserIdx]?.content ?? "", reasons: insp.decision.reasons, findings: insp.findings, model: plan.ordered[0]!.id },
         signal,
       );
       this.audit(id, plan, insp.findings, r.ok ? "approved" : "rejected", insp.decision.reasons, "user");
+      this.guardEvent(evCtx, r.ok ? "approved" : r.timedOut ? "timeout" : "rejected", "user", insp.findings, insp.decision.reasons);
       if (!r.ok) return yield { type: "error", message: "not sent: approval rejected or timed out" };
       if (r.edited !== undefined && lastUserIdx >= 0) {
         // Edits are made to the redacted text; re-check them so nothing new slips out unredacted.
@@ -370,7 +380,7 @@ export class Engine {
       plan.ordered = plan.ordered.slice(0, 1);
       plan.route = { ...plan.route, advisor: false };
       yield { type: "approved", edited: r.edited !== undefined };
-    }
+    } else this.guardEvent(evCtx, "redacted", "policy", insp.findings, insp.decision.reasons);
     if (agent) outbound = [{ role: "system", content: obfuscateText(vault, agent.system, plan.route.level, this.cfg, plan.route.mode) }, ...outbound];
     if (vault.size) outbound = [{ role: "system", content: tokenNote(vault.tag) }, ...outbound];
 
@@ -477,6 +487,11 @@ export class Engine {
       await this.saveVault(conversationId!, vault);
     }
     yield { type: "done", runId: finalRun!, model: finalModel };
+  }
+
+  /** One guard.decision event; reasons can quote the prompt, so they go through the event log's redactor. */
+  guardEvent(ctx: Context, action: "redacted" | "approved" | "rejected" | "timeout", by: "policy" | "user", findings: Record<string, number>, reasons: string[]) {
+    this.events.emit("guard.decision", ctx, { action, decided_by: by, findings, reasons: reasons.map((r) => this.events.redact(r)) });
   }
 
   private audit(runId: string, plan: { cls: string; route: any }, findings: Record<string, number>, action: string, reasons: string[], by: string, c?: Candidate) {
