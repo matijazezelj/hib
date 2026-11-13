@@ -67,7 +67,7 @@ export class EventLog {
   private readonly host = hostname();
   private readonly version = version();
   private readonly identities = machineTerms();
-  private auth = new Map<string, { last: number; suppressed: number; timer?: ReturnType<typeof setTimeout> }>();
+  private auth = new Map<string, { last: number; suppressed: number; path: string; remote?: string; timer?: ReturnType<typeof setTimeout> }>();
 
   constructor(
     readonly cfg: EventsConfig,
@@ -129,17 +129,31 @@ export class EventLog {
     if (s && t - s.last < AUTH_WINDOW_MS) {
       s.suppressed++;
       // Flush the count when the window closes, so a burst that stops is still reported in full.
-      s.timer ??= setTimeout(() => {
-        const cur = this.auth.get(key);
-        if (!cur?.suppressed) return;
-        this.emit("auth.failure", { mode: "daemon" }, { reason, path: this.redact(path), ...(remote ? { remote } : {}), count: cur.suppressed });
-        this.auth.set(key, { last: Date.now(), suppressed: 0 });
-      }, AUTH_WINDOW_MS - (t - s.last));
+      s.timer ??= setTimeout(() => this.flushAuth(key), AUTH_WINDOW_MS - (t - s.last));
       (s.timer as any).unref?.();
       return;
     }
-    this.auth.set(key, { last: t, suppressed: 0 });
-    this.emit("auth.failure", { mode: "daemon" }, { reason, path: this.redact(path), ...(remote ? { remote } : {}), count: 1 + (s?.suppressed ?? 0) });
+    this.auth.set(key, { last: t, suppressed: 0, path, remote });
+    this.emit("auth.failure", { mode: "daemon" }, { reason, path: this.redact(path), ...(remote ? { remote } : {}), count: 1 });
+  }
+
+  /** Writes the failures counted but not yet logged: one window (`key`), or all of them. */
+  flushAuth(key?: string): void {
+    for (const [k, s] of key ? [[key, this.auth.get(key)] as const] : [...this.auth]) {
+      if (!s) continue;
+      clearTimeout(s.timer);
+      s.timer = undefined;
+      if (!s.suppressed) continue;
+      const reason = k.slice(0, k.indexOf("|"));
+      this.emit("auth.failure", { mode: "daemon" }, { reason, path: this.redact(s.path), ...(s.remote ? { remote: s.remote } : {}), count: s.suppressed });
+      this.auth.set(k, { last: Date.now(), suppressed: 0, path: s.path, remote: s.remote });
+    }
+  }
+
+  /** A clean stop: counted auth failures first, so a burst that ends with a restart isn't lost, then daemon.stop. */
+  stop(fields: Record<string, unknown> = {}): void {
+    this.flushAuth();
+    this.emit("daemon.stop", { mode: "daemon" }, fields);
   }
 
   private write(line: string) {

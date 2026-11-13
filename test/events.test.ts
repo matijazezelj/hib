@@ -125,3 +125,22 @@ describe("config", () => {
     expect(() => parseConfig({ events: { dir: join(home, "..") } }, home)).toThrow(/must not be or contain/);
   });
 });
+
+describe("stopping", () => {
+  test("failures counted in an open window are written before daemon.stop", () => {
+    const ev = log();
+    ev.authFailure("token", "/hib/info", "127.0.0.1");
+    for (let i = 0; i < 3; i++) ev.authFailure("token", "/v1/models", "127.0.0.1");
+    ev.authFailure("origin", "/hib/info", "127.0.0.1"); // a window with nothing pending writes nothing more
+    ev.stop();
+    const lines = read(ev.file).map((l) => [l.event, l.reason, l.count]);
+    expect(lines).toEqual([
+      ["auth.failure", "token", 1],
+      ["auth.failure", "origin", 1],
+      ["auth.failure", "token", 3],
+      ["daemon.stop", undefined, undefined],
+    ]);
+    const total = read(ev.file).filter((l) => l.event === "auth.failure" && l.reason === "token").reduce((n, l) => n + l.count, 0);
+    expect(total).toBe(4); // what SIB alerts on: the sum of count
+  });
+});

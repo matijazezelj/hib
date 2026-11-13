@@ -375,7 +375,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
         POST: guarded(() => {
           setTimeout(() => {
             sessions.closeAll();
-            engine.events.emit("daemon.stop", { mode: "daemon" });
+            engine.events.stop();
             opts.onShutdown ? opts.onShutdown() : process.exit(0);
           }, 50);
           return json({ ok: true });

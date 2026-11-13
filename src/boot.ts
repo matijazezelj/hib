@@ -32,7 +32,7 @@ export async function serve(port?: number) {
   // `hib daemon stop` records its own daemon.stop; a signal (Ctrl-C on `hib serve`, systemd, kill) is a clean stop too.
   for (const sig of ["SIGTERM", "SIGINT"] as const)
     process.once(sig, () => {
-      events.emit("daemon.stop", { mode: "daemon" }, { signal: sig });
+      events.stop({ signal: sig });
       process.exit(0);
     });
   return { ...b, server, url: `http://127.0.0.1:${server.port}` };
