@@ -256,8 +256,10 @@ The log stores the redacted text locally in `~/.hib/hib.db`, so anything the gua
 ## Security event log
 
 The daemon writes security events as JSON lines to `~/.hib/events/events.jsonl`, for a log collector to ship and alert on (the contract SIB implements is schema 1 in its `docs/hib-events-spec.md`).
-- **Events:** daemon start and stop, refused requests (bad token, Host or Origin), guard decisions, approvals waiting, tool permissions (allowed, always, denied; by you, a rule or auto mode), sandboxed commands reaching a new host, raw data reads blocked in sensitive folders, reverted changes to git hooks or tool config (critical), browser terminals opened, agent sessions starting and ending, and a missing OS sandbox.
-- **Never in it:** prompts, model or tool output, file contents, diffs, the token or vault values. Commands, URLs and guard reasons go through the guard (identifiers and secrets become `[CATEGORY]`) and are cut to 300 characters; paths are relative to the workspace.
+- **Events:** daemon start and stop, a `daemon.alive` heartbeat every 5 minutes (so a crash or kill shows as heartbeats that stop with no `daemon.stop`), refused requests (bad token, Host or Origin), guard decisions, approvals waiting, tool permissions (allowed, always, denied; by you, a rule or auto mode), sandboxed commands reaching a new host, raw data reads blocked in sensitive folders, reverted changes to git hooks or tool config (critical), browser terminals opened, agent sessions starting and ending, and a missing OS sandbox.
+- **Never in it:** prompts, model or tool output, file contents, diffs, the token or vault values. Commands, URLs and guard reasons go through the guard (identifiers and secrets become `[CATEGORY]`) and are cut to 300 characters; paths are relative to the workspace. Every other field built from user or agent text (tool names, hosts, paths, reasons) is checked for secrets too.
+  - The log also hides what the guard has no pattern for: `user:pass@` in URLs, `curl -u user:pass`, `Authorization`, `Cookie` and `X-…-Key` header values, percent-encoded runs, and opaque runs (letters and digits mixed, 16+ characters; 8+ next to a line break, for a key split across lines). Zero-width characters are removed and look-alike forms folded first. So a full git commit hash or an id like `x86_64-linux-gnu` shows as `[OPAQUE]`.
+  - `test/events-fuzz.test.ts` tries to get secrets through every field: known and near-miss key formats in headers, URLs, env assignments, flags, JSON, base64, hex and URL encoding, zero-width characters, homoglyphs, line splits, the 300-character cut, huge input and lone surrogates.
 - Refused requests are logged once per reason and peer per minute, with a count.
 - The folder holds event files only, so a collector can mount it alone; hib refuses an `[events] dir` that is, or contains, `~/.hib`. Folder 0700, files 0600.
 
@@ -267,6 +269,7 @@ enabled = true          # default
 dir = "~/.hib/events"   # default
 max_mb = 20             # rotate at this size: events.jsonl.1 … .keep
 keep = 5
+heartbeat_sec = 300     # daemon.alive interval; 0 = off
 ```
 
 ## Performance

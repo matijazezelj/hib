@@ -174,6 +174,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
     return snap.row && (snap.row as any).workspace !== root ? null : snap;
   };
   process.once("exit", () => sessions.closeAll());
+  engine.events.onStop(() => sessions.closeAll());
 
 
 
@@ -374,8 +375,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
       "/hib/shutdown": {
         POST: guarded(() => {
           setTimeout(() => {
-            sessions.closeAll();
-            engine.events.stop();
+            engine.events.stop(); // ends the agent sessions first (onStop below), so daemon.stop is the last line
             opts.onShutdown ? opts.onShutdown() : process.exit(0);
           }, 50);
           return json({ ok: true });

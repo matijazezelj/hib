@@ -7,7 +7,7 @@ import { EventLog, severityOf } from "../src/events";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "hib-ev-"));
 const read = (file: string) => (existsSync(file) ? readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
-const log = (over: Partial<ConstructorParameters<typeof EventLog>[0]> = {}) => new EventLog({ enabled: true, dir: join(tmp(), "events"), maxMb: 20, keep: 5, ...over });
+const log = (over: Partial<ConstructorParameters<typeof EventLog>[0]> = {}) => new EventLog({ enabled: true, dir: join(tmp(), "events"), maxMb: 20, keep: 5, heartbeatSec: 0, ...over });
 
 describe("event lines", () => {
   test("common fields on every line; absent optional fields are left out, never null", () => {
@@ -83,7 +83,7 @@ describe("rotation", () => {
   });
 
   test("a restarted log appends and keeps counting the size already on disk", () => {
-    const cfg = { enabled: true, dir: join(tmp(), "events"), maxMb: 400 / (1024 * 1024), keep: 1 };
+    const cfg = { enabled: true, dir: join(tmp(), "events"), maxMb: 400 / (1024 * 1024), keep: 1, heartbeatSec: 0 };
     new EventLog(cfg).emit("daemon.start", { mode: "daemon" }, { pad: "x".repeat(250) });
     new EventLog(cfg).emit("daemon.start", { mode: "daemon" }, { pad: "y".repeat(250) });
     expect(read(join(cfg.dir, "events.jsonl.1"))[0].pad[0]).toBe("x");
@@ -110,7 +110,7 @@ describe("auth failures", () => {
 describe("config", () => {
   test("defaults: on, $HIB_HOME/events, 20 MB, 5 kept", () => {
     const home = tmp();
-    expect(parseConfig(Bun.TOML.parse(DEFAULT_TOML) as any, home).events).toEqual({ enabled: true, dir: join(home, "events"), maxMb: 20, keep: 5 });
+    expect(parseConfig(Bun.TOML.parse(DEFAULT_TOML) as any, home).events).toEqual({ enabled: true, dir: join(home, "events"), maxMb: 20, keep: 5, heartbeatSec: 300 });
   });
 
   test("keys as written in config.toml", () => {
@@ -142,5 +142,47 @@ describe("stopping", () => {
     ]);
     const total = read(ev.file).filter((l) => l.event === "auth.failure" && l.reason === "token").reduce((n, l) => n + l.count, 0);
     expect(total).toBe(4); // what SIB alerts on: the sum of count
+  });
+});
+
+describe("heartbeat", () => {
+  test("daemon.alive every heartbeat_sec, the first one an interval after start, none after daemon.stop", async () => {
+    const ev = log({ heartbeatSec: 0.05 });
+    ev.emit("daemon.start", { mode: "daemon" });
+    ev.startHeartbeat();
+    expect(read(ev.file).map((l) => l.event)).toEqual(["daemon.start"]); // not immediately
+    await Bun.sleep(130);
+    const alive = read(ev.file).filter((l) => l.event === "daemon.alive");
+    expect(alive.length).toBeGreaterThanOrEqual(2);
+    expect(alive[0]).toMatchObject({ severity: "info", mode: "daemon" });
+    expect(alive.every((l) => Number.isInteger(l.uptime_sec))).toBe(true);
+    ev.stop();
+    const n = read(ev.file).length;
+    await Bun.sleep(120);
+    expect(read(ev.file)).toHaveLength(n);
+    expect(read(ev.file).at(-1).event).toBe("daemon.stop");
+  });
+
+  test("heartbeat_sec = 0 writes none", async () => {
+    const ev = log({ heartbeatSec: 0 });
+    ev.startHeartbeat();
+    await Bun.sleep(60);
+    expect(read(ev.file)).toEqual([]);
+  });
+
+  test("on stop: sessions end first, then counted auth failures, then daemon.stop, which stays the last line", () => {
+    const ev = log();
+    ev.onStop(() => ev.emit("session.end", { mode: "workspace", session_id: "w_1" }, { agent: "claude", sensitive: false }));
+    ev.authFailure("token", "/hib/info", "127.0.0.1");
+    ev.authFailure("token", "/hib/info", "127.0.0.1");
+    ev.stop({ signal: "SIGTERM" });
+    ev.stop(); // a second stop (signal after /hib/shutdown) writes nothing
+    ev.emit("session.end", { mode: "workspace" }, {}); // nor does anything after it
+    expect(read(ev.file).map((l) => [l.event, l.count ?? l.signal ?? ""])).toEqual([
+      ["auth.failure", 1],
+      ["session.end", ""],
+      ["auth.failure", 1],
+      ["daemon.stop", "SIGTERM"],
+    ]);
   });
 });
