@@ -110,7 +110,7 @@ describe("auth failures", () => {
 describe("config", () => {
   test("defaults: on, $HIB_HOME/events, 20 MB, 5 kept", () => {
     const home = tmp();
-    expect(parseConfig(Bun.TOML.parse(DEFAULT_TOML) as any, home).events).toEqual({ enabled: true, dir: join(home, "events"), maxMb: 20, keep: 5, heartbeatSec: 300 });
+    expect(parseConfig(Bun.TOML.parse(DEFAULT_TOML) as any, home).events).toEqual({ enabled: true, dir: join(home, "events"), maxMb: 20, keep: 5, heartbeatSec: 300, workspace: "path", account: "name", netHost: "full", command: "full", remote: true, keyFile: join(home, "events.key") });
   });
 
   test("keys as written in config.toml", () => {
@@ -184,5 +184,63 @@ describe("heartbeat", () => {
       ["auth.failure", 1],
       ["daemon.stop", "SIGTERM"],
     ]);
+  });
+});
+
+describe("coarsening", () => {
+  const ctx = { mode: "workspace" as const, session_id: "s1", workspace: "/home/ana/code/payroll", account: "claude@work" };
+  const fields = { tool: "Bash", command: "GITHUB_TOKEN=[CREDENTIALS] sudo -E /usr/bin/curl -s https://api.eu.example.com/x", url: "https://deploy:[CREDENTIALS]@api.eu.example.com/v1/items?a=1", net_host: "api.eu.example.com:443", decision: "allow", decided_by: "user" };
+
+  test("defaults log every field whole", () => {
+    const ev = log();
+    ev.emit("tool.permission", ctx, fields);
+    ev.authFailure("token", "/hib/chat", "127.0.0.1");
+    const [l, a] = read(ev.file);
+    expect(l).toMatchObject({ workspace: "/home/ana/code/payroll", account: "claude@work", net_host: "api.eu.example.com:443" });
+    expect(l.command).toContain("curl -s");
+    expect(a.remote).toBe("127.0.0.1");
+  });
+
+  test("name, domain, program, no remote", () => {
+    const ev = log({ workspace: "name", netHost: "domain", command: "program", remote: false });
+    ev.emit("tool.permission", ctx, fields);
+    ev.authFailure("token", "/hib/chat", "127.0.0.1");
+    const [l, a] = read(ev.file);
+    expect(l).toMatchObject({ workspace: "payroll", account: "claude@work", net_host: "example.com", url: "https://example.com", command: "curl" });
+    expect("remote" in a).toBe(false);
+  });
+
+  test("hashes are keyed, stable across restarts with the same key file, and differ with another key", () => {
+    const keyFile = join(tmp(), "home", "events.key");
+    const a = log({ workspace: "hash", account: "hash", keyFile });
+    a.emit("session.start", ctx);
+    const b = log({ workspace: "hash", account: "hash", keyFile });
+    b.emit("session.start", ctx);
+    const c = log({ workspace: "hash", account: "hash", keyFile: join(tmp(), "events.key") });
+    c.emit("session.start", ctx);
+    const [la, lb, lc] = [read(a.file)[0], read(b.file)[0], read(c.file)[0]];
+    expect(la.workspace).toMatch(/^[0-9a-f]{16}$/);
+    expect(la.account).toMatch(/^claude@[0-9a-f]{16}$/);
+    expect(lb.workspace).toBe(la.workspace);
+    expect(lb.account).toBe(la.account);
+    expect(lc.workspace).not.toBe(la.workspace);
+    expect(statSync(keyFile).mode & 0o777).toBe(0o600);
+    expect(readFileSync(a.file, "utf8")).not.toContain("payroll");
+  });
+
+  test("domainOf and programOf", () => {
+    const { domainOf, programOf } = require("../src/events");
+    expect(domainOf("a.b.example.co.uk")).toBe("example.co.uk");
+    expect(domainOf("Registry.NPMjs.org.")).toBe("npmjs.org");
+    expect(domainOf("10.0.0.5:8080")).toBe("10.0.0.5");
+    expect(domainOf("localhost")).toBe("localhost");
+    expect(programOf("FOO=1 BAR=2 env -i ./scripts/deploy.sh --prod")).toBe("deploy.sh");
+    expect(programOf("  ")).toBe("[COMMAND]");
+  });
+
+  test("config: accepted values, and a wrong value refused", () => {
+    const set = parseConfig(Bun.TOML.parse('[events]\nworkspace = "hash"\naccount = "hash"\nnet_host = "domain"\ncommand = "program"\nremote = false') as any, tmp()).events;
+    expect(set).toMatchObject({ workspace: "hash", account: "hash", netHost: "domain", command: "program", remote: false });
+    expect(() => parseConfig({ events: { workspace: "folder" } }, tmp())).toThrow(/workspace = "folder"/);
   });
 });
