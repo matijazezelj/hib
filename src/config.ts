@@ -42,6 +42,13 @@ export interface EventsConfig {
   maxMb: number;
   keep: number;
   heartbeatSec: number; // daemon.alive every this many seconds; 0 = off
+  // How much of each identifying field to log; the defaults log it whole.
+  workspace?: "path" | "name" | "hash"; // the root path, its last folder name, or a keyed hash of the path
+  account?: "name" | "hash"; // claude@work, or claude@<keyed hash of "work">
+  netHost?: "full" | "domain"; // api.eu.example.com, or example.com (also cuts url to scheme://domain)
+  command?: "full" | "program"; // the redacted command line, or only the program's name
+  remote?: boolean; // false: auth.failure lines carry no peer address
+  keyFile?: string; // the key for the hashes; it stays in hib's home, out of the events directory
 }
 
 export interface Config {
@@ -139,6 +146,12 @@ enabled = true                  # security events as JSON lines, for a log colle
 max_mb = 20                     # rotate events.jsonl at this size
 keep = 5                        # rotated files kept: events.jsonl.1 … .5
 heartbeat_sec = 300             # daemon.alive every 5 minutes, so a crash shows; 0 = off
+# How much of each identifying field goes in; the defaults log it whole:
+# workspace = "path"            # "name": last folder only; "hash": keyed hash (same folder, same hash)
+# account = "name"              # "hash": claude@<keyed hash>
+# net_host = "full"             # "domain": example.com instead of api.eu.example.com (url too)
+# command = "full"              # "program": only the program's name, not the (redacted) line
+# remote = true                 # false: no peer address on auth.failure
 `;
 
 function expandHome(p: string): string {
@@ -223,8 +236,21 @@ export function parseConfig(raw: any, home: string): Config {
       maxMb: Number(ev.max_mb ?? 20),
       keep: Number(ev.keep ?? 5),
       heartbeatSec: Number(ev.heartbeat_sec ?? 300),
+      workspace: oneOf("workspace", ev.workspace, ["path", "name", "hash"] as const),
+      account: oneOf("account", ev.account, ["name", "hash"] as const),
+      netHost: oneOf("net_host", ev.net_host, ["full", "domain"] as const),
+      command: oneOf("command", ev.command, ["full", "program"] as const),
+      remote: ev.remote ?? true,
+      keyFile: join(home, "events.key"),
     },
   };
+}
+
+/** An [events] setting from its allowed values; unset gives the first, the one that logs the field whole. */
+function oneOf<T extends string>(key: string, v: unknown, allowed: readonly T[]): T {
+  if (v === undefined) return allowed[0]!;
+  if (allowed.includes(v as T)) return v as T;
+  throw new Error(`[events] ${key} = ${JSON.stringify(v)}: use ${allowed.map((a) => `"${a}"`).join(", ")}`);
 }
 
 /** "claude@work/sonnet" | "claude/sonnet" -> parts; account falls back to the provider default. */

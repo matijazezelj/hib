@@ -1,6 +1,7 @@
-import { appendFileSync, chmodSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { createHmac, randomBytes } from "node:crypto";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { detect } from "./guard/detectors";
 import { machineTerms } from "./guard";
 import type { EventsConfig } from "./config";
@@ -92,6 +93,32 @@ function replaceSpans(text: string, spans: Span[]): string {
   return out + text.slice(pos);
 }
 
+/** Second-level labels under a two-letter country code that act as a suffix: example.co.uk keeps three labels. */
+const SLD = new Set(["co", "com", "net", "org", "gov", "ac", "edu", "or", "ne", "go"]);
+
+/** api.eu.example.com -> example.com; an IP address or a single label stays as it is; a port goes. */
+export function domainOf(host: string): string {
+  const h = host.replace(/^\[|\]$/g, "").replace(/:\d+$/, "").replace(/\.$/, "").toLowerCase();
+  if (/^[\d.]+$/.test(h) || h.includes(":")) return h;
+  const labels = h.split(".");
+  const n = labels.length >= 3 && labels.at(-1)!.length === 2 && SLD.has(labels.at(-2)!) ? 3 : 2;
+  return labels.slice(-n).join(".");
+}
+
+/** A URL cut to scheme://domain; text that isn't a URL becomes [URL]. */
+function urlDomain(url: string): string {
+  const m = /^([a-z][a-z0-9+.-]*):\/\/(?:[^\s/@]*@)?(\[[^\]]*\]|[^\s/?#:]+)/i.exec(url);
+  return m ? `${m[1]!.toLowerCase()}://${domainOf(m[2]!)}` : "[URL]";
+}
+
+/** The program a command line runs: past VAR=value assignments and sudo/env/nohup/exec/time, its file name only. */
+export function programOf(command: string): string {
+  const words = command.trim().split(/\s+/).map((w) => w.replace(/^["'(]+|["';)]+$/g, ""));
+  let i = 0;
+  while (i < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!) || ["sudo", "env", "nohup", "exec", "time", "command"].includes(words[i]!) || (i > 0 && /^-/.test(words[i]!) && ["sudo", "env"].includes(words[i - 1]!)))) i++;
+  return basename(words[i] ?? "") || "[COMMAND]";
+}
+
 export type { EventsConfig };
 
 export type Mode = "router" | "workspace" | "daemon";
@@ -146,6 +173,7 @@ export class EventLog {
   private heartbeat?: ReturnType<typeof setInterval>;
   private stopHooks: (() => void)[] = [];
   private stopped = false;
+  private key?: Buffer;
   private auth = new Map<string, { last: number; suppressed: number; path: string; remote?: string; timer?: ReturnType<typeof setTimeout> }>();
 
   constructor(
@@ -185,6 +213,50 @@ export class EventLog {
     return workspace && !isAbsolute(p) ? this.scrub(p) : this.redact(p);
   }
 
+  /**
+   * A keyed hash (HMAC-SHA256, 16 hex): the same value gives the same hash on this machine, so events still correlate,
+   * but a known path can't be hashed by anyone without the key to check a guess. The key is made on first use, 0600,
+   * in hib's home, never next to the events.
+   */
+  hash(value: string): string {
+    if (!this.key) {
+      const file = this.cfg.keyFile;
+      if (!file) this.key = randomBytes(32); // no home to keep it in (tests): hashes hold for this process only
+      else {
+        if (!existsSync(file)) {
+          mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+          try {
+            writeFileSync(file, randomBytes(32).toString("hex") + "\n", { mode: 0o600, flag: "wx" });
+          } catch (e: any) {
+            if (e?.code !== "EEXIST") throw e; // another process made it first: use theirs
+          }
+        }
+        this.key = Buffer.from(readFileSync(file, "utf8").trim(), "hex");
+      }
+    }
+    return createHmac("sha256", this.key).update(value).digest("hex").slice(0, 16);
+  }
+
+  /** The [events] coarsening settings applied to the context and to the fields they name. */
+  private coarsen(ctx: Context, fields: Record<string, unknown>): [Context, Record<string, unknown>] {
+    const c = this.cfg;
+    ctx = { ...ctx };
+    if (ctx.workspace && c.workspace === "name") ctx.workspace = basename(ctx.workspace) || ctx.workspace;
+    if (ctx.workspace && c.workspace === "hash") ctx.workspace = this.hash(ctx.workspace);
+    if (ctx.account && c.account === "hash") {
+      const at = ctx.account.indexOf("@");
+      ctx.account = at > 0 ? `${ctx.account.slice(0, at)}@${this.hash(ctx.account.slice(at + 1))}` : this.hash(ctx.account);
+    }
+    fields = { ...fields };
+    if (c.netHost === "domain") {
+      if (typeof fields.net_host === "string") fields.net_host = domainOf(fields.net_host);
+      if (typeof fields.url === "string") fields.url = urlDomain(fields.url);
+    }
+    if (c.command === "program" && typeof fields.command === "string") fields.command = programOf(fields.command);
+    if (c.remote === false) delete fields.remote;
+    return [ctx, fields];
+  }
+
   /** Every string a caller passed, at any depth, scrubbed unless hib wrote it itself (OWN_FIELDS). */
   private safe(value: unknown, key: string): unknown {
     if (typeof value === "string") return OWN_FIELDS.has(key) ? value.toWellFormed() : this.scrub(value);
@@ -195,6 +267,13 @@ export class EventLog {
 
   emit(event: string, ctx: Context, fields: Record<string, unknown> = {}): void {
     if (!this.cfg.enabled || this.stopped) return; // daemon.stop stays the last line
+    try {
+      [ctx, fields] = this.coarsen(ctx, fields);
+    } catch (e: any) {
+      // No key for the hashes (unreadable file): drop the line rather than write the field whole, and don't throw.
+      console.error(`hib: event ${event} not written: ${e?.message ?? e}`);
+      return;
+    }
     const line: Record<string, unknown> = {
       ts: this.now().toISOString(),
       schema: SCHEMA,

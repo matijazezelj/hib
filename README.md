@@ -270,7 +270,15 @@ dir = "~/.hib/events"   # default
 max_mb = 20             # rotate at this size: events.jsonl.1 … .keep
 keep = 5
 heartbeat_sec = 300     # daemon.alive interval; 0 = off
+workspace = "path"      # or "name" (last folder), "hash" (keyed hash of the path)
+account = "name"        # or "hash": claude@<keyed hash>
+net_host = "full"       # or "domain": example.com for api.eu.example.com; url cut to scheme://domain too
+command = "full"        # or "program": only the program's name (curl), not the redacted line
+remote = true           # false: auth.failure carries no peer address
 ```
+
+- The coarsening settings decide how much of each identifying field goes in; the defaults log it whole. Hashes are HMAC-SHA256 with a key made on first use in `~/.hib/events.key` (0600, never in the events folder): the same folder or account gives the same hash on one machine, so events still correlate, but a guessed path can't be checked without the key.
+- They cover the fields they name, not text elsewhere in an event: a command that `cd`s into the workspace still shows that path unless `command = "program"`.
 
 ## Performance
 
