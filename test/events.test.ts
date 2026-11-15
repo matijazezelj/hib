@@ -17,7 +17,7 @@ describe("event lines", () => {
     expect(l).toMatchObject({ schema: 1, source: "hib", event: "session.start", severity: "info", mode: "workspace", session_id: "s1", workspace: "/w", account: "claude@work", agent: "claude", sensitive: false });
     expect(l.ts).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
     expect(typeof l.host).toBe("string");
-    expect(typeof l.hib_version).toBe("string");
+    expect(l.hib_version).toBe(require("../package.json").version);
     for (const k of ["model", "run_id", "route", "gone"]) expect(k in l).toBe(false);
   });
 
