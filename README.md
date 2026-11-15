@@ -270,15 +270,28 @@ dir = "~/.hib/events"   # default
 max_mb = 20             # rotate at this size: events.jsonl.1 … .keep
 keep = 5
 heartbeat_sec = 300     # daemon.alive interval; 0 = off
+profile = "local"       # each field whole; "siem" coarsens the five below
 workspace = "path"      # or "name" (last folder), "hash" (keyed hash of the path)
 account = "name"        # or "hash": claude@<keyed hash>
-net_host = "full"       # or "domain": example.com for api.eu.example.com; url cut to scheme://domain too
-command = "full"        # or "program": only the program's name (curl), not the redacted line
+net_host = "full"       # or "domain": registrable domain; url cut to scheme://domain too
+command = "full"        # or "program": a best-effort program label, not the redacted line
 remote = true           # false: auth.failure carries no peer address
 ```
 
-- The coarsening settings decide how much of each identifying field goes in; the defaults log it whole. Hashes are HMAC-SHA256 with a key made on first use in `~/.hib/events.key` (0600, never in the events folder): the same folder or account gives the same hash on one machine, so events still correlate, but a guessed path can't be checked without the key.
-- They cover the fields they name, not text elsewhere in an event: a command that `cd`s into the workspace still shows that path unless `command = "program"`.
+- **Two profiles.** `local` (the default) logs every field whole: the most use for an investigation, for a collector on this machine, under the same access rules as the rest of `~/.hib`. `siem` is for logs that leave the machine (a central SIEM, another team's store): coarsen before the data crosses that boundary, and keep the detail here. A setting given on its own overrides the profile.
+
+  | | `local` | `siem` |
+  |---|---|---|
+  | `workspace` | path | hash |
+  | `account` | name | hash |
+  | `net_host` | full | domain |
+  | `command` | full | program |
+  | `remote` | included | left out |
+
+- **Hashes** are HMAC-SHA256 with a key made on first use in `~/.hib/events.key`, never in the events folder: the same folder or account gives the same hash on one machine, so events still correlate, but a guessed path can't be checked without the key. hib refuses a key that is a symlink, not a regular file, not yours, readable by group or others, or not 32 bytes; it then drops the event rather than write the field whole.
+- **Domains** come from the Public Suffix List (`tldts`, private suffixes included, so `you.github.io` stays apart from `them.github.io`). Loopback becomes `localhost`, IP addresses `[IP-INTERNAL]` or `[IP-EXTERNAL]`, and a name under no public suffix (`.corp`, `.local`, `.internal`, a single label) `[INTERNAL]`.
+- **`command = "program"` is lossy.** It skips assignments and wrappers (`sudo -u root`, `env -i`, `nice`, `timeout`) and looks inside `sh -c '…'`, but it splits on whitespace only: `a | b` is labelled `a`, and aliases or scripts aren't followed. It also drops the arguments most detections match on. Treat it as a label; process telemetry (Falco, auditd) is the source of truth for what ran.
+- The settings cover the fields they name, not text elsewhere in an event: a command that `cd`s into the workspace still shows that path unless `command = "program"`.
 
 ## Performance
 

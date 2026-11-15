@@ -42,7 +42,9 @@ export interface EventsConfig {
   maxMb: number;
   keep: number;
   heartbeatSec: number; // daemon.alive every this many seconds; 0 = off
-  // How much of each identifying field to log; the defaults log it whole.
+  // How much of each identifying field to log. profile "local" (default) logs each whole, "siem" coarsens all five;
+  // a setting given on its own overrides the profile.
+  profile?: "local" | "siem";
   workspace?: "path" | "name" | "hash"; // the root path, its last folder name, or a keyed hash of the path
   account?: "name" | "hash"; // claude@work, or claude@<keyed hash of "work">
   netHost?: "full" | "domain"; // api.eu.example.com, or example.com (also cuts url to scheme://domain)
@@ -146,11 +148,12 @@ enabled = true                  # security events as JSON lines, for a log colle
 max_mb = 20                     # rotate events.jsonl at this size
 keep = 5                        # rotated files kept: events.jsonl.1 … .5
 heartbeat_sec = 300             # daemon.alive every 5 minutes, so a crash shows; 0 = off
-# How much of each identifying field goes in; the defaults log it whole:
+# profile = "local"             # each field whole; "siem" coarsens all five below, for logs that leave this machine
+# Or one at a time (overrides the profile):
 # workspace = "path"            # "name": last folder only; "hash": keyed hash (same folder, same hash)
 # account = "name"              # "hash": claude@<keyed hash>
-# net_host = "full"             # "domain": example.com instead of api.eu.example.com (url too)
-# command = "full"              # "program": only the program's name, not the (redacted) line
+# net_host = "full"             # "domain": registrable domain (Public Suffix List); url too
+# command = "full"              # "program": a best-effort program label; loses the arguments detections use
 # remote = true                 # false: no peer address on auth.failure
 `;
 
@@ -203,6 +206,8 @@ export function parseConfig(raw: any, home: string): Config {
   // The collector mounts this directory: if it were hib's home (or held it), the token, vault key and database would go too.
   const rel = relative(eventsDir, resolve(home));
   if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) throw new Error(`[events] dir ${eventsDir} must not be or contain hib's home (${home}): use a directory of its own`);
+  const profile = oneOf("profile", ev.profile, ["local", "siem"] as const, "local");
+  const siem = profile === "siem";
   return {
     home,
     port: raw.port ?? 4141,
@@ -236,21 +241,26 @@ export function parseConfig(raw: any, home: string): Config {
       maxMb: Number(ev.max_mb ?? 20),
       keep: Number(ev.keep ?? 5),
       heartbeatSec: Number(ev.heartbeat_sec ?? 300),
-      workspace: oneOf("workspace", ev.workspace, ["path", "name", "hash"] as const),
-      account: oneOf("account", ev.account, ["name", "hash"] as const),
-      netHost: oneOf("net_host", ev.net_host, ["full", "domain"] as const),
-      command: oneOf("command", ev.command, ["full", "program"] as const),
-      remote: ev.remote ?? true,
+      profile,
+      workspace: oneOf("workspace", ev.workspace, ["path", "name", "hash"] as const, siem ? "hash" : "path"),
+      account: oneOf("account", ev.account, ["name", "hash"] as const, siem ? "hash" : "name"),
+      netHost: oneOf("net_host", ev.net_host, ["full", "domain"] as const, siem ? "domain" : "full"),
+      command: oneOf("command", ev.command, ["full", "program"] as const, siem ? "program" : "full"),
+      remote: typeof ev.remote === "boolean" ? ev.remote : ev.remote === undefined ? !siem : bad("remote", ev.remote, ["true", "false"]),
       keyFile: join(home, "events.key"),
     },
   };
 }
 
-/** An [events] setting from its allowed values; unset gives the first, the one that logs the field whole. */
-function oneOf<T extends string>(key: string, v: unknown, allowed: readonly T[]): T {
-  if (v === undefined) return allowed[0]!;
+/** An [events] setting from its allowed values; unset gives the profile's default. */
+function oneOf<T extends string>(key: string, v: unknown, allowed: readonly T[], dflt: T): T {
+  if (v === undefined) return dflt;
   if (allowed.includes(v as T)) return v as T;
-  throw new Error(`[events] ${key} = ${JSON.stringify(v)}: use ${allowed.map((a) => `"${a}"`).join(", ")}`);
+  return bad(key, v, allowed.map((a) => `"${a}"`));
+}
+
+function bad(key: string, v: unknown, allowed: string[]): never {
+  throw new Error(`[events] ${key} = ${JSON.stringify(v)}: use ${allowed.join(", ")}`);
 }
 
 /** "claude@work/sonnet" | "claude/sonnet" -> parts; account falls back to the provider default. */

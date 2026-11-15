@@ -1,8 +1,9 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
-import { detect } from "./guard/detectors";
+import { parse as parseHost } from "tldts";
+import { detect, isPrivateIp } from "./guard/detectors";
 import { machineTerms } from "./guard";
 import type { EventsConfig } from "./config";
 
@@ -93,16 +94,26 @@ function replaceSpans(text: string, spans: Span[]): string {
   return out + text.slice(pos);
 }
 
-/** Second-level labels under a two-letter country code that act as a suffix: example.co.uk keeps three labels. */
-const SLD = new Set(["co", "com", "net", "org", "gov", "ac", "edu", "or", "ne", "go"]);
+const LOOPBACK = /^(?:localhost|.*\.localhost|127(?:\.\d{1,3}){3}|::1|0:0:0:0:0:0:0:1)$/;
 
-/** api.eu.example.com -> example.com; an IP address or a single label stays as it is; a port goes. */
+/**
+ * The registrable domain, from the Public Suffix List (tldts, private suffixes included: you.github.io stays
+ * you.github.io, x.example.com.au becomes example.com.au). Loopback is "localhost"; an IP address becomes
+ * [IP-INTERNAL] or [IP-EXTERNAL]; a name under no public suffix (.corp, .local, .internal, a single label) becomes
+ * [INTERNAL], since its last labels would still name the network. A port goes.
+ */
 export function domainOf(host: string): string {
-  const h = host.replace(/^\[|\]$/g, "").replace(/:\d+$/, "").replace(/\.$/, "").toLowerCase();
-  if (/^[\d.]+$/.test(h) || h.includes(":")) return h;
-  const labels = h.split(".");
-  const n = labels.length >= 3 && labels.at(-1)!.length === 2 && SLD.has(labels.at(-2)!) ? 3 : 2;
-  return labels.slice(-n).join(".");
+  let h = host.trim().toLowerCase().replace(/\.$/, "");
+  const v6 = /^\[([^\]]*)\](?::\d+)?$/.exec(h);
+  if (v6) h = v6[1]!;
+  else if (h.split(":").length === 2) h = h.replace(/:\d*$/, ""); // host:port; two or more colons is a bare IPv6
+  if (LOOPBACK.test(h)) return "localhost";
+  const p = parseHost(h, { allowPrivateDomains: true });
+  if (p.isIp) {
+    const internal = h.includes(":") ? /^f[cd]|^fe[89ab]/.test(h) : isPrivateIp(h);
+    return internal ? "[IP-INTERNAL]" : "[IP-EXTERNAL]";
+  }
+  return p.domain && (p.isIcann || p.isPrivate) ? p.domain : "[INTERNAL]";
 }
 
 /** A URL cut to scheme://domain; text that isn't a URL becomes [URL]. */
@@ -111,12 +122,80 @@ function urlDomain(url: string): string {
   return m ? `${m[1]!.toLowerCase()}://${domainOf(m[2]!)}` : "[URL]";
 }
 
-/** The program a command line runs: past VAR=value assignments and sudo/env/nohup/exec/time, its file name only. */
-export function programOf(command: string): string {
-  const words = command.trim().split(/\s+/).map((w) => w.replace(/^["'(]+|["';)]+$/g, ""));
+/** Wrappers that run another program, with the options that take a value (so the value isn't read as the program). */
+const WRAPPERS: Record<string, Set<string>> = {
+  sudo: new Set(["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "-U", "--user", "--group", "--chdir", "--prompt", "--host", "--role", "--type", "--other-user", "--close-from", "--command-timeout"]),
+  doas: new Set(["-u", "-C"]),
+  env: new Set(["-u", "-C", "--unset", "--chdir"]),
+  nice: new Set(["-n", "--adjustment"]),
+  exec: new Set(["-a"]),
+  time: new Set(["-f", "-o", "--format", "--output"]),
+  nohup: new Set(),
+  command: new Set(),
+  timeout: new Set(["-s", "-k", "--signal", "--kill-after"]), // its first operand is the duration
+};
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
+
+/**
+ * A best-effort label for what a command line runs, not an authoritative identity: no shell parsing beyond splitting
+ * on whitespace. Skips VAR=value assignments and the WRAPPERS with their options; `bash -c '<cmd>'` and `env -S` give
+ * the program inside. Pipelines, `;`, `&&`, subshells and aliases are not followed: `a | b` is labelled `a`. Process
+ * telemetry (Falco, auditd) remains the source of truth for what actually ran.
+ */
+export function programOf(command: string, depth = 0): string {
+  const words = command.trim().split(/\s+/).map((w) => w.replace(/^["'(]+|["';)]+$/g, "")).filter(Boolean);
   let i = 0;
-  while (i < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!) || ["sudo", "env", "nohup", "exec", "time", "command"].includes(words[i]!) || (i > 0 && /^-/.test(words[i]!) && ["sudo", "env"].includes(words[i - 1]!)))) i++;
-  return basename(words[i] ?? "") || "[COMMAND]";
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!)) i++;
+  while (i < words.length) {
+    const w = basename(words[i]!);
+    const opts = WRAPPERS[w];
+    if (opts) {
+      i++;
+      while (i < words.length && words[i]!.startsWith("-")) {
+        const o = words[i]!;
+        if (o === "--") {
+          i++;
+          break;
+        }
+        if (w === "env" && (o === "-S" || o === "--split-string") && depth < 3) return programOf(words.slice(i + 1).join(" "), depth + 1);
+        i += opts.has(o) ? 2 : 1; // "-u root" takes two words, "--user=root" one
+      }
+      if (w === "env" || w === "sudo" || w === "doas") while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!)) i++;
+      if (w === "timeout") i++; // the duration
+      continue;
+    }
+    if (SHELLS.has(w) && depth < 3) {
+      const c = words.findIndex((x, j) => j > i && /^-[a-z]*c[a-z]*$/.test(x));
+      if (c > 0 && c + 1 < words.length) return programOf(words.slice(c + 1).join(" "), depth + 1);
+    }
+    return w || "[COMMAND]";
+  }
+  return "[COMMAND]";
+}
+
+/**
+ * The hash key, refused unless it is what hib made: a regular file (not a symlink: opened with O_NOFOLLOW), owned by
+ * this user, no access for group or others, holding exactly 32 bytes as hex. Someone who could swap it could make the
+ * hashes of every folder known to them.
+ */
+export function readKey(file: string): Buffer {
+  let fd: number;
+  try {
+    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  } catch (e: any) {
+    throw new Error(`${file}: ${e?.code === "ELOOP" ? "is a symlink" : (e?.message ?? e)}`);
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error(`${file}: not a regular file`);
+    if (process.getuid && st.uid !== process.getuid()) throw new Error(`${file}: not owned by this user`);
+    if (st.mode & 0o077) throw new Error(`${file}: group or others can access it (chmod 600)`);
+    const text = readFileSync(fd, "utf8");
+    if (!/^[0-9a-f]{64}\n?$/.test(text)) throw new Error(`${file}: not a 32-byte hex key`);
+    return Buffer.from(text.trim(), "hex");
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export type { EventsConfig };
@@ -231,7 +310,7 @@ export class EventLog {
             if (e?.code !== "EEXIST") throw e; // another process made it first: use theirs
           }
         }
-        this.key = Buffer.from(readFileSync(file, "utf8").trim(), "hex");
+        this.key = readKey(file);
       }
     }
     return createHmac("sha256", this.key).update(value).digest("hex").slice(0, 16);

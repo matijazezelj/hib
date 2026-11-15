@@ -28,6 +28,7 @@
     "react": "19",
     "react-dom": "19",
     "react-markdown": "9",
-    "remark-gfm": "4"
+    "remark-gfm": "4",
+    "tldts": "7.4.19"
   }
 }
