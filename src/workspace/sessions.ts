@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { basename, sep, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { loadTable, TABLE_FILE } from "../analyze/table";
 import { columnsToHide, pseudonymizeWithSpans } from "../analyze/pseudo";
-import { DATA_RULE_NOTE, rawDataCommand } from "./datarules";
+import { DATA_RULE_NOTE, dataBlockEventReason, rawDataCommand } from "./datarules";
 import { readdirSync, statSync } from "node:fs";
 
 export type DriverFactory = (provider: string) => AgentDriver | null;
@@ -678,13 +678,14 @@ export class WorkspaceSessions {
             if (e.call.outbound) call.outbound = webOutbound(e.call.outbound);
             if (policy && call.kind === "command" && call.command) {
               // Raw reads of data through the shell are refused outright; the agent is told to use Read instead.
-              const why = rawDataCommand(call.command, root, dataFiles());
-              if (why) {
+              const block = rawDataCommand(call.command, root, dataFiles());
+              if (block) {
+                const why = block.text; // the agent, the user and the local session record get the detail; the event may not
                 const message = `Blocked by hib: this folder is sensitive and ${why}. Read data files with the Read tool instead (you get a pseudonymised copy).`;
                 l.driver.answer(e.id, { behavior: "deny", message });
                 const ev = { type: "tool_result" as const, id: call.id, ok: false, output: `denied: ${why}` };
                 this.record(sid, { type: "data_block", command: call.command, why });
-                this.events.emit("data.block", this.evCtx(sid, root, c), { command: this.events.redact(call.command), reason: why });
+                this.events.emit("data.block", this.evCtx(sid, root, c), { command: this.events.redact(call.command), reason: dataBlockEventReason(block, this.events.cfg.command, (t) => this.events.redact(t)) });
                 this.record(sid, { type: "tool_call", call });
                 this.record(sid, ev);
                 yield { type: "tool_call", call };

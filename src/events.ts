@@ -176,12 +176,14 @@ export function programOf(command: string, depth = 0): string {
 /**
  * The hash key, refused unless it is what hib made: a regular file (not a symlink: opened with O_NOFOLLOW), owned by
  * this user, no access for group or others, holding exactly 32 bytes as hex. Someone who could swap it could make the
- * hashes of every folder known to them.
+ * hashes of every folder known to them. Opened with O_NONBLOCK so a named pipe put there fails the regular-file check
+ * instead of blocking the open (and the daemon with it); nothing is read before the checks pass, and never more than
+ * the 65 bytes a key file can hold.
  */
 export function readKey(file: string): Buffer {
   let fd: number;
   try {
-    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
   } catch (e: any) {
     throw new Error(`${file}: ${e?.code === "ELOOP" ? "is a symlink" : (e?.message ?? e)}`);
   }
@@ -190,8 +192,9 @@ export function readKey(file: string): Buffer {
     if (!st.isFile()) throw new Error(`${file}: not a regular file`);
     if (process.getuid && st.uid !== process.getuid()) throw new Error(`${file}: not owned by this user`);
     if (st.mode & 0o077) throw new Error(`${file}: group or others can access it (chmod 600)`);
-    const text = readFileSync(fd, "utf8");
-    if (!/^[0-9a-f]{64}\n?$/.test(text)) throw new Error(`${file}: not a 32-byte hex key`);
+    if (st.size > 65) throw new Error(`${file}: not a 32-byte hex key`);
+    const text = readFileSync(fd, "utf8"); // grown since the fstat: the length check below still refuses it
+    if (text.length > 65 || !/^[0-9a-f]{64}\n?$/.test(text)) throw new Error(`${file}: not a 32-byte hex key`);
     return Buffer.from(text.trim(), "hex");
   } finally {
     closeSync(fd);
