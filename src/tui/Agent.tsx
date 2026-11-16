@@ -165,6 +165,9 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
       case "protected_reverted":
         push({ text: `hib put back ${e.changes.length} unapproved change(s) to git hooks/config or tool config: ${e.changes.map((c: any) => `${c.path} (${c.change})`).join(", ")}${e.failed.length ? `; couldn't restore ${e.failed.join(", ")}` : ""}. If you made one yourself, redo it.`, color: "red" });
         break;
+      case "home_changed":
+        push({ text: `${e.changes.some((c: any) => !c.approved) ? "files outside this folder changed during the turn" : "approved changes outside this folder"}: ${e.changes.map((c: any) => `${c.path} (${c.change}${c.approved ? ", approved" : ""})`).join(", ")}. hib doesn't put these back: check them if you didn't make the change.`, color: e.changes.some((c: any) => !c.approved) ? "red" : "yellow" });
+        break;
       case "guard":
         if (Object.keys(e.findings).length) push({ text: `guard ${e.action}: ${Object.entries(e.findings).map(([k, v]) => `${k}×${v}`).join(" ")}`, color: "yellow" });
         break;
