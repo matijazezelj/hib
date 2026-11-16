@@ -25,7 +25,7 @@ const SCAN_MAX = 8192; // text past this can't reach the 300 characters that are
  */
 const OWN_FIELDS = new Set([
   "ts", "schema", "source", "host", "hib_version", "event", "severity", "mode", "session_id", "run_id", "workspace", "account", "model", "route",
-  "bind", "port", "sandbox", "remote", "decision", "decided_by", "action", "kind", "agent", "sensitive", "count", "uptime_sec", "timeout_sec", "signal", "change", "findings",
+  "bind", "port", "sandbox", "remote", "decision", "decided_by", "action", "kind", "agent", "sensitive", "count", "uptime_sec", "timeout_sec", "signal", "change", "findings", "script_driver",
 ]);
 
 /** Lone surrogates become U+FFFD (every line stays valid UTF-8); zero-width and bidi controls go; look-alike forms fold (NFKC). */
