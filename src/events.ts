@@ -103,6 +103,17 @@ const PLACEHOLDER_HOST = new RegExp(String.raw`^(${PLACEHOLDER})(?::\d*)?$`);
 /** scheme://[userinfo@]PLACEHOLDER[:port] up to the end of the authority (\ ends it too, as in new URL). */
 const PLACEHOLDER_URL = new RegExp(String.raw`^([A-Za-z][A-Za-z0-9+.-]*):\/\/(?:[^\s\/?#\\]*@)?(${PLACEHOLDER})(?::\d*)?(?:[\/?#\\]|$)`);
 
+/**
+ * A placeholder reduced to its category, so only what the scrubber writes passes: [HIBab12-IP-INTERNAL-NET1-1] and
+ * [IP-INTERNAL] both give [IP-INTERNAL]. Other bracketed text ([ACME-PAYROLL]) is a name, not a placeholder: [INTERNAL].
+ */
+const CATEGORIES = ["IP-INTERNAL", "IP-EXTERNAL", "INTERNAL", "HOST", "IP", "EMAIL", "USER", "PATH", "CONTAINER", "PERSON", "TERM", "TEXT", "HIGH-ENTROPY", "CREDENTIALS"];
+function placeholderClass(p: string): string {
+  const core = p.slice(1, -1).replace(/^HIB[0-9a-f]{4}-/, "");
+  const cat = CATEGORIES.find((c) => core === c || core.startsWith(c + "-"));
+  return cat ? `[${cat}]` : "[INTERNAL]";
+}
+
 /** What a host that can't be parsed becomes; never the input text. */
 const BAD_HOST = "[HOST]";
 const BAD_URL = "[URL]";
@@ -197,12 +208,12 @@ function hostClass(hostname: string | null): string {
  * becomes example.com.au). IDN comes out as punycode. Loopback is "localhost"; an IP address (in any form new URL
  * accepts) becomes [IP-INTERNAL] or [IP-EXTERNAL]; a name under no ICANN suffix (.corp, .local, .internal, .arpa, a
  * single label) becomes [INTERNAL], since its last labels would still name the network. A port goes. A placeholder
- * the scrubber left ([IP-INTERNAL]) stays as it is; anything that doesn't parse is [HOST].
+ * the scrubber left gives its category ([IP-INTERNAL]); anything that doesn't parse is [HOST].
  */
 export function domainOf(host: string): string {
   const h = host.trim();
   const placeholder = PLACEHOLDER_HOST.exec(h);
-  if (placeholder) return placeholder[1]!;
+  if (placeholder) return placeholderClass(placeholder[1]!);
   return hostClass(canonicalHost(h));
 }
 
@@ -214,7 +225,7 @@ export function domainOf(host: string): string {
 export function urlDomain(url: string): string {
   const u = url.trim();
   const placeholder = PLACEHOLDER_URL.exec(u);
-  if (placeholder) return `${placeholder[1]!.toLowerCase()}://${placeholder[2]!}`;
+  if (placeholder) return `${placeholder[1]!.toLowerCase()}://${placeholderClass(placeholder[2]!)}`;
   let parsed: URL;
   try {
     // An IPv6 zone id ([fe80::1%25eth0]) makes new URL throw; it says nothing about where the request goes.
@@ -444,6 +455,7 @@ export function programOf(command: string, depth = 0): string {
       if (c > 0 && c + 1 < words.length) return inner(words[c + 1]!.text, c + 1);
     }
     if (words.slice(0, i + 1).some((x) => x.live)) return "[COMMAND]";
+    if (/[<>]/.test(words[i]!.text)) return "[COMMAND]"; // <file cmd, 2>log cmd: the file is no label
     return w && !/[\s=$]/.test(w) ? w : "[COMMAND]";
   }
   return "[COMMAND]";

@@ -47,3 +47,18 @@ describe("profile siem, end to end", () => {
     for (const s of ["horse", "battery", "passwd", "/root", "good.com", "router", "acme", "payroll", "tok3n", "ana.kovac", "10.0.0.1", "169.254", "extract.py"]) expect(text).not.toContain(s);
   });
 });
+
+describe("fail closed", () => {
+  const { domainOf, urlDomain, programOf } = require("../src/events");
+  test("only the scrubber's categories pass through as placeholders", () => {
+    expect(domainOf("[ACME-PAYROLL-2026]")).toBe("[INTERNAL]");
+    expect(urlDomain("https://[ACME-PAYROLL-2026]/")).toBe("https://[INTERNAL]");
+    expect(domainOf("[HIBab12-IP-INTERNAL-NET1-1]:443")).toBe("[IP-INTERNAL]");
+    expect(urlDomain("https://[HIBab12-IP-EXTERNAL-NET2-1]/x")).toBe("https://[IP-EXTERNAL]");
+  });
+  test("a leading redirection is not the program", () => {
+    expect(programOf("</srv/acme/payroll_2026.csv sort")).toBe("[COMMAND]");
+    expect(programOf("2>/srv/acme/run.log curl x")).toBe("[COMMAND]");
+    expect(programOf("curl x >/srv/acme/out")).toBe("curl");
+  });
+});

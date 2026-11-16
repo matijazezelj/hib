@@ -73,13 +73,14 @@ describe("domainOf", () => {
     ]);
   });
 
-  test("placeholders the scrubber left pass through, port dropped", () => {
+  test("placeholders the scrubber left give their category, port dropped", () => {
     check(domainOf, [
       ["[IP-INTERNAL]", "[IP-INTERNAL]"],
       ["[IP-INTERNAL]:8443", "[IP-INTERNAL]"],
-      ["[HOST-1]", "[HOST-1]"],
-      ["[HIBab12-IP-INTERNAL-NET1-1]", "[HIBab12-IP-INTERNAL-NET1-1]"],
-      ["[HIBab12-IP-INTERNAL-NET1-1]:22", "[HIBab12-IP-INTERNAL-NET1-1]"],
+      ["[HOST-1]", "[HOST]"],
+      ["[ACME-PAYROLL-2026]", "[INTERNAL]"], // not a scrubber category: a name
+      ["[HIBab12-IP-INTERNAL-NET1-1]", "[IP-INTERNAL]"],
+      ["[HIBab12-IP-INTERNAL-NET1-1]:22", "[IP-INTERNAL]"],
     ]);
   });
 
@@ -115,7 +116,7 @@ describe("urlDomain", () => {
       ["https://[IP-INTERNAL]", "https://[IP-INTERNAL]"],
       ["https://[IP-INTERNAL]:8443/x?y#z", "https://[IP-INTERNAL]"],
       ["https://deploy:[CREDENTIALS]@[IP-INTERNAL]/v1", "https://[IP-INTERNAL]"],
-      ["https://[HIBab12-IP-INTERNAL-NET1-1]:8080/x", "https://[HIBab12-IP-INTERNAL-NET1-1]"],
+      ["https://[HIBab12-IP-INTERNAL-NET1-1]:8080/x", "https://[IP-INTERNAL]"],
       ["https://deploy:[CREDENTIALS]@api.eu.example.com/v1", "https://example.com"],
     ]);
   });
