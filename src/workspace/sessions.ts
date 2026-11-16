@@ -12,7 +12,8 @@ import { changes as protectedChanges, revert as revertProtected, snapshot as pro
 import { detect, type Finding } from "../guard/detectors";
 import { onPinnedAccount, pinnedModel, SENSITIVE_NEEDS_CLAUDE, supportsSensitive } from "./registry";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { homeChanges, homePath, homeSnapshot, type HomeSnapshot, type HomeWatch } from "./homewatch";
 import { basename, sep, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { loadTable, TABLE_FILE } from "../analyze/table";
 import { columnsToHide, pseudonymizeWithSpans } from "../analyze/pseudo";
@@ -35,6 +36,7 @@ export type WsEvent =
   | { type: "sent"; account: string; model: string; text: string; handoff: boolean; progress?: boolean; chars: number }
   | { type: "pseudonymised"; file: string; columns: string[]; callId?: string; names?: string } // names: why the copy's names weren't (all) checked
   | { type: "protected_reverted"; changes: { path: string; change: string }[]; failed: string[] } // unapproved changes to git hooks/config or tool config, put back
+  | { type: "home_changed"; changes: { path: string; change: string; approved: boolean }[] } // shell startup files, user agent config etc. changed during the turn: reported, not put back
   | AgentEvent
   | { type: "done" }
   | { type: "turn_end" }; // always last; clients stop following a turn here
@@ -62,6 +64,7 @@ interface Live {
   advisorKey?: string; // set when this CLI was started with hib's advisor tool
   sandboxed: boolean; // the agent's commands run in the CLI's OS sandbox
   approvedProtected: Set<string>; // protected files you approved edits to in the running turn (real paths)
+  approvedHome: Set<string>; // files under your home you approved edits to in the running turn ("~/..." form)
 }
 
 /**
@@ -240,6 +243,16 @@ export class WorkspaceSessions {
     private daemonUrl = "",
     private sandbox: (cfg: Config) => Sandbox | undefined = sandboxFor,
   ) {}
+
+  /** The home folder whose startup files and agent config each turn watches (tests point it elsewhere). */
+  homeDir = homedir();
+
+  /** What the home watch covers: the home folder, plus every account's Claude config dir and Codex home. */
+  private homeWatch(): HomeWatch {
+    const expand = (p: string) => (p.startsWith("~/") ? join(this.homeDir, p.slice(2)) : p);
+    const dirs = (k: string) => this.cfg.accounts.map((a) => a.env[k]).filter((p): p is string => !!p).map(expand);
+    return { home: this.homeDir, claudeDirs: dirs("CLAUDE_CONFIG_DIR"), codexDirs: dirs("CODEX_HOME") };
+  }
 
   /** Whether agent commands can be confined here; auto mode and background tasks need it. */
   sandboxed(): boolean {
@@ -452,7 +465,7 @@ export class WorkspaceSessions {
       }
     }
     await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools, session: id });
-    const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox, approvedProtected: new Set() };
+    const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox, approvedProtected: new Set(), approvedHome: new Set() };
     this.live.set(id, l);
     this.events.emit("session.start", this.evCtx(id, root, c), { agent: c.provider, sensitive: askReads });
     return l;
@@ -647,6 +660,15 @@ export class WorkspaceSessions {
     // Git hooks/config and tool config, by content: whatever changes there this turn without your approval is put back.
     const guarded = protectedSnapshot(root);
     l.approvedProtected.clear();
+    // Shell startup files and user-level agent config: changes are reported, not put back (you edit them too).
+    const watch = this.homeWatch();
+    let homeBefore: HomeSnapshot | "failed";
+    try {
+      homeBefore = homeSnapshot(watch);
+    } catch {
+      homeBefore = "failed"; // reported after the turn: the check must never go quiet
+    }
+    l.approvedHome.clear();
 
     try {
       for await (const e of l.driver.turn(prompt)) {
@@ -755,6 +777,22 @@ export class WorkspaceSessions {
       this.record(sid, protectedEv);
       yield protectedEv;
     }
+    {
+      const failed = { type: "home_changed" as const, changes: [{ path: "(the check failed: inspect shell startup files and ~/.claude, ~/.codex by hand)", change: "changed", approved: false }] };
+      let homeEv: Extract<WsEvent, { type: "home_changed" }> | undefined;
+      try {
+        const changed = homeBefore === "failed" ? null : homeChanges(homeBefore, watch);
+        if (!changed) homeEv = failed;
+        else if (changed.length) homeEv = { type: "home_changed", changes: changed.map((x) => ({ ...x, approved: l!.approvedHome.has(x.path.replace(/ \(link target\)$/, "")) })) };
+      } catch {
+        homeEv = failed;
+      }
+      if (homeEv) {
+        this.events.emit("home.changed", this.evCtx(sid, root, c), { changes: homeEv.changes });
+        this.record(sid, homeEv);
+        yield homeEv;
+      }
+    }
     const tail = restorer.flush();
     answer += tail;
     if (tail) yield { type: "text", delta: tail };
@@ -799,7 +837,15 @@ export class WorkspaceSessions {
    * pseudonymised copy. If that copy can't be made, the read is denied: it was approved on the promise of the copy.
    */
   private async allowDecision(l: Live, call: ToolCall, input: unknown): Promise<Decision> {
-    if (call.kind === "edit") for (const p of call.paths ?? (call.path ? [call.path] : [])) if (protectedPath(l.root, p)) l.approvedProtected.add(realTarget(l.root, p));
+    if (call.kind === "edit")
+      for (const p of call.paths ?? (call.path ? [call.path] : [])) {
+        if (protectedPath(l.root, p)) l.approvedProtected.add(realTarget(l.root, p));
+        const w = this.homeWatch();
+        for (const abs of [isAbsolute(p) ? p : resolvePath(l.root, p), realTarget(l.root, p)]) {
+          const t = homePath(w, abs);
+          if (!t.startsWith("[outside")) l.approvedHome.add(t);
+        }
+      }
     if (input === undefined) return { behavior: "allow" };
     // A web fetch or search leaves the machine: placeholders go out as placeholders, never as the real values.
     if (call.kind === "web" && call.host === undefined) return { behavior: "allow", updatedInput: input };

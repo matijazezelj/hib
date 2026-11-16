@@ -101,6 +101,7 @@ beforeEach(async () => {
     "",
     FAKE_SANDBOX,
   );
+  sessions.homeDir = realpathSync(mkdtempSync(join(tmpdir(), "hib-home-"))); // never the real home in tests
   notes = [];
   tasks = new Tasks(engine, sessions, { dir: wtDir, notify: (title, body) => notes.push([title, body]) });
 });
