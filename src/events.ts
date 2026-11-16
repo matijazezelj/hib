@@ -122,11 +122,19 @@ function urlDomain(url: string): string {
   return m ? `${m[1]!.toLowerCase()}://${domainOf(m[2]!)}` : "[URL]";
 }
 
-/** Wrappers that run another program, with the options that take a value (so the value isn't read as the program). */
+/**
+ * Wrappers that run another program, with the options that take a value (so the value isn't read as the program).
+ * An extra entry only skips one word too many; a missing one logs the value, so when in doubt an option is listed.
+ */
 const WRAPPERS: Record<string, Set<string>> = {
-  sudo: new Set(["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "-U", "--user", "--group", "--chdir", "--prompt", "--host", "--role", "--type", "--other-user", "--close-from", "--command-timeout"]),
-  doas: new Set(["-u", "-C"]),
-  env: new Set(["-u", "-C", "--unset", "--chdir"]),
+  // sudo(8) -C -D -g -h -p -R -T -U -u; -a -c (BSD auth, login class) and -r -t (SELinux) exist only in some builds
+  sudo: new Set([
+    "-a", "-c", "-C", "-D", "-g", "-h", "-p", "-R", "-r", "-T", "-t", "-U", "-u",
+    "--auth-type", "--login-class", "--close-from", "--chdir", "--group", "--host", "--prompt", "--chroot", "--role",
+    "--command-timeout", "--type", "--other-user", "--user",
+  ]),
+  doas: new Set(["-a", "-u", "-C"]),
+  env: new Set(["-a", "-u", "-C", "-P", "-S", "--argv0", "--unset", "--chdir", "--split-string"]),
   nice: new Set(["-n", "--adjustment"]),
   exec: new Set(["-a"]),
   time: new Set(["-f", "-o", "--format", "--output"]),
@@ -136,39 +144,202 @@ const WRAPPERS: Record<string, Set<string>> = {
 };
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
 
+/** A shell word with its quotes removed; `live` if it holds a command substitution or a `$'...'` string. */
+type ShellWord = { text: string; live: boolean };
+
 /**
- * A best-effort label for what a command line runs, not an authoritative identity: no shell parsing beyond splitting
- * on whitespace. Skips VAR=value assignments and the WRAPPERS with their options; `bash -c '<cmd>'` and `env -S` give
- * the program inside. Pipelines, `;`, `&&`, subshells and aliases are not followed: `a | b` is labelled `a`. Process
- * telemetry (Falco, auditd) remains the source of truth for what actually ran.
+ * Splits a command line into words the way a POSIX shell would quote them: single quotes literal, double quotes and
+ * backslash escapes honoured; unquoted `; | & ( )` end a word. `$(...)` and backticks are kept as text and mark the
+ * word live. Returns null for anything it can't balance (open quote, open `$(`, trailing backslash).
+ */
+function shellWords(s: string): ShellWord[] | null {
+  const words: ShellWord[] = [];
+  let text = "";
+  let live = false;
+  let inWord = false;
+  const end = () => {
+    if (inWord) words.push({ text, live });
+    text = "";
+    live = false;
+    inWord = false;
+  };
+  /** From s[j] just past "$(", returns the index just past the matching ")", or -1. Quotes inside are skipped whole. */
+  const closeParen = (j: number): number => {
+    let d = 1;
+    while (j < s.length) {
+      const ch = s[j]!;
+      if (ch === "\\") j += 2;
+      else if (ch === "'") {
+        const k = s.indexOf("'", j + 1);
+        if (k < 0) return -1;
+        j = k + 1;
+      } else if (ch === '"') {
+        j++;
+        while (j < s.length && s[j] !== '"') j += s[j] === "\\" ? 2 : 1;
+        if (j >= s.length) return -1;
+        j++;
+      } else if (ch === "`") {
+        const k = closeTick(j + 1);
+        if (k < 0) return -1;
+        j = k;
+      } else {
+        if (ch === "(") d++;
+        else if (ch === ")" && --d === 0) return j + 1;
+        j++;
+      }
+    }
+    return -1;
+  };
+  /** From s[j] just past "`", returns the index just past the closing backtick, or -1. */
+  const closeTick = (j: number): number => {
+    while (j < s.length) {
+      if (s[j] === "\\") j += 2;
+      else if (s[j] === "`") return j + 1;
+      else j++;
+    }
+    return -1;
+  };
+  /** A substitution starting at s[j] ("$(" or "`"): appends it to the word, returns the index past it, or -1. */
+  const subst = (j: number): number => {
+    const k = s[j] === "`" ? closeTick(j + 1) : closeParen(j + 2);
+    if (k < 0) return -1;
+    text += s.slice(j, k);
+    live = true;
+    return k;
+  };
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i]!;
+    if (/\s/.test(ch)) {
+      end();
+      i++;
+    } else if (";|&()".includes(ch)) {
+      if (ch === "(" && inWord) return null; // A=(s1 s2): an array assignment, or a function definition
+      end();
+      i++;
+    } else if (ch === "\\") {
+      if (i + 1 >= s.length) return null;
+      if (s[i + 1] !== "\n") {
+        text += s[i + 1]!;
+        inWord = true;
+      }
+      i += 2;
+    } else if (ch === "'") {
+      const k = s.indexOf("'", i + 1);
+      if (k < 0) return null;
+      text += s.slice(i + 1, k);
+      inWord = true;
+      i = k + 1;
+    } else if (ch === "$" && s[i + 1] === "'") {
+      // $'...' can spell any byte with escapes: kept as text, marked live so it is never taken as the program
+      let j = i + 2;
+      while (j < s.length && s[j] !== "'") j += s[j] === "\\" ? 2 : 1;
+      if (j >= s.length) return null;
+      text += s.slice(i + 2, j);
+      live = inWord = true;
+      i = j + 1;
+    } else if ((ch === "$" && s[i + 1] === "(") || ch === "`") {
+      inWord = true;
+      i = subst(i);
+      if (i < 0) return null;
+    } else if (ch === '"') {
+      inWord = true;
+      i++;
+      for (;;) {
+        if (i >= s.length) return null;
+        const c = s[i]!;
+        if (c === '"') {
+          i++;
+          break;
+        }
+        if (c === "\\") {
+          if (i + 1 >= s.length) return null;
+          const n = s[i + 1]!;
+          if (n !== "\n") text += "$`\"\\".includes(n) ? n : c + n;
+          i += 2;
+        } else if ((c === "$" && s[i + 1] === "(") || c === "`") {
+          i = subst(i);
+          if (i < 0) return null;
+        } else {
+          text += c;
+          i++;
+        }
+      }
+    } else {
+      text += ch;
+      inWord = true;
+      i++;
+    }
+  }
+  end();
+  return words;
+}
+
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * A best-effort label for what a command line runs, not an authoritative identity. Splits the line into shell words
+ * (quotes and escapes honoured, nothing expanded), skips VAR=value assignments and the WRAPPERS with their options;
+ * `bash -c '<cmd>'` and `env -S` give the program inside. Pipelines, `;`, `&&`, subshells and aliases are not
+ * followed: `a | b` is labelled `a`. Fails closed to [COMMAND]: on quotes it can't balance, on a command substitution
+ * or `$'...'` at or before the program word, and on a label that holds whitespace, `=` or `$` (so a quoted secret
+ * or an unexpanded variable is never the label). Process telemetry (Falco, auditd) remains the source of truth for
+ * what actually ran.
  */
 export function programOf(command: string, depth = 0): string {
-  const words = command.trim().split(/\s+/).map((w) => w.replace(/^["'(]+|["';)]+$/g, "")).filter(Boolean);
+  const words = shellWords(command);
+  if (!words) return "[COMMAND]";
+  /** Recurse on the text of one word (bash -c, env -S), unless a word before it is live; the inner parse judges its own. */
+  const inner = (text: string, upto: number): string =>
+    depth < 3 && !words.slice(0, upto).some((x) => x.live) ? programOf(text, depth + 1) : "[COMMAND]";
   let i = 0;
-  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!)) i++;
+  while (i < words.length && ASSIGNMENT.test(words[i]!.text)) i++;
   while (i < words.length) {
-    const w = basename(words[i]!);
-    const opts = WRAPPERS[w];
+    const w = basename(words[i]!.text);
+    const opts = Object.hasOwn(WRAPPERS, w) ? WRAPPERS[w] : undefined; // not "constructor" etc. from the prototype
     if (opts) {
       i++;
-      while (i < words.length && words[i]!.startsWith("-")) {
-        const o = words[i]!;
+      while (i < words.length && words[i]!.text.startsWith("-")) {
+        const o = words[i]!.text;
         if (o === "--") {
           i++;
           break;
         }
-        if (w === "env" && (o === "-S" || o === "--split-string") && depth < 3) return programOf(words.slice(i + 1).join(" "), depth + 1);
-        i += opts.has(o) ? 2 : 1; // "-u root" takes two words, "--user=root" one
+        // the option's value: "-u root" / "--user root" -> the next word, "-uroot" / "--user=root" -> attached,
+        // grouped short options "-Eu root" / "-Euroot" -> the first letter that takes a value
+        let name = o;
+        let value: string | undefined;
+        let next = false;
+        if (o.startsWith("--")) {
+          const eq = o.indexOf("=");
+          if (eq > 0) [name, value] = [o.slice(0, eq), o.slice(eq + 1)];
+          else next = opts.has(o);
+        } else {
+          for (let k = 1; k < o.length; k++) {
+            if (!opts.has(`-${o[k]}`)) continue;
+            name = `-${o[k]}`;
+            if (k + 1 < o.length) value = o.slice(k + 1);
+            else next = true;
+            break;
+          }
+        }
+        if (w === "env" && (name === "-S" || name === "--split-string")) {
+          if (value !== undefined) return inner(value, i);
+          if (next && i + 1 < words.length) return inner(words[i + 1]!.text, i + 1);
+          return "[COMMAND]";
+        }
+        i += next ? 2 : 1;
       }
-      if (w === "env" || w === "sudo" || w === "doas") while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!)) i++;
+      if (w === "env" || w === "sudo" || w === "doas") while (i < words.length && ASSIGNMENT.test(words[i]!.text)) i++;
       if (w === "timeout") i++; // the duration
       continue;
     }
     if (SHELLS.has(w) && depth < 3) {
-      const c = words.findIndex((x, j) => j > i && /^-[a-z]*c[a-z]*$/.test(x));
-      if (c > 0 && c + 1 < words.length) return programOf(words.slice(c + 1).join(" "), depth + 1);
+      const c = words.findIndex((x, j) => j > i && /^-[a-z]*c[a-z]*$/.test(x.text));
+      if (c > 0 && c + 1 < words.length) return inner(words[c + 1]!.text, c + 1);
     }
-    return w || "[COMMAND]";
+    if (words.slice(0, i + 1).some((x) => x.live)) return "[COMMAND]";
+    return w && !/[\s=$]/.test(w) ? w : "[COMMAND]";
   }
   return "[COMMAND]";
 }
