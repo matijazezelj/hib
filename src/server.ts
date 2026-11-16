@@ -1,3 +1,4 @@
+import { ScriptDriver } from "./workspace/script-driver";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Engine, HibEvent, ChatInput } from "./engine";
@@ -146,7 +147,7 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
       const root = workspaces.resolve(q(req, "root"));
       return root ? fn(root, req) : json({ error: { message: "unknown workspace; run hib in that folder first" } }, 404);
     });
-  const sessions = new WorkspaceSessions(engine, engine.sealer, (p) => (p === "claude" ? new ClaudeDriver() : p === "codex" ? new CodexDriver() : null), `http://127.0.0.1:${port}`);
+  const sessions = new WorkspaceSessions(engine, engine.sealer, (p) => (p === "claude" ? new ClaudeDriver() : p === "codex" ? new CodexDriver() : p === "script" && engine.cfg.testing.scriptDir ? new ScriptDriver(engine.cfg.testing.scriptDir) : null), `http://127.0.0.1:${port}`);
   const tasks = new Tasks(engine, sessions, { dir: defaultWorktreeDir() });
   // Task worktrees are registered so their sessions run like any workspace, but they aren't folders the user opened.
   // A folder's sensitive policy and, when it's inherited, the sensitive folder it comes from (so the UI can say so).

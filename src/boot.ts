@@ -17,6 +17,15 @@ async function boot(home = hibHome()) {
   const cfg = applyPlugins(loadConfig(home), plugins);
   const registry = new Registry();
   for (const p of plugins.providers) registry.add(p);
+  // The scripted agent for acceptance tests: a workspace driver only, never a chat model.
+  if (cfg.testing.scriptDir)
+    registry.add({
+      id: "script",
+      available: async () => true,
+      async *run() {
+        yield { type: "error", message: "the script provider only drives workspace sessions" } as any;
+      },
+    });
   const engine = new Engine(cfg, openDb(home), registry, await Sealer.open(home), plugins);
   return { cfg, engine, home, token: apiToken(home) };
 }
@@ -27,7 +36,8 @@ export async function serve(port?: number) {
   const server = startServer(b.engine, { port: port ?? b.cfg.port, token: b.token });
   const events = b.engine.events;
   const problem = sandboxProblem();
-  events.emit("daemon.start", { mode: "daemon" }, { bind: server.hostname, port: server.port, sandbox: problem ? "unavailable" : "available" });
+  events.emit("daemon.start", { mode: "daemon" }, { bind: server.hostname, port: server.port, sandbox: problem ? "unavailable" : "available", ...(b.cfg.testing.scriptDir ? { script_driver: true } : {}) });
+  if (b.cfg.testing.scriptDir) console.error(`hib: TEST MODE: the scripted agent is on ([testing] script_dir = ${b.cfg.testing.scriptDir})`);
   if (problem) events.emit("sandbox.unavailable", { mode: "daemon" }, { reason: problem });
   events.checkKey();
   events.startHeartbeat();

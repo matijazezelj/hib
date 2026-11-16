@@ -13,7 +13,25 @@ const KIND: Record<string, ToolKind> = {
   Grep: "search", Glob: "search", WebFetch: "web", WebSearch: "web",
 };
 
-function describe(id: string, name: string, input: any, cwd: string): ToolCall {
+/** The key an "always" answer is stored under for this call. */
+export function ruleKeyFor(name: string, input: any, call: ToolCall): string {
+  return name === "Bash"
+    ? commandRuleKey("Bash", String(input?.command ?? ""))
+    : KIND[name] === "edit"
+      ? "edit"
+      : // "always" for a read covers that directory only
+        name === "Read" && call.path
+        ? `read:${call.path.includes("/") ? call.path.slice(0, call.path.lastIndexOf("/")) : "."}`
+        : name === "SandboxNetworkAccess"
+          ? `net:${input?.host ?? ""}` // "always" opens that host only
+          : name === "WebFetch" && call.outbound
+            ? `WebFetch:${call.outbound.host}` // and fetches from that host only
+            : KIND[name]
+              ? name
+              : `${name}:exact:${short(JSON.stringify(input ?? null), 2000)}`; // MCP and unknown tools: "always" covers this exact call
+}
+
+export function describe(id: string, name: string, input: any, cwd: string): ToolCall {
   const rel = (p?: string) => (p && p.startsWith(cwd + "/") ? p.slice(cwd.length + 1) : p);
   const kind = KIND[name] ?? "other";
   const path = rel(input?.file_path ?? input?.notebook_path ?? input?.path);
@@ -167,21 +185,7 @@ export class ClaudeDriver implements AgentDriver {
           const pid = `cl_${m.request_id}`;
           this.requests.set(pid, { requestId: m.request_id, input: r.input });
           const call = describe(r.tool_use_id ?? pid, r.tool_name, r.input, this.cwd);
-          const ruleKey =
-            r.tool_name === "Bash"
-              ? commandRuleKey("Bash", String(r.input?.command ?? ""))
-              : KIND[r.tool_name] === "edit"
-                ? "edit"
-                : // "always" for a read covers that directory only
-                  r.tool_name === "Read" && call.path
-                  ? `read:${call.path.includes("/") ? call.path.slice(0, call.path.lastIndexOf("/")) : "."}`
-                  : r.tool_name === "SandboxNetworkAccess"
-                    ? `net:${r.input?.host ?? ""}` // "always" opens that host only
-                    : r.tool_name === "WebFetch" && call.outbound
-                      ? `WebFetch:${call.outbound.host}` // and fetches from that host only
-                      : KIND[r.tool_name]
-                        ? r.tool_name
-                        : `${r.tool_name}:exact:${short(JSON.stringify(r.input ?? null), 2000)}`; // MCP and unknown tools: "always" covers this exact call
+          const ruleKey = ruleKeyFor(r.tool_name, r.input, call);
           q.push({ type: "permission", id: pid, call, ruleKey, input: r.input });
         } else this.send({ type: "control_response", response: { subtype: "error", request_id: m.request_id, error: `hib does not handle ${m.request?.subtype}` } });
         break;

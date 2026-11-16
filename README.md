@@ -402,6 +402,37 @@ The tests cover:
 
 CI runs the typecheck and tests on Ubuntu and macOS.
 
+### Acceptance tests: the scripted agent
+
+For tests that run a real daemon end to end (for example hib's events through a SIEM to its alerts), hib can drive a workspace session with a scripted agent instead of Claude Code or Codex. It is off unless the config names a script folder:
+
+```toml
+[testing]
+script_dir = "~/hib-e2e/scripts"   # turns on the model script/replay; never set this on a machine you use
+```
+
+With it set, `daemon.start` carries `script_driver: true` and the daemon prints a TEST MODE warning. A `[providers.script]` entry alone does nothing, and the script model is never used for routing or as an advisor. Run the test daemon with `HOME` set to a throwaway folder, since scripts can write under `~/`.
+
+A message containing `hib-script:<name>` replays `<script_dir>/<name>.json`, which is an array of steps:
+
+| Step | What happens |
+|---|---|
+| `{"say": "text"}` | assistant text |
+| `{"edit": "path", "content": "..."}` | a Write, asked like Claude's, and written if allowed |
+| `{"command": "cat data.csv"}` | a Bash call, asked, never run |
+| `{"network": "host"}` | a sandboxed command reaching a new host, asked |
+| `{"fetch": "https://..."}` | a WebFetch, asked, nothing fetched |
+| `{"write": "path", "content": "..."}` | a write hib isn't asked about, as through a swapped symlink (causes `protected.reverted` or `home.changed`) |
+
+Paths are workspace-relative or `~/...`; absolute paths and `..` are refused. Each step goes through hib's real permission, data-rule, protected-file and home-watch code, so the events are the ones a CLI session would write. No agent CLI process runs, so process telemetry (Falco) sees none of it.
+
+Driving it headless over the API, with the token from `~/.hib/token` as `Authorization: Bearer`:
+1. `POST /hib/workspaces {"root": "/path"}` registers the folder.
+2. `POST /ws/turn?root=/path {"model": "script/replay", "text": "hib-script:e2e"}` starts a turn and returns its `sessionId`.
+3. Follow `GET /ws/sessions/<id>/stream?root=/path` (server-sent events) and answer each `permission` with `POST /ws/permission?root=/path {"sessionId", "id", "choice": "allow" | "deny"}`.
+
+`auth.failure` needs no script: send any `/hib/...` request with a wrong token.
+
 Layout: `src/` is the daemon, router, guard, providers and the workspace drivers and sessions; `src/tui/` is the terminal UIs; `web/` is the browser UI; `test/` is the tests.
 
 ## License
