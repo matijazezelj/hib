@@ -13,7 +13,7 @@ import { detect, type Finding } from "../guard/detectors";
 import { onPinnedAccount, pinnedModel, SENSITIVE_NEEDS_CLAUDE, supportsSensitive } from "./registry";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { homeChanges, homeSnapshot, type HomeSnapshot } from "./homewatch";
+import { homeChanges, homePath, homeSnapshot, type HomeSnapshot, type HomeWatch } from "./homewatch";
 import { basename, sep, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { loadTable, TABLE_FILE } from "../analyze/table";
 import { columnsToHide, pseudonymizeWithSpans } from "../analyze/pseudo";
@@ -247,11 +247,11 @@ export class WorkspaceSessions {
   /** The home folder whose startup files and agent config each turn watches (tests point it elsewhere). */
   homeDir = homedir();
 
-  /** A path under the home folder in "~/..." form (as homewatch reports it), or null. */
-  private tilde(p: string): string | null {
-    for (const h of new Set([this.homeDir, (() => { try { return realpathSync(this.homeDir); } catch { return this.homeDir; } })()]))
-      if (p.startsWith(h + "/")) return `~/${p.slice(h.length + 1)}`;
-    return null;
+  /** What the home watch covers: the home folder, plus every account's Claude config dir and Codex home. */
+  private homeWatch(): HomeWatch {
+    const expand = (p: string) => (p.startsWith("~/") ? join(this.homeDir, p.slice(2)) : p);
+    const dirs = (k: string) => this.cfg.accounts.map((a) => a.env[k]).filter((p): p is string => !!p).map(expand);
+    return { home: this.homeDir, claudeDirs: dirs("CLAUDE_CONFIG_DIR"), codexDirs: dirs("CODEX_HOME") };
   }
 
   /** Whether agent commands can be confined here; auto mode and background tasks need it. */
@@ -661,10 +661,13 @@ export class WorkspaceSessions {
     const guarded = protectedSnapshot(root);
     l.approvedProtected.clear();
     // Shell startup files and user-level agent config: changes are reported, not put back (you edit them too).
-    let homeBefore: HomeSnapshot | undefined;
+    const watch = this.homeWatch();
+    let homeBefore: HomeSnapshot | "failed";
     try {
-      homeBefore = homeSnapshot(this.homeDir);
-    } catch {}
+      homeBefore = homeSnapshot(watch);
+    } catch {
+      homeBefore = "failed"; // reported after the turn: the check must never go quiet
+    }
     l.approvedHome.clear();
 
     try {
@@ -774,13 +777,15 @@ export class WorkspaceSessions {
       this.record(sid, protectedEv);
       yield protectedEv;
     }
-    if (homeBefore) {
+    {
+      const failed = { type: "home_changed" as const, changes: [{ path: "(the check failed: inspect shell startup files and ~/.claude, ~/.codex by hand)", change: "changed", approved: false }] };
       let homeEv: Extract<WsEvent, { type: "home_changed" }> | undefined;
       try {
-        const changed = homeChanges(homeBefore, this.homeDir);
-        if (changed.length) homeEv = { type: "home_changed", changes: changed.map((x) => ({ ...x, approved: l!.approvedHome.has(x.path) })) };
-      } catch (e: any) {
-        homeEv = { type: "home_changed", changes: [{ path: `(the check failed: ${String(e?.message ?? e).slice(0, 120)})`, change: "changed", approved: false }] };
+        const changed = homeBefore === "failed" ? null : homeChanges(homeBefore, watch);
+        if (!changed) homeEv = failed;
+        else if (changed.length) homeEv = { type: "home_changed", changes: changed.map((x) => ({ ...x, approved: l!.approvedHome.has(x.path.replace(/ \(link target\)$/, "")) })) };
+      } catch {
+        homeEv = failed;
       }
       if (homeEv) {
         this.events.emit("home.changed", this.evCtx(sid, root, c), { changes: homeEv.changes });
@@ -835,8 +840,11 @@ export class WorkspaceSessions {
     if (call.kind === "edit")
       for (const p of call.paths ?? (call.path ? [call.path] : [])) {
         if (protectedPath(l.root, p)) l.approvedProtected.add(realTarget(l.root, p));
-        const t = this.tilde(isAbsolute(p) ? p : resolvePath(l.root, p)) ?? this.tilde(realTarget(l.root, p));
-        if (t) l.approvedHome.add(t);
+        const w = this.homeWatch();
+        for (const abs of [isAbsolute(p) ? p : resolvePath(l.root, p), realTarget(l.root, p)]) {
+          const t = homePath(w, abs);
+          if (!t.startsWith("[outside")) l.approvedHome.add(t);
+        }
       }
     if (input === undefined) return { behavior: "allow" };
     // A web fetch or search leaves the machine: placeholders go out as placeholders, never as the real values.
