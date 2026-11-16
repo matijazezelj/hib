@@ -66,6 +66,8 @@ export interface Config {
   routes: Record<string, Route> & Record<"chat" | "code" | "review" | "long", Route>;
   guard: GuardConfig;
   events: EventsConfig;
+  /** Acceptance tests only: the scripted agent (provider "script") and the folder its scripts are read from. */
+  testing: { scriptDir?: string };
 }
 
 export const DEFAULT_TOML = `# hib config. Model ids: <provider>[@account]/<model>, e.g. claude@work/sonnet
@@ -178,7 +180,9 @@ export function loadConfig(home = hibHome()): Config {
 export function parseConfig(raw: any, home: string): Config {
   const accounts: Account[] = [];
   const defaultAccount: Record<string, string> = {};
+  const scriptDir = typeof raw.testing?.script_dir === "string" && raw.testing.script_dir ? expandHome(raw.testing.script_dir) : undefined;
   for (const [provider, p] of Object.entries<any>(raw.providers ?? {})) {
+    if (provider === "script") continue; // only [testing] script_dir makes the scripted agent, never a providers entry
     defaultAccount[provider] = p.default ?? "default";
     for (const [name, a] of Object.entries<any>(p.accounts ?? { default: {} })) {
       const env: Record<string, string> = {};
@@ -214,10 +218,11 @@ export function parseConfig(raw: any, home: string): Config {
     switchAt: raw.usage?.switchAt ?? 0.9,
     arenaRate: raw.arena?.rate ?? 0,
     classifierModel: raw.classifier?.model ?? "claude/haiku",
-    advisorModels: raw.advisor ?? {},
+    advisorModels: Object.fromEntries(Object.entries<any>(raw.advisor ?? {}).filter(([k]) => k !== "script")),
     models: raw.models ?? {},
     defaultAccount,
-    accounts,
+    accounts: scriptDir ? [...accounts, { id: "script@default", provider: "script", name: "default", env: {}, limits: {}, dirs: [] }] : accounts,
+    testing: { scriptDir },
     routes: {
       chat: route(raw.routes?.chat),
       code: route(raw.routes?.code),
