@@ -55,6 +55,7 @@ export interface StartOptions {
   mcp?: McpServer; // hib's own tools (the advisor), launched by the CLI
   sandbox?: Sandbox; // OS-level confinement for the agent's commands
   denyReads?: string[]; // absolute paths the CLI's own file tools may never read (they run outside the sandbox)
+  session?: string; // hib's session id: set as HIB_SESSION on the CLI, so every process it starts can be traced to it
 }
 
 /** What the agent's commands (and every process they start) may not touch, whatever is approved. */

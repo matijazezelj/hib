@@ -187,6 +187,12 @@ test("claude: sensitive sessions start with auto-memory off (setting and env); o
   expect(normal.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBeUndefined();
 });
 
+test("claude: HIB_SESSION carries the session id, and an account env can't override it", () => {
+  const { claudeLaunch } = require("../src/workspace/claude-driver") as typeof import("../src/workspace/claude-driver");
+  const account = { id: "claude@work", provider: "claude", name: "work", env: { HIB_SESSION: "spoofed" }, limits: {}, dirs: [] };
+  expect(claudeLaunch({ cwd: "/work", model: "sonnet", account, session: "w_abc" } as any).env.HIB_SESSION).toBe("w_abc");
+});
+
 test("a keep-list needs the folder's own sensitive policy", async () => {
   const { Workspaces } = await import("../src/workspace/registry");
   const { memoryDb } = await import("../src/db");

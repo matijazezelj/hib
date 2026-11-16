@@ -464,7 +464,7 @@ export class WorkspaceSessions {
         throw new Error(`hib won't start a sensitive session it can't fully protect: ${e.message}`);
       }
     }
-    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools });
+    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools, session: id });
     const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox, approvedProtected: new Set(), approvedHome: new Set() };
     this.live.set(id, l);
     this.events.emit("session.start", this.evCtx(id, root, c), { agent: c.provider, sensitive: askReads });
