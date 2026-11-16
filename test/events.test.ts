@@ -297,7 +297,7 @@ describe("coarsening", () => {
     } finally {
       console.error = err;
     }
-    expect(read(ev.file)).toEqual([]);
+    expect(read(ev.file).map((l: any) => l.event)).toEqual(["events.key_refused"]); // the session line is dropped
   });
 
   test("config: accepted values, and a wrong value refused", () => {

@@ -468,21 +468,30 @@ export function programOf(command: string, depth = 0): string {
  * instead of blocking the open (and the daemon with it); nothing is read before the checks pass, and never more than
  * the 65 bytes a key file can hold.
  */
+/** Why the key was refused, as a fixed code: the events.key_refused event carries only this, never the path. */
+export type KeyRefusal = "symlink" | "not_regular" | "not_owner" | "mode" | "format" | "unreadable";
+export class KeyRefused extends Error {
+  constructor(readonly file: string, readonly reason: KeyRefusal, detail: string) {
+    super(`${file}: ${detail}`);
+  }
+}
+
 export function readKey(file: string): Buffer {
   let fd: number;
   try {
     fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
   } catch (e: any) {
-    throw new Error(`${file}: ${e?.code === "ELOOP" ? "is a symlink" : (e?.message ?? e)}`);
+    if (e?.code === "ELOOP") throw new KeyRefused(file, "symlink", "is a symlink");
+    throw new KeyRefused(file, "unreadable", e?.message ?? String(e));
   }
   try {
     const st = fstatSync(fd);
-    if (!st.isFile()) throw new Error(`${file}: not a regular file`);
-    if (process.getuid && st.uid !== process.getuid()) throw new Error(`${file}: not owned by this user`);
-    if (st.mode & 0o077) throw new Error(`${file}: group or others can access it (chmod 600)`);
-    if (st.size > 65) throw new Error(`${file}: not a 32-byte hex key`);
+    if (!st.isFile()) throw new KeyRefused(file, "not_regular", "not a regular file");
+    if (process.getuid && st.uid !== process.getuid()) throw new KeyRefused(file, "not_owner", "not owned by this user");
+    if (st.mode & 0o077) throw new KeyRefused(file, "mode", "group or others can access it (chmod 600)");
+    if (st.size > 65) throw new KeyRefused(file, "format", "not a 32-byte hex key");
     const text = readFileSync(fd, "utf8"); // grown since the fstat: the length check below still refuses it
-    if (text.length > 65 || !/^[0-9a-f]{64}\n?$/.test(text)) throw new Error(`${file}: not a 32-byte hex key`);
+    if (text.length > 65 || !/^[0-9a-f]{64}\n?$/.test(text)) throw new KeyRefused(file, "format", "not a 32-byte hex key");
     return Buffer.from(text.trim(), "hex");
   } finally {
     closeSync(fd);
@@ -511,6 +520,7 @@ const FIXED: Record<string, Severity> = {
   "auth.failure": "warning",
   "approval.pending": "info",
   "data.block": "warning",
+  "events.key_refused": "warning",
   "sandbox.unavailable": "warning",
   "protected.reverted": "critical",
   "terminal.open": "warning",
@@ -601,10 +611,36 @@ export class EventLog {
             if (e?.code !== "EEXIST") throw e; // another process made it first: use theirs
           }
         }
-        this.key = readKey(file);
+        try {
+          this.key = readKey(file);
+        } catch (e) {
+          this.keyRefused(e);
+          throw e;
+        }
       }
     }
     return createHmac("sha256", this.key).update(value).digest("hex").slice(0, 16);
+  }
+
+  /**
+   * The lines that need a hash are dropped while the key is refused, and nothing else in the log would show it: say so
+   * once per run, in a line that has nothing to hash. Only the fixed reason, never the path.
+   */
+  private refusalReported = false;
+  private keyRefused(e: unknown): void {
+    if (this.refusalReported) return;
+    this.refusalReported = true;
+    this.emit("events.key_refused", { mode: "daemon" }, { reason: e instanceof KeyRefused ? e.reason : "unreadable" });
+  }
+
+  /** At daemon start: when a setting hashes, load (or make) the key now, so a refused key shows before the first session. */
+  checkKey(): void {
+    if (this.cfg.workspace !== "hash" && this.cfg.account !== "hash") return;
+    try {
+      this.hash("");
+    } catch (e: any) {
+      console.error(`hib: events: hash key refused: ${e?.message ?? e}`);
+    }
   }
 
   /** The [events] coarsening settings applied to the context and to the fields they name. */
