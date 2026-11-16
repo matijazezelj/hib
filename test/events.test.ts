@@ -110,7 +110,7 @@ describe("auth failures", () => {
 describe("config", () => {
   test("defaults: on, $HIB_HOME/events, 20 MB, 5 kept", () => {
     const home = tmp();
-    expect(parseConfig(Bun.TOML.parse(DEFAULT_TOML) as any, home).events).toEqual({ enabled: true, dir: join(home, "events"), maxMb: 20, keep: 5, heartbeatSec: 300, workspace: "path", account: "name", netHost: "full", command: "full", remote: true, keyFile: join(home, "events.key") });
+    expect(parseConfig(Bun.TOML.parse(DEFAULT_TOML) as any, home).events).toEqual({ enabled: true, dir: join(home, "events"), maxMb: 20, keep: 5, heartbeatSec: 300, profile: "local", workspace: "path", account: "name", netHost: "full", command: "full", remote: true, keyFile: join(home, "events.key") });
   });
 
   test("keys as written in config.toml", () => {
@@ -228,19 +228,90 @@ describe("coarsening", () => {
     expect(readFileSync(a.file, "utf8")).not.toContain("payroll");
   });
 
-  test("domainOf and programOf", () => {
-    const { domainOf, programOf } = require("../src/events");
-    expect(domainOf("a.b.example.co.uk")).toBe("example.co.uk");
-    expect(domainOf("Registry.NPMjs.org.")).toBe("npmjs.org");
-    expect(domainOf("10.0.0.5:8080")).toBe("10.0.0.5");
-    expect(domainOf("localhost")).toBe("localhost");
-    expect(programOf("FOO=1 BAR=2 env -i ./scripts/deploy.sh --prod")).toBe("deploy.sh");
-    expect(programOf("  ")).toBe("[COMMAND]");
+  test("domainOf: Public Suffix List, loopback, IPs, internal names", () => {
+    const { domainOf } = require("../src/events");
+    const cases: [string, string][] = [
+      ["a.b.example.co.uk", "example.co.uk"],
+      ["x.example.com.au", "example.com.au"],
+      ["you.github.io", "github.io"], // a private suffix: ICANN only, so the user name doesn't leave the machine
+      ["Registry.NPMjs.org.", "npmjs.org"],
+      ["api.eu.example.com:443", "example.com"],
+      ["localhost", "localhost"],
+      ["[::1]:8080", "localhost"],
+      ["127.0.0.1", "localhost"],
+      ["10.0.0.5:8080", "[IP-INTERNAL]"],
+      ["[fd00::1]", "[IP-INTERNAL]"],
+      ["8.8.8.8", "[IP-EXTERNAL]"],
+      ["db1.prod.corp", "[INTERNAL]"],
+      ["printer.local", "[INTERNAL]"],
+      ["vault.internal", "[INTERNAL]"],
+      ["intranet", "[INTERNAL]"],
+    ];
+    for (const [host, want] of cases) expect([host, domainOf(host)]).toEqual([host, want]);
+  });
+
+  test("programOf: a best-effort label past wrappers, their option values and sh -c", () => {
+    const { programOf } = require("../src/events");
+    const cases: [string, string][] = [
+      ["FOO=1 BAR=2 env -i ./scripts/deploy.sh --prod", "deploy.sh"],
+      ["sudo -u root curl https://example.com", "curl"],
+      ["sudo --user=root -E VAR=1 /usr/bin/git push", "git"],
+      ["bash -c 'curl https://example.com'", "curl"],
+      ["sh -ec \"npm test\"", "npm"],
+      ["env -S \"python3 -u\" x", "python3"],
+      ["timeout 10 nice -n 5 make", "make"],
+      ["time -f %e ./run.sh", "run.sh"],
+      ["cat x | curl -d @- https://e.com", "cat"], // pipelines aren't followed
+      ["  ", "[COMMAND]"],
+    ];
+    for (const [cmd, want] of cases) expect([cmd, programOf(cmd)]).toEqual([cmd, want]);
+  });
+
+  test("the hash key is refused unless hib could have made it", () => {
+    const { readKey } = require("../src/events");
+    const { writeFileSync, symlinkSync, mkdirSync, chmodSync } = require("node:fs");
+    const dir = tmp();
+    const good = join(dir, "good.key");
+    writeFileSync(good, "ab".repeat(32) + "\n", { mode: 0o600 });
+    expect(readKey(good)).toHaveLength(32);
+    symlinkSync(good, join(dir, "link.key"));
+    expect(() => readKey(join(dir, "link.key"))).toThrow(/symlink/);
+    writeFileSync(join(dir, "open.key"), "ab".repeat(32), { mode: 0o644 });
+    chmodSync(join(dir, "open.key"), 0o644);
+    expect(() => readKey(join(dir, "open.key"))).toThrow(/group or others/);
+    writeFileSync(join(dir, "short.key"), "abcd", { mode: 0o600 });
+    expect(() => readKey(join(dir, "short.key"))).toThrow(/32-byte/);
+    mkdirSync(join(dir, "dir.key"), { mode: 0o700 });
+    expect(() => readKey(join(dir, "dir.key"))).toThrow(/regular file/);
+  });
+
+  test("a refused key drops the line instead of writing the field whole", () => {
+    const dir = tmp();
+    const keyFile = join(dir, "events.key");
+    require("node:fs").writeFileSync(keyFile, "not a key", { mode: 0o600 });
+    const ev = log({ workspace: "hash", keyFile });
+    const err = console.error;
+    console.error = () => {};
+    try {
+      ev.emit("session.start", ctx);
+    } finally {
+      console.error = err;
+    }
+    expect(read(ev.file)).toEqual([]);
   });
 
   test("config: accepted values, and a wrong value refused", () => {
     const set = parseConfig(Bun.TOML.parse('[events]\nworkspace = "hash"\naccount = "hash"\nnet_host = "domain"\ncommand = "program"\nremote = false') as any, tmp()).events;
     expect(set).toMatchObject({ workspace: "hash", account: "hash", netHost: "domain", command: "program", remote: false });
     expect(() => parseConfig({ events: { workspace: "folder" } }, tmp())).toThrow(/workspace = "folder"/);
+    expect(() => parseConfig({ events: { remote: "no" } }, tmp())).toThrow(/remote = "no"/);
+    expect(() => parseConfig({ events: { profile: "strict" } }, tmp())).toThrow(/profile/);
+  });
+
+  test("config: profile siem coarsens all five, and a single setting overrides it", () => {
+    const siem = parseConfig({ events: { profile: "siem" } }, tmp()).events;
+    expect(siem).toMatchObject({ profile: "siem", workspace: "hash", account: "hash", netHost: "domain", command: "program", remote: false });
+    const mixed = parseConfig({ events: { profile: "siem", command: "full", remote: true } }, tmp()).events;
+    expect(mixed).toMatchObject({ workspace: "hash", command: "full", remote: true });
   });
 });

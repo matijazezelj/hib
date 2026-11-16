@@ -270,15 +270,28 @@ dir = "~/.hib/events"   # default
 max_mb = 20             # rotate at this size: events.jsonl.1 … .keep
 keep = 5
 heartbeat_sec = 300     # daemon.alive interval; 0 = off
+profile = "local"       # each field whole; "siem" coarsens the five below
 workspace = "path"      # or "name" (last folder), "hash" (keyed hash of the path)
 account = "name"        # or "hash": claude@<keyed hash>
-net_host = "full"       # or "domain": example.com for api.eu.example.com; url cut to scheme://domain too
-command = "full"        # or "program": only the program's name (curl), not the redacted line
+net_host = "full"       # or "domain": registrable domain; url cut to scheme://domain too
+command = "full"        # or "program": a best-effort program label, not the redacted line
 remote = true           # false: auth.failure carries no peer address
 ```
 
-- The coarsening settings decide how much of each identifying field goes in; the defaults log it whole. Hashes are HMAC-SHA256 with a key made on first use in `~/.hib/events.key` (0600, never in the events folder): the same folder or account gives the same hash on one machine, so events still correlate, but a guessed path can't be checked without the key.
-- They cover the fields they name, not text elsewhere in an event: a command that `cd`s into the workspace still shows that path unless `command = "program"`.
+- **Two profiles.** `local` (the default) logs every field whole: the most use for an investigation, for a collector on this machine, under the same access rules as the rest of `~/.hib`. `siem` is for logs that leave the machine (a central SIEM, another team's store): coarsen before the data crosses that boundary, and keep the detail here. A setting given on its own overrides the profile.
+
+  | | `local` | `siem` |
+  |---|---|---|
+  | `workspace` | path | hash |
+  | `account` | name | hash |
+  | `net_host` | full | domain |
+  | `command` | full | program |
+  | `remote` | included | left out |
+
+- **Hashes** are HMAC-SHA256 with a key made on first use in `~/.hib/events.key`, never in the events folder: the same folder or account gives the same hash on one machine, so events still correlate, but a guessed path can't be checked without the key. hib refuses a key that is a symlink, not a regular file, not yours, readable by group or others, larger than 65 bytes, or not exactly 64 lowercase hex characters (an optional newline after); it then drops the event rather than write the field whole.
+- **Domains** are the registrable domain under an ICANN suffix of the Public Suffix List (`tldts`). Private suffixes are left out, so a tenant name doesn't leave the machine: `acme-payroll.s3.amazonaws.com` becomes `amazonaws.com`, `you.github.io` becomes `github.io`. Hosts are read the way `new URL` reads them (`https://evil.com\@good.com/` is `evil.com`; IDN comes out as punycode; `127.1` and `::ffff:10.0.0.1` are the addresses they spell). Loopback becomes `localhost`; IP addresses `[IP-INTERNAL]` (private, link-local such as `169.254.169.254`, CGNAT, ULA, unspecified) or `[IP-EXTERNAL]`; a name under no ICANN suffix (`.corp`, `.local`, `.internal`, `.arpa`, a single label) `[INTERNAL]`; a placeholder the scrubber already put there keeps only its category (`[IP-INTERNAL]`), other bracketed text is `[INTERNAL]`; anything that doesn't parse `[HOST]` or `[URL]`.
+- **`command = "program"` is lossy.** It skips assignments and wrappers (`sudo -u root`, `env -i`, `nice`, `timeout`) and looks inside `sh -c '…'`, and honours quotes, but expands nothing: `a | b` is labelled `a`, and aliases or scripts aren't followed. When it can't tell safely (an unbalanced quote, a `$(…)` or backtick before the program), the label is `[COMMAND]`. It also drops the arguments most detections match on. Treat it as a label; process telemetry (Falco, auditd) is the source of truth for what ran.
+- The settings cover the fields they name, not text elsewhere in an event: a command that `cd`s into the workspace still shows that path unless `command = "program"`. With `command = "program"`, `data.block` also gives only its fixed reason, without the file name or script path that set it off.
 
 ## Performance
 

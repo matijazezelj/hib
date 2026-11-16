@@ -19,19 +19,38 @@ export const DATA_RULE_NOTE =
   "(python -c, node -e, heredocs) and scripts written outside this folder are blocked. To compute something over a data file, read it with Read and reason over it, " +
   "or write a script inside this folder that the user can review.";
 
-export function rawDataCommand(command: string, root: string, dataFiles: Set<string> = new Set()): string | null {
+/**
+ * Why a command was blocked. `reason` is fixed text that never holds anything from the command; `detail` is the file
+ * name or script path that set it off, if any; `text` is the full sentence for the agent and the user.
+ */
+export interface DataBlock {
+  reason: "it reads a data file directly" | "it runs inline code that could read data files" | "it runs a script from outside this folder";
+  detail?: string;
+  text: string;
+}
+
+export function rawDataCommand(command: string, root: string, dataFiles: Set<string> = new Set()): DataBlock | null {
   const cmd = command.trim();
   const programs = cmd.split(/\s*(?:&&|\|\||[;|])\s*/).map((part) => part.trim().split(/\s+/)[0] ?? "");
   if (programs.every((p) => METADATA_ONLY.has(p)) && !/-exec|-execdir|-ok\b|-delete/.test(cmd)) return null;
-  if (DATA_EXT.test(cmd) || DATA_GLOB.test(cmd)) return "it reads a data file directly";
-  for (const name of dataFiles) if (name.length > 2 && cmd.includes(name)) return `it reads ${name} directly`;
-  if (INLINE_CODE.test(cmd) || HEREDOC_INTO_INTERPRETER.test(cmd)) return "it runs inline code that could read data files";
+  if (DATA_EXT.test(cmd) || DATA_GLOB.test(cmd)) return { reason: "it reads a data file directly", text: "it reads a data file directly" };
+  for (const name of dataFiles) if (name.length > 2 && cmd.includes(name)) return { reason: "it reads a data file directly", detail: name, text: `it reads ${name} directly` };
+  if (INLINE_CODE.test(cmd) || HEREDOC_INTO_INTERPRETER.test(cmd)) return { reason: "it runs inline code that could read data files", text: "it runs inline code that could read data files" };
   if (INTERPRETERS.test(cmd)) {
     // An interpreter running a script from outside the folder (e.g. /tmp/x.py) can read anything here unseen.
     for (const m of cmd.matchAll(/(?:^|\s)((?:\/|~\/|\.\.\/)[^\s;&|'"]+\.(?:py|js|mjs|ts|rb|pl|php|r|jl|sql|jq|awk))\b/gi)) {
       const p = m[1]!.startsWith("~/") ? m[1]! : isAbsolute(m[1]!) ? m[1]! : resolve(root, m[1]!);
-      if (p.startsWith("~/") || !(p === root || p.startsWith(root + "/"))) return `it runs a script from outside this folder (${m[1]})`;
+      if (p.startsWith("~/") || !(p === root || p.startsWith(root + "/")))
+        return { reason: "it runs a script from outside this folder", detail: m[1]!, text: `it runs a script from outside this folder (${m[1]})` };
     }
   }
   return null;
+}
+
+/**
+ * The data.block event's reason. With [events] command = "program" (the siem default) only the fixed reason, since the
+ * detail is a file name or path the command field was coarsened to hide; otherwise the full text. Redacted either way.
+ */
+export function dataBlockEventReason(block: DataBlock, command: "full" | "program" | undefined, redact: (text: string) => string): string {
+  return redact(command === "program" ? block.reason : block.text);
 }

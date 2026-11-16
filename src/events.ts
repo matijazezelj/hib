@@ -1,8 +1,9 @@
 import { createHmac, randomBytes } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
-import { detect } from "./guard/detectors";
+import { parse as parseHost } from "tldts";
+import { detect, isPrivateIp } from "./guard/detectors";
 import { machineTerms } from "./guard";
 import type { EventsConfig } from "./config";
 
@@ -93,30 +94,399 @@ function replaceSpans(text: string, spans: Span[]): string {
   return out + text.slice(pos);
 }
 
-/** Second-level labels under a two-letter country code that act as a suffix: example.co.uk keeps three labels. */
-const SLD = new Set(["co", "com", "net", "org", "gov", "ac", "edu", "or", "ne", "go"]);
+/** Loopback names (loopback addresses are found by their value, see ipv4Class and ipv6Class). */
+const LOOPBACK = /^(?:localhost|.*\.localhost)$/;
 
-/** api.eu.example.com -> example.com; an IP address or a single label stays as it is; a port goes. */
+/** A placeholder the scrubber already put where a host was: [IP-INTERNAL], [HIBab12-IP-INTERNAL-NET1-1]. */
+const PLACEHOLDER = String.raw`\[(?:HIB[0-9a-f]{4}-)?[A-Z][A-Z0-9-]*\]`;
+const PLACEHOLDER_HOST = new RegExp(String.raw`^(${PLACEHOLDER})(?::\d*)?$`);
+/** scheme://[userinfo@]PLACEHOLDER[:port] up to the end of the authority (\ ends it too, as in new URL). */
+const PLACEHOLDER_URL = new RegExp(String.raw`^([A-Za-z][A-Za-z0-9+.-]*):\/\/(?:[^\s\/?#\\]*@)?(${PLACEHOLDER})(?::\d*)?(?:[\/?#\\]|$)`);
+
+/**
+ * A placeholder reduced to its category, so only what the scrubber writes passes: [HIBab12-IP-INTERNAL-NET1-1] and
+ * [IP-INTERNAL] both give [IP-INTERNAL]. Other bracketed text ([ACME-PAYROLL]) is a name, not a placeholder: [INTERNAL].
+ */
+const CATEGORIES = ["IP-INTERNAL", "IP-EXTERNAL", "INTERNAL", "HOST", "IP", "EMAIL", "USER", "PATH", "CONTAINER", "PERSON", "TERM", "TEXT", "HIGH-ENTROPY", "CREDENTIALS"];
+function placeholderClass(p: string): string {
+  const core = p.slice(1, -1).replace(/^HIB[0-9a-f]{4}-/, "");
+  const cat = CATEGORIES.find((c) => core === c || core.startsWith(c + "-"));
+  return cat ? `[${cat}]` : "[INTERNAL]";
+}
+
+/** What a host that can't be parsed becomes; never the input text. */
+const BAD_HOST = "[HOST]";
+const BAD_URL = "[URL]";
+
+/** IPv4 ranges that are internal on top of isPrivateIp's (10/8, 172.16/12, 192.168/16, 127/8): [first, prefix bits]. */
+const INTERNAL_V4: [number, number][] = [
+  [0x00000000, 8], // 0.0.0.0/8, "this network", 0.0.0.0 included
+  [0x64400000, 10], // 100.64.0.0/10, carrier-grade NAT
+  [0xa9fe0000, 16], // 169.254.0.0/16, link-local (cloud metadata at 169.254.169.254)
+  [0xc0000000, 24], // 192.0.0.0/24, IETF protocol assignments
+  [0xc6120000, 15], // 198.18.0.0/15, benchmarking
+  [0xe0000000, 4], // 224.0.0.0/4, multicast
+  [0xf0000000, 4], // 240.0.0.0/4, reserved, 255.255.255.255 included
+];
+
+/** A dotted-quad IPv4 address (as new URL writes it) classed: localhost, [IP-INTERNAL] or [IP-EXTERNAL]. */
+function ipv4Class(ip: string): string {
+  const p = ip.split(".").map(Number);
+  if (p.length !== 4 || p.some((n) => !(Number.isInteger(n) && n >= 0 && n <= 255))) return BAD_HOST;
+  if (p[0] === 127) return "localhost";
+  const n = ((p[0]! << 24) >>> 0) + (p[1]! << 16) + (p[2]! << 8) + p[3]!;
+  const inRange = INTERNAL_V4.some(([base, bits]) => (n >>> (32 - bits)) === (base >>> (32 - bits)));
+  return inRange || isPrivateIp(ip) ? "[IP-INTERNAL]" : "[IP-EXTERNAL]";
+}
+
+/** An IPv6 address without brackets or zone (as new URL writes it) as its eight 16-bit groups, or null. */
+function ipv6Groups(s: string): number[] | null {
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const groups = (x: string) => (x === "" ? [] : x.split(":").map((g) => (/^[0-9a-f]{1,4}$/i.test(g) ? parseInt(g, 16) : NaN)));
+  const head = groups(halves[0]!);
+  const tail = halves.length === 2 ? groups(halves[1]!) : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 2 ? fill < 1 : fill !== 0) return null;
+  const all = [...head, ...new Array<number>(halves.length === 2 ? fill : 0).fill(0), ...tail];
+  return all.every((n) => Number.isInteger(n)) ? all : null;
+}
+
+/** An IPv6 address classed; IPv4 inside it (mapped, compatible, NAT64) is classed as IPv4. */
+function ipv6Class(s: string): string {
+  const g = ipv6Groups(s);
+  if (!g) return BAD_HOST;
+  const [a, b, c, d, e, f, hi, lo] = g as [number, number, number, number, number, number, number, number];
+  const zero5 = a === 0 && b === 0 && c === 0 && d === 0 && e === 0;
+  if (zero5 && f === 0 && hi === 0 && lo === 1) return "localhost"; // ::1
+  if (zero5 && f === 0 && hi === 0 && lo === 0) return "[IP-INTERNAL]"; // ::, unspecified
+  const v4 = `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  if (zero5 && (f === 0xffff || f === 0)) return ipv4Class(v4); // ::ffff:0:0/96 mapped, ::/96 compatible
+  if (a === 0x64 && b === 0xff9b && c === 0 && d === 0 && e === 0 && f === 0) return ipv4Class(v4); // 64:ff9b::/96 NAT64
+  if (a === 0x64 && b === 0xff9b && c === 1) return "[IP-INTERNAL]"; // 64:ff9b:1::/48, local-use NAT64
+  const internal =
+    (a & 0xffc0) === 0xfe80 || // fe80::/10 link-local
+    (a & 0xffc0) === 0xfec0 || // fec0::/10 site-local
+    (a & 0xfe00) === 0xfc00 || // fc00::/7 unique local
+    (a & 0xff00) === 0xff00; // ff00::/8 multicast
+  return internal ? "[IP-INTERNAL]" : "[IP-EXTERNAL]";
+}
+
+/**
+ * A host, host:port, [IPv6]:port or bare IPv6 (zone id allowed) as new URL normalises it: lower case, punycode,
+ * IPv4 in dotted-quad (127.1 and 0x7f000001 are 127.0.0.1), IPv6 compressed in brackets. Null if it doesn't parse
+ * or has anything a host can't (path, query, userinfo, whitespace).
+ */
+function canonicalHost(raw: string): string | null {
+  if (!raw || /[\s\/\\?#@]/.test(raw)) return null;
+  let h = raw;
+  const bracketed = /^\[([^\]]*)\](:\d*)?$/.exec(h);
+  if (bracketed) h = `[${bracketed[1]!.replace(/%.*$/, "")}]`; // the port goes, and an IPv6 zone id (fe80::1%eth0)
+  else if ((h.match(/:/g) ?? []).length >= 2) h = `[${h.replace(/%.*$/, "")}]`; // bare IPv6; one colon is host:port
+  try {
+    return new URL(`http://${h}`).hostname || null;
+  } catch {
+    return null;
+  }
+}
+
+/** A hostname from canonicalHost reduced to a domain or a fixed label. */
+function hostClass(hostname: string | null): string {
+  if (!hostname) return BAD_HOST;
+  const h = hostname.replace(/\.$/, "");
+  if (h.startsWith("[") && h.endsWith("]")) return ipv6Class(h.slice(1, -1));
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) return ipv4Class(h);
+  if (LOOPBACK.test(h)) return "localhost";
+  if (h === "arpa" || h.endsWith(".arpa")) return "[INTERNAL]"; // home.arpa, in-addr.arpa, ip6.arpa: they name the network
+  const p = parseHost(h, { allowPrivateDomains: false });
+  return p.domain && p.isIcann ? p.domain : "[INTERNAL]";
+}
+
+/**
+ * The registrable domain under an ICANN public suffix (tldts, private suffixes left out so a tenant label doesn't
+ * survive: acme-payroll.s3.amazonaws.com and you.github.io become amazonaws.com and github.io; x.example.com.au
+ * becomes example.com.au). IDN comes out as punycode. Loopback is "localhost"; an IP address (in any form new URL
+ * accepts) becomes [IP-INTERNAL] or [IP-EXTERNAL]; a name under no ICANN suffix (.corp, .local, .internal, .arpa, a
+ * single label) becomes [INTERNAL], since its last labels would still name the network. A port goes. A placeholder
+ * the scrubber left gives its category ([IP-INTERNAL]); anything that doesn't parse is [HOST].
+ */
 export function domainOf(host: string): string {
-  const h = host.replace(/^\[|\]$/g, "").replace(/:\d+$/, "").replace(/\.$/, "").toLowerCase();
-  if (/^[\d.]+$/.test(h) || h.includes(":")) return h;
-  const labels = h.split(".");
-  const n = labels.length >= 3 && labels.at(-1)!.length === 2 && SLD.has(labels.at(-2)!) ? 3 : 2;
-  return labels.slice(-n).join(".");
+  const h = host.trim();
+  const placeholder = PLACEHOLDER_HOST.exec(h);
+  if (placeholder) return placeholderClass(placeholder[1]!);
+  return hostClass(canonicalHost(h));
 }
 
-/** A URL cut to scheme://domain; text that isn't a URL becomes [URL]. */
-function urlDomain(url: string): string {
-  const m = /^([a-z][a-z0-9+.-]*):\/\/(?:[^\s/@]*@)?(\[[^\]]*\]|[^\s/?#:]+)/i.exec(url);
-  return m ? `${m[1]!.toLowerCase()}://${domainOf(m[2]!)}` : "[URL]";
+/**
+ * A URL cut to scheme://domain, the host as new URL reads it (https://evil.com\@good.com/ goes to evil.com) and
+ * classed as domainOf does, so net_host and url agree. A placeholder host is kept; anything else that isn't a URL
+ * with a host becomes [URL].
+ */
+export function urlDomain(url: string): string {
+  const u = url.trim();
+  const placeholder = PLACEHOLDER_URL.exec(u);
+  if (placeholder) return `${placeholder[1]!.toLowerCase()}://${placeholderClass(placeholder[2]!)}`;
+  let parsed: URL;
+  try {
+    // An IPv6 zone id ([fe80::1%25eth0]) makes new URL throw; it says nothing about where the request goes.
+    parsed = new URL(u.replace(/^([^\/?#]*\/\/[^\/?#\\]*\[[0-9A-Fa-f:.]+)%[^\]\/?#]*\]/, "$1]"));
+  } catch {
+    return BAD_URL;
+  }
+  // Re-read as an http host: non-special schemes (ssh://, git://) leave the host as typed, not normalised.
+  const domain = hostClass(canonicalHost(parsed.hostname));
+  return domain === BAD_HOST ? BAD_URL : `${parsed.protocol.replace(/:$/, "")}://${domain}`;
 }
 
-/** The program a command line runs: past VAR=value assignments and sudo/env/nohup/exec/time, its file name only. */
-export function programOf(command: string): string {
-  const words = command.trim().split(/\s+/).map((w) => w.replace(/^["'(]+|["';)]+$/g, ""));
+/**
+ * Wrappers that run another program, with the options that take a value (so the value isn't read as the program).
+ * An extra entry only skips one word too many; a missing one logs the value, so when in doubt an option is listed.
+ */
+const WRAPPERS: Record<string, Set<string>> = {
+  // sudo(8) -C -D -g -h -p -R -T -U -u; -a -c (BSD auth, login class) and -r -t (SELinux) exist only in some builds
+  sudo: new Set([
+    "-a", "-c", "-C", "-D", "-g", "-h", "-p", "-R", "-r", "-T", "-t", "-U", "-u",
+    "--auth-type", "--login-class", "--close-from", "--chdir", "--group", "--host", "--prompt", "--chroot", "--role",
+    "--command-timeout", "--type", "--other-user", "--user",
+  ]),
+  doas: new Set(["-a", "-u", "-C"]),
+  env: new Set(["-a", "-u", "-C", "-P", "-S", "--argv0", "--unset", "--chdir", "--split-string"]),
+  nice: new Set(["-n", "--adjustment"]),
+  exec: new Set(["-a"]),
+  time: new Set(["-f", "-o", "--format", "--output"]),
+  nohup: new Set(),
+  command: new Set(),
+  timeout: new Set(["-s", "-k", "--signal", "--kill-after"]), // its first operand is the duration
+};
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
+
+/** A shell word with its quotes removed; `live` if it holds a command substitution or a `$'...'` string. */
+type ShellWord = { text: string; live: boolean };
+
+/**
+ * Splits a command line into words the way a POSIX shell would quote them: single quotes literal, double quotes and
+ * backslash escapes honoured; unquoted `; | & ( )` end a word. `$(...)` and backticks are kept as text and mark the
+ * word live. Returns null for anything it can't balance (open quote, open `$(`, trailing backslash).
+ */
+function shellWords(s: string): ShellWord[] | null {
+  const words: ShellWord[] = [];
+  let text = "";
+  let live = false;
+  let inWord = false;
+  const end = () => {
+    if (inWord) words.push({ text, live });
+    text = "";
+    live = false;
+    inWord = false;
+  };
+  /** From s[j] just past "$(", returns the index just past the matching ")", or -1. Quotes inside are skipped whole. */
+  const closeParen = (j: number): number => {
+    let d = 1;
+    while (j < s.length) {
+      const ch = s[j]!;
+      if (ch === "\\") j += 2;
+      else if (ch === "'") {
+        const k = s.indexOf("'", j + 1);
+        if (k < 0) return -1;
+        j = k + 1;
+      } else if (ch === '"') {
+        j++;
+        while (j < s.length && s[j] !== '"') j += s[j] === "\\" ? 2 : 1;
+        if (j >= s.length) return -1;
+        j++;
+      } else if (ch === "`") {
+        const k = closeTick(j + 1);
+        if (k < 0) return -1;
+        j = k;
+      } else {
+        if (ch === "(") d++;
+        else if (ch === ")" && --d === 0) return j + 1;
+        j++;
+      }
+    }
+    return -1;
+  };
+  /** From s[j] just past "`", returns the index just past the closing backtick, or -1. */
+  const closeTick = (j: number): number => {
+    while (j < s.length) {
+      if (s[j] === "\\") j += 2;
+      else if (s[j] === "`") return j + 1;
+      else j++;
+    }
+    return -1;
+  };
+  /** A substitution starting at s[j] ("$(" or "`"): appends it to the word, returns the index past it, or -1. */
+  const subst = (j: number): number => {
+    const k = s[j] === "`" ? closeTick(j + 1) : closeParen(j + 2);
+    if (k < 0) return -1;
+    text += s.slice(j, k);
+    live = true;
+    return k;
+  };
   let i = 0;
-  while (i < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!) || ["sudo", "env", "nohup", "exec", "time", "command"].includes(words[i]!) || (i > 0 && /^-/.test(words[i]!) && ["sudo", "env"].includes(words[i - 1]!)))) i++;
-  return basename(words[i] ?? "") || "[COMMAND]";
+  while (i < s.length) {
+    const ch = s[i]!;
+    if (/\s/.test(ch)) {
+      end();
+      i++;
+    } else if (";|&()".includes(ch)) {
+      if (ch === "(" && inWord) return null; // A=(s1 s2): an array assignment, or a function definition
+      end();
+      i++;
+    } else if (ch === "\\") {
+      if (i + 1 >= s.length) return null;
+      if (s[i + 1] !== "\n") {
+        text += s[i + 1]!;
+        inWord = true;
+      }
+      i += 2;
+    } else if (ch === "'") {
+      const k = s.indexOf("'", i + 1);
+      if (k < 0) return null;
+      text += s.slice(i + 1, k);
+      inWord = true;
+      i = k + 1;
+    } else if (ch === "$" && s[i + 1] === "'") {
+      // $'...' can spell any byte with escapes: kept as text, marked live so it is never taken as the program
+      let j = i + 2;
+      while (j < s.length && s[j] !== "'") j += s[j] === "\\" ? 2 : 1;
+      if (j >= s.length) return null;
+      text += s.slice(i + 2, j);
+      live = inWord = true;
+      i = j + 1;
+    } else if ((ch === "$" && s[i + 1] === "(") || ch === "`") {
+      inWord = true;
+      i = subst(i);
+      if (i < 0) return null;
+    } else if (ch === '"') {
+      inWord = true;
+      i++;
+      for (;;) {
+        if (i >= s.length) return null;
+        const c = s[i]!;
+        if (c === '"') {
+          i++;
+          break;
+        }
+        if (c === "\\") {
+          if (i + 1 >= s.length) return null;
+          const n = s[i + 1]!;
+          if (n !== "\n") text += "$`\"\\".includes(n) ? n : c + n;
+          i += 2;
+        } else if ((c === "$" && s[i + 1] === "(") || c === "`") {
+          i = subst(i);
+          if (i < 0) return null;
+        } else {
+          text += c;
+          i++;
+        }
+      }
+    } else {
+      text += ch;
+      inWord = true;
+      i++;
+    }
+  }
+  end();
+  return words;
+}
+
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * A best-effort label for what a command line runs, not an authoritative identity. Splits the line into shell words
+ * (quotes and escapes honoured, nothing expanded), skips VAR=value assignments and the WRAPPERS with their options;
+ * `bash -c '<cmd>'` and `env -S` give the program inside. Pipelines, `;`, `&&`, subshells and aliases are not
+ * followed: `a | b` is labelled `a`. Fails closed to [COMMAND]: on quotes it can't balance, on a command substitution
+ * or `$'...'` at or before the program word, and on a label that holds whitespace, `=` or `$` (so a quoted secret
+ * or an unexpanded variable is never the label). Process telemetry (Falco, auditd) remains the source of truth for
+ * what actually ran.
+ */
+export function programOf(command: string, depth = 0): string {
+  const words = shellWords(command);
+  if (!words) return "[COMMAND]";
+  /** Recurse on the text of one word (bash -c, env -S), unless a word before it is live; the inner parse judges its own. */
+  const inner = (text: string, upto: number): string =>
+    depth < 3 && !words.slice(0, upto).some((x) => x.live) ? programOf(text, depth + 1) : "[COMMAND]";
+  let i = 0;
+  while (i < words.length && ASSIGNMENT.test(words[i]!.text)) i++;
+  while (i < words.length) {
+    const w = basename(words[i]!.text);
+    const opts = Object.hasOwn(WRAPPERS, w) ? WRAPPERS[w] : undefined; // not "constructor" etc. from the prototype
+    if (opts) {
+      i++;
+      while (i < words.length && words[i]!.text.startsWith("-")) {
+        const o = words[i]!.text;
+        if (o === "--") {
+          i++;
+          break;
+        }
+        // the option's value: "-u root" / "--user root" -> the next word, "-uroot" / "--user=root" -> attached,
+        // grouped short options "-Eu root" / "-Euroot" -> the first letter that takes a value
+        let name = o;
+        let value: string | undefined;
+        let next = false;
+        if (o.startsWith("--")) {
+          const eq = o.indexOf("=");
+          if (eq > 0) [name, value] = [o.slice(0, eq), o.slice(eq + 1)];
+          else next = opts.has(o);
+        } else {
+          for (let k = 1; k < o.length; k++) {
+            if (!opts.has(`-${o[k]}`)) continue;
+            name = `-${o[k]}`;
+            if (k + 1 < o.length) value = o.slice(k + 1);
+            else next = true;
+            break;
+          }
+        }
+        if (w === "env" && (name === "-S" || name === "--split-string")) {
+          if (value !== undefined) return inner(value, i);
+          if (next && i + 1 < words.length) return inner(words[i + 1]!.text, i + 1);
+          return "[COMMAND]";
+        }
+        i += next ? 2 : 1;
+      }
+      if (w === "env" || w === "sudo" || w === "doas") while (i < words.length && ASSIGNMENT.test(words[i]!.text)) i++;
+      if (w === "timeout") i++; // the duration
+      continue;
+    }
+    if (SHELLS.has(w) && depth < 3) {
+      const c = words.findIndex((x, j) => j > i && /^-[a-z]*c[a-z]*$/.test(x.text));
+      if (c > 0 && c + 1 < words.length) return inner(words[c + 1]!.text, c + 1);
+    }
+    if (words.slice(0, i + 1).some((x) => x.live)) return "[COMMAND]";
+    if (/[<>]/.test(words[i]!.text)) return "[COMMAND]"; // <file cmd, 2>log cmd: the file is no label
+    return w && !/[\s=$]/.test(w) ? w : "[COMMAND]";
+  }
+  return "[COMMAND]";
+}
+
+/**
+ * The hash key, refused unless it is what hib made: a regular file (not a symlink: opened with O_NOFOLLOW), owned by
+ * this user, no access for group or others, holding exactly 32 bytes as hex. Someone who could swap it could make the
+ * hashes of every folder known to them. Opened with O_NONBLOCK so a named pipe put there fails the regular-file check
+ * instead of blocking the open (and the daemon with it); nothing is read before the checks pass, and never more than
+ * the 65 bytes a key file can hold.
+ */
+export function readKey(file: string): Buffer {
+  let fd: number;
+  try {
+    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+  } catch (e: any) {
+    throw new Error(`${file}: ${e?.code === "ELOOP" ? "is a symlink" : (e?.message ?? e)}`);
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error(`${file}: not a regular file`);
+    if (process.getuid && st.uid !== process.getuid()) throw new Error(`${file}: not owned by this user`);
+    if (st.mode & 0o077) throw new Error(`${file}: group or others can access it (chmod 600)`);
+    if (st.size > 65) throw new Error(`${file}: not a 32-byte hex key`);
+    const text = readFileSync(fd, "utf8"); // grown since the fstat: the length check below still refuses it
+    if (text.length > 65 || !/^[0-9a-f]{64}\n?$/.test(text)) throw new Error(`${file}: not a 32-byte hex key`);
+    return Buffer.from(text.trim(), "hex");
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export type { EventsConfig };
@@ -231,7 +601,7 @@ export class EventLog {
             if (e?.code !== "EEXIST") throw e; // another process made it first: use theirs
           }
         }
-        this.key = Buffer.from(readFileSync(file, "utf8").trim(), "hex");
+        this.key = readKey(file);
       }
     }
     return createHmac("sha256", this.key).update(value).digest("hex").slice(0, 16);
