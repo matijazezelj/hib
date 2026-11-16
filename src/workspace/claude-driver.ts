@@ -89,6 +89,7 @@ export function claudeLaunch(opts: StartOptions): { args: string[]; env: Record<
   // unguarded in every session, and the agent could write new ones. Both switches, as Claude Code checks either.
   const memory = opts.askReads ? { autoMemoryEnabled: false } : {};
   if (opts.askReads) env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+  if (opts.session) env.HIB_SESSION = opts.session;
   args.push("--settings", JSON.stringify({ permissions, ...memory, ...(sandbox ? { sandbox } : {}) }));
   return { args, env };
 }
