@@ -94,32 +94,137 @@ function replaceSpans(text: string, spans: Span[]): string {
   return out + text.slice(pos);
 }
 
-const LOOPBACK = /^(?:localhost|.*\.localhost|127(?:\.\d{1,3}){3}|::1|0:0:0:0:0:0:0:1)$/;
+/** Loopback names (loopback addresses are found by their value, see ipv4Class and ipv6Class). */
+const LOOPBACK = /^(?:localhost|.*\.localhost)$/;
 
-/**
- * The registrable domain, from the Public Suffix List (tldts, private suffixes included: you.github.io stays
- * you.github.io, x.example.com.au becomes example.com.au). Loopback is "localhost"; an IP address becomes
- * [IP-INTERNAL] or [IP-EXTERNAL]; a name under no public suffix (.corp, .local, .internal, a single label) becomes
- * [INTERNAL], since its last labels would still name the network. A port goes.
- */
-export function domainOf(host: string): string {
-  let h = host.trim().toLowerCase().replace(/\.$/, "");
-  const v6 = /^\[([^\]]*)\](?::\d+)?$/.exec(h);
-  if (v6) h = v6[1]!;
-  else if (h.split(":").length === 2) h = h.replace(/:\d*$/, ""); // host:port; two or more colons is a bare IPv6
-  if (LOOPBACK.test(h)) return "localhost";
-  const p = parseHost(h, { allowPrivateDomains: true });
-  if (p.isIp) {
-    const internal = h.includes(":") ? /^f[cd]|^fe[89ab]/.test(h) : isPrivateIp(h);
-    return internal ? "[IP-INTERNAL]" : "[IP-EXTERNAL]";
-  }
-  return p.domain && (p.isIcann || p.isPrivate) ? p.domain : "[INTERNAL]";
+/** A placeholder the scrubber already put where a host was: [IP-INTERNAL], [HIBab12-IP-INTERNAL-NET1-1]. */
+const PLACEHOLDER = String.raw`\[(?:HIB[0-9a-f]{4}-)?[A-Z][A-Z0-9-]*\]`;
+const PLACEHOLDER_HOST = new RegExp(String.raw`^(${PLACEHOLDER})(?::\d*)?$`);
+/** scheme://[userinfo@]PLACEHOLDER[:port] up to the end of the authority (\ ends it too, as in new URL). */
+const PLACEHOLDER_URL = new RegExp(String.raw`^([A-Za-z][A-Za-z0-9+.-]*):\/\/(?:[^\s\/?#\\]*@)?(${PLACEHOLDER})(?::\d*)?(?:[\/?#\\]|$)`);
+
+/** What a host that can't be parsed becomes; never the input text. */
+const BAD_HOST = "[HOST]";
+const BAD_URL = "[URL]";
+
+/** IPv4 ranges that are internal on top of isPrivateIp's (10/8, 172.16/12, 192.168/16, 127/8): [first, prefix bits]. */
+const INTERNAL_V4: [number, number][] = [
+  [0x00000000, 8], // 0.0.0.0/8, "this network", 0.0.0.0 included
+  [0x64400000, 10], // 100.64.0.0/10, carrier-grade NAT
+  [0xa9fe0000, 16], // 169.254.0.0/16, link-local (cloud metadata at 169.254.169.254)
+  [0xc0000000, 24], // 192.0.0.0/24, IETF protocol assignments
+  [0xc6120000, 15], // 198.18.0.0/15, benchmarking
+  [0xe0000000, 4], // 224.0.0.0/4, multicast
+  [0xf0000000, 4], // 240.0.0.0/4, reserved, 255.255.255.255 included
+];
+
+/** A dotted-quad IPv4 address (as new URL writes it) classed: localhost, [IP-INTERNAL] or [IP-EXTERNAL]. */
+function ipv4Class(ip: string): string {
+  const p = ip.split(".").map(Number);
+  if (p.length !== 4 || p.some((n) => !(Number.isInteger(n) && n >= 0 && n <= 255))) return BAD_HOST;
+  if (p[0] === 127) return "localhost";
+  const n = ((p[0]! << 24) >>> 0) + (p[1]! << 16) + (p[2]! << 8) + p[3]!;
+  const inRange = INTERNAL_V4.some(([base, bits]) => (n >>> (32 - bits)) === (base >>> (32 - bits)));
+  return inRange || isPrivateIp(ip) ? "[IP-INTERNAL]" : "[IP-EXTERNAL]";
 }
 
-/** A URL cut to scheme://domain; text that isn't a URL becomes [URL]. */
-function urlDomain(url: string): string {
-  const m = /^([a-z][a-z0-9+.-]*):\/\/(?:[^\s/@]*@)?(\[[^\]]*\]|[^\s/?#:]+)/i.exec(url);
-  return m ? `${m[1]!.toLowerCase()}://${domainOf(m[2]!)}` : "[URL]";
+/** An IPv6 address without brackets or zone (as new URL writes it) as its eight 16-bit groups, or null. */
+function ipv6Groups(s: string): number[] | null {
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const groups = (x: string) => (x === "" ? [] : x.split(":").map((g) => (/^[0-9a-f]{1,4}$/i.test(g) ? parseInt(g, 16) : NaN)));
+  const head = groups(halves[0]!);
+  const tail = halves.length === 2 ? groups(halves[1]!) : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 2 ? fill < 1 : fill !== 0) return null;
+  const all = [...head, ...new Array<number>(halves.length === 2 ? fill : 0).fill(0), ...tail];
+  return all.every((n) => Number.isInteger(n)) ? all : null;
+}
+
+/** An IPv6 address classed; IPv4 inside it (mapped, compatible, NAT64) is classed as IPv4. */
+function ipv6Class(s: string): string {
+  const g = ipv6Groups(s);
+  if (!g) return BAD_HOST;
+  const [a, b, c, d, e, f, hi, lo] = g as [number, number, number, number, number, number, number, number];
+  const zero5 = a === 0 && b === 0 && c === 0 && d === 0 && e === 0;
+  if (zero5 && f === 0 && hi === 0 && lo === 1) return "localhost"; // ::1
+  if (zero5 && f === 0 && hi === 0 && lo === 0) return "[IP-INTERNAL]"; // ::, unspecified
+  const v4 = `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  if (zero5 && (f === 0xffff || f === 0)) return ipv4Class(v4); // ::ffff:0:0/96 mapped, ::/96 compatible
+  if (a === 0x64 && b === 0xff9b && c === 0 && d === 0 && e === 0 && f === 0) return ipv4Class(v4); // 64:ff9b::/96 NAT64
+  if (a === 0x64 && b === 0xff9b && c === 1) return "[IP-INTERNAL]"; // 64:ff9b:1::/48, local-use NAT64
+  const internal =
+    (a & 0xffc0) === 0xfe80 || // fe80::/10 link-local
+    (a & 0xffc0) === 0xfec0 || // fec0::/10 site-local
+    (a & 0xfe00) === 0xfc00 || // fc00::/7 unique local
+    (a & 0xff00) === 0xff00; // ff00::/8 multicast
+  return internal ? "[IP-INTERNAL]" : "[IP-EXTERNAL]";
+}
+
+/**
+ * A host, host:port, [IPv6]:port or bare IPv6 (zone id allowed) as new URL normalises it: lower case, punycode,
+ * IPv4 in dotted-quad (127.1 and 0x7f000001 are 127.0.0.1), IPv6 compressed in brackets. Null if it doesn't parse
+ * or has anything a host can't (path, query, userinfo, whitespace).
+ */
+function canonicalHost(raw: string): string | null {
+  if (!raw || /[\s\/\\?#@]/.test(raw)) return null;
+  let h = raw;
+  const bracketed = /^\[([^\]]*)\](:\d*)?$/.exec(h);
+  if (bracketed) h = `[${bracketed[1]!.replace(/%.*$/, "")}]`; // the port goes, and an IPv6 zone id (fe80::1%eth0)
+  else if ((h.match(/:/g) ?? []).length >= 2) h = `[${h.replace(/%.*$/, "")}]`; // bare IPv6; one colon is host:port
+  try {
+    return new URL(`http://${h}`).hostname || null;
+  } catch {
+    return null;
+  }
+}
+
+/** A hostname from canonicalHost reduced to a domain or a fixed label. */
+function hostClass(hostname: string | null): string {
+  if (!hostname) return BAD_HOST;
+  const h = hostname.replace(/\.$/, "");
+  if (h.startsWith("[") && h.endsWith("]")) return ipv6Class(h.slice(1, -1));
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) return ipv4Class(h);
+  if (LOOPBACK.test(h)) return "localhost";
+  if (h === "arpa" || h.endsWith(".arpa")) return "[INTERNAL]"; // home.arpa, in-addr.arpa, ip6.arpa: they name the network
+  const p = parseHost(h, { allowPrivateDomains: false });
+  return p.domain && p.isIcann ? p.domain : "[INTERNAL]";
+}
+
+/**
+ * The registrable domain under an ICANN public suffix (tldts, private suffixes left out so a tenant label doesn't
+ * survive: acme-payroll.s3.amazonaws.com and you.github.io become amazonaws.com and github.io; x.example.com.au
+ * becomes example.com.au). IDN comes out as punycode. Loopback is "localhost"; an IP address (in any form new URL
+ * accepts) becomes [IP-INTERNAL] or [IP-EXTERNAL]; a name under no ICANN suffix (.corp, .local, .internal, .arpa, a
+ * single label) becomes [INTERNAL], since its last labels would still name the network. A port goes. A placeholder
+ * the scrubber left ([IP-INTERNAL]) stays as it is; anything that doesn't parse is [HOST].
+ */
+export function domainOf(host: string): string {
+  const h = host.trim();
+  const placeholder = PLACEHOLDER_HOST.exec(h);
+  if (placeholder) return placeholder[1]!;
+  return hostClass(canonicalHost(h));
+}
+
+/**
+ * A URL cut to scheme://domain, the host as new URL reads it (https://evil.com\@good.com/ goes to evil.com) and
+ * classed as domainOf does, so net_host and url agree. A placeholder host is kept; anything else that isn't a URL
+ * with a host becomes [URL].
+ */
+export function urlDomain(url: string): string {
+  const u = url.trim();
+  const placeholder = PLACEHOLDER_URL.exec(u);
+  if (placeholder) return `${placeholder[1]!.toLowerCase()}://${placeholder[2]!}`;
+  let parsed: URL;
+  try {
+    // An IPv6 zone id ([fe80::1%25eth0]) makes new URL throw; it says nothing about where the request goes.
+    parsed = new URL(u.replace(/^([^\/?#]*\/\/[^\/?#\\]*\[[0-9A-Fa-f:.]+)%[^\]\/?#]*\]/, "$1]"));
+  } catch {
+    return BAD_URL;
+  }
+  // Re-read as an http host: non-special schemes (ssh://, git://) leave the host as typed, not normalised.
+  const domain = hostClass(canonicalHost(parsed.hostname));
+  return domain === BAD_HOST ? BAD_URL : `${parsed.protocol.replace(/:$/, "")}://${domain}`;
 }
 
 /**

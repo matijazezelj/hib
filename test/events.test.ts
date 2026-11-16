@@ -233,7 +233,7 @@ describe("coarsening", () => {
     const cases: [string, string][] = [
       ["a.b.example.co.uk", "example.co.uk"],
       ["x.example.com.au", "example.com.au"],
-      ["you.github.io", "you.github.io"], // a private suffix: github.io alone would merge every user
+      ["you.github.io", "github.io"], // a private suffix: ICANN only, so the user name doesn't leave the machine
       ["Registry.NPMjs.org.", "npmjs.org"],
       ["api.eu.example.com:443", "example.com"],
       ["localhost", "localhost"],
