@@ -68,6 +68,8 @@ function fold(items: Item[], e: any): Item[] {
     }
     case "protected_reverted":
       return [...items, { kind: "note", tone: "bad", text: `hib put back ${e.changes.length} unapproved change(s) to git hooks/config or tool config: ${e.changes.map((c: any) => `${c.path} (${c.change})`).join(", ")}${e.failed.length ? `; couldn't restore ${e.failed.join(", ")}` : ""}. If you made one yourself, redo it.` }];
+    case "home_changed":
+      return [...items, { kind: "note", tone: e.changes.some((c: any) => !c.approved) ? "bad" : "warn", text: `${e.changes.some((c: any) => !c.approved) ? "files outside this folder changed during the turn" : "approved changes outside this folder"}: ${e.changes.map((c: any) => `${c.path} (${c.change}${c.approved ? ", approved" : ""})`).join(", ")}. hib doesn't put these back: check them if you didn't make the change.` }];
     case "pseudonymised": {
       const i = items.findIndex((x) => x.kind === "tool" && x.call.id === e.callId);
       const at = i >= 0 ? i : items.map((x) => (x.kind === "tool" && x.call.kind === "read" ? "r" : "")).lastIndexOf("r");
