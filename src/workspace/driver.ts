@@ -101,3 +101,13 @@ export function commandRuleKey(prefix: string, command: string): string {
 }
 
 export const short = (s: string, n = 120) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+
+/**
+ * HIB_SESSION as the first variable: Falco (modern eBPF) reads only the first 4 KB of a process's environment, so a
+ * marker at the end of a large one is invisible to proc.env.
+ */
+export function sessionFirst(env: Record<string, string>, session?: string): Record<string, string> {
+  if (!session) return env;
+  const { HIB_SESSION: _, ...rest } = env;
+  return { HIB_SESSION: session, ...rest };
+}
