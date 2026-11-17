@@ -66,6 +66,15 @@ class FakeDriver implements AgentDriver {
     this.decisions.set(id, d);
     this.waiters.get(id)?.(d);
   }
+  outputs = new Map<string, string>();
+  outputWaiters = new Map<string, (t: string) => void>();
+  answerOutput(id: string, text: string) {
+    this.outputs.set(id, text);
+    this.outputWaiters.get(id)?.(text);
+  }
+  shown(id: string): Promise<string> {
+    return new Promise((r) => this.outputWaiters.set(id, r));
+  }
   async interrupt() {}
   async close() {}
   get alive() {
@@ -110,6 +119,7 @@ beforeEach(async () => {
   );
   userHome = realpathSync(mkdtempSync(join(tmpdir(), "hib-home-")));
   sessions.homeDir = userHome; // never the real home in tests
+  sessions.captureRoot = join(userHome, "capture");
 });
 let userHome = "";
 
@@ -491,6 +501,35 @@ describe("sensitive workspaces", () => {
     const evs: WsEvent[] = [];
     for await (const e of r) evs.push(e);
     expect(evs.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("pinned to alpha@work") });
+  });
+
+  test("command output: captured, then guarded with the session's vault before the agent sees it", async () => {
+    sensitive();
+    let seen = "";
+    script.current = async (_t, d, q) => {
+      q.push({ type: "output", id: "o1", callId: "toolu_1", text: "jane.doe@acme.com logged in from 10.1.2.3\n[exit 0]" });
+      seen = await d.shown("o1");
+      q.push({ type: "output", id: "o2", callId: "toolu_2", text: "again: jane.doe@acme.com\n[exit 0]" });
+      await d.shown("o2");
+    };
+    const r = await turn("look at the login log", undefined, undefined, "hib/auto");
+    expect(drivers[0]!.started[0]!.captureDir).toBe(join(userHome, "capture", r.sid));
+    expect(seen).not.toContain("jane.doe@acme.com");
+    expect(seen).not.toContain("10.1.2.3");
+    expect(seen).toEndWith("[exit 0]");
+    const token = /\[HIB[0-9a-f]{4}-EMAIL-\d+\]/.exec(seen)![0];
+    expect(drivers[0]!.outputs.get("o2")).toBe(`again: ${token}\n[exit 0]`); // same value, same token
+    const notes = r.events.filter((e) => e.type === "output_guarded");
+    expect(notes[0]).toMatchObject({ callId: "toolu_1", findings: { EMAIL: 1 } });
+    const dir = drivers[0]!.started[0]!.captureDir!;
+    writeFileSync(join(dir, "toolu_left"), "a killed command's output");
+    await sessions.close(r.sid);
+    expect(existsSync(dir)).toBe(false); // nothing left behind once the CLI is gone
+  });
+
+  test("no capture folder outside sensitive folders", async () => {
+    await turn("hello");
+    expect(drivers[0]!.started[0]!.captureDir).toBeUndefined();
   });
 
   test("secrets in the prompt are blocked outright and nothing is sent", async () => {

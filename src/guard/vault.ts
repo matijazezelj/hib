@@ -78,6 +78,26 @@ export class Vault {
     return out + text.slice(pos);
   }
 
+  /**
+   * Where `text` holds a value this vault already has a token for, as findings (whole words only, 3+ characters): a
+   * value tokenised once, say a name from a Read copy's table, gets the same token in command output, where no
+   * detector would find it again.
+   */
+  knownFindings(text: string): Finding[] {
+    const values = [...this.toToken.keys()].filter((v) => v.length >= 3 && v.trim() === v).sort((a, b) => b.length - a.length);
+    if (!values.length || !text) return [];
+    const esc = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`(?<![\\p{L}\\p{N}_])(?:${values.map(esc).join("|")})(?![\\p{L}\\p{N}_])`, "gu");
+    const out: Finding[] = [];
+    const prefix = `HIB${this.tag}-`;
+    for (const m of text.matchAll(re)) {
+      const core = this.toToken.get(m[0])!;
+      const category = core.slice(prefix.length).replace(/-\d+$/, "");
+      out.push({ start: m.index!, end: m.index! + m[0].length, value: m[0], category, kind: "pii" });
+    }
+    return out;
+  }
+
   lookup(core: string): string | undefined {
     return this.toValue.get(core);
   }

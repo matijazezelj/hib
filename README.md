@@ -108,6 +108,16 @@ A sensitive folder is seen by exactly one vendor account, and it must be a Claud
   - A symlink to a data file is judged by its target, so it gets the pseudonymised copy too.
   - Commands keep `[HIB…]` placeholders as they are; restored, `echo` would print the real values back to the model.
   - The agent is told this rule up front. Listing and counting (`ls`, `wc`, `find`) still work.
+- **Command output is guarded.** hib asks before each command; once it runs, the agent sees what it printed only after the guard.
+  - Every command that runs, however it was allowed (asked, "always" or auto), is rewritten to run (as one quoted string, so nothing in it can end the redirect early) in a subshell that prints into a capture file in hib's own folder (`$TMPDIR/hib-out-<uid>/<session>/`, the one place outside the workspace the sandbox lets it write). The tool result itself carries only `[exit N]`.
+  - hib's PostToolUse hook, registered over Claude Code's control channel so it runs in the daemon, reads that file, guards it and hands the agent the result: the guard at the level a Read copy gets, name detection within its budget (when on), and every value the session's vault already holds, so a name tokenized from a Read copy comes back as the same token. Paths stay readable. The timeline notes what was replaced.
+  - This fails closed. A failing command's output is passed on by Claude Code without hooks, and a killed one never reaches the hook, but neither printed anything into the tool result: the agent sees `[exit N]` or `Exit code 137`, never the raw text, and neither does Claude's transcript. If Claude Code doesn't confirm the hook at start, the session doesn't start.
+  - hib makes the capture file itself before the command runs and reads back only that file (same device and inode, no symlink, one link, owned by you), so a command can't rename a data file onto it to get it read. It reads up to 1 MB; the agent gets up to 60,000 characters, cut at a line break. The file tools can't read the capture folder, and `Monitor` (which streams output as it comes) is off. Commands run in the foreground; one that outlives its timeout and moves to the background keeps its capture file, and a later `cat` of it is guarded like any command.
+  - Each command runs in its own subshell, so `cd` and exports don't carry over to the next one; the agent is told.
+  - Placeholders in later commands aren't restored (as before), so a command grepping for a token from earlier output finds nothing.
+  - With name detection off, a name in command output goes through as it is, as in a plain-text Read copy.
+  - Checked on Linux (bubblewrap). On macOS, run the probe below before relying on it.
+  - `bun test/manual/output-guard-probe.ts` rechecks this against your installed Claude Code (it relies on the stream-json control protocol, which isn't a documented interface); run it after an upgrade.
 - **No MCP servers** but hib's own (every session already ignores the repo's `.claude/` settings and hooks; see Security model).
 - **No browser terminal** (the server refuses it).
 - **Egress log.** Each turn records the redacted prompt and the account it went to, plus every tool call. View it in the *Egress* tab, with `/egress` in the terminal, or with `hib workspace egress`.
@@ -163,7 +173,7 @@ In a **sensitive workspace**, when you approve Claude reading a `.csv` or `.tsv`
 Limits:
 - The profile still reveals column names and row counts.
 - Detecting identifying columns is heuristic, so check the "identifying" list and use `--hide` for anything it missed.
-- Only Claude reads can be redirected, not Bash `cat`. In sensitive mode Bash asks, so deny it.
+- Only Claude reads can be redirected, not Bash `cat`; commands can't read data files at all (the sandbox), and what they print is guarded.
 
 ## Log pipelines (hib pipe)
 
@@ -235,7 +245,7 @@ hib daemon stop         # restart to pick it up; `hib guard ner status|off` to c
 
 Pattern matching catches emails, keys and IPs, but not "Marija Horvat", "Podravka d.d." or "Trg bana Josipa Jelačića 3". With name detection on, a multilingual entity-recognition model (`bert-base-multilingual-cased-ner-hrl`, pinned revision) runs **on your machine** and finds people, places and organisations. Two rules add companies with legal suffixes (d.o.o., d.d., GmbH, Ltd, Inc…) and street addresses. The findings become the same stable tokens as everything else: `[…-PERSON-1]`, `[…-ORG-1]`, `[…-PLACE-1]`, `[…-ADDRESS-1]`. The model sees them as placeholders and you see the real values.
 
-- **Covers:** router prompts, `hib ask -f` tables, the LLM classifier's excerpt, and prompts and Read copies in sensitive workspaces.
+- **Covers:** router prompts, `hib ask -f` tables, the LLM classifier's excerpt, and prompts, Read copies and command output in sensitive workspaces.
 - **Prose only:** fenced code, inline code and code-looking lines are skipped, and a built-in list keeps tech names like Redis and Grafana from being treated as companies. Add your own with `nerIgnore = [...]` in `[guard]`.
 - **Lowercase chat** ("luka novak from infobip") gets a second pass on a title-cased copy.
 - **File names, URLs and slugs** (`_3077649_-_ivana_babic_learner_-_contact_form.pdf`, `/people/ivana-babic-cv`, `Ivana%20Babi%C4%87.pdf`) are read too, anywhere in the input, from a copy with separators turned into spaces, escapes decoded and words title-cased; what's found replaces the exact span.
