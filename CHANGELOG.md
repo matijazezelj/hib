@@ -2,6 +2,11 @@
 
 All notable changes to hib. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change behaviour.
 
+## [0.4.0] - 2026-11-17
+
+### Added
+- **Session scopes** (Linux, opt-in: `[events] session_scope = true`). Each Claude or Codex CLI runs in a systemd user scope named after its session, `hib-<session_id>-<8 hex>.scope`, new each time the CLI starts. The unit name is on `session.start` as `scope`. Process telemetry such as Falco can then tie every process an agent starts to its session by cgroup, which survives `env -i`, `setsid` and a reordered environment. Checked live with Claude Code and Codex: shells, `sh -c` children, background jobs and `env -i setsid` stayed in the scope; a command inside the agent's OS sandbox couldn't start a scope of its own; killing the daemon ended the CLIs. `daemon.start` carries `session_scope` (`available` or `unavailable`). When systemd can't be reached, a `scope.unavailable` warning gives the reason and sessions run unscoped. Scopes aren't stopped at session end. (#24)
+
 ## [0.3.0] - 2026-11-17
 
 SIEM noise and session tracing, from SIB's first rules running against hib.
@@ -42,5 +47,6 @@ First versioned release: the harness as built from 8 October to 15 November 2026
 - **`hib pipe`** redacts log streams before they reach an LLM. (#7)
 - **Security event log** (`~/.hib/events/events.jsonl`) for a SIEM, with a `daemon.alive` heartbeat and redaction hardened by fuzzing. (#8, #9)
 
+[0.4.0]: https://github.com/matijazezelj/hib/releases/tag/v0.4.0
 [0.3.0]: https://github.com/matijazezelj/hib/releases/tag/v0.3.0
 [0.2.0]: https://github.com/matijazezelj/hib/releases/tag/v0.2.0
