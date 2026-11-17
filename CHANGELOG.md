@@ -2,6 +2,11 @@
 
 All notable changes to hib. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change behaviour.
 
+## [Unreleased]
+
+### Changed
+- **`home.changed` is a warning, not critical, when a CLI settings file changed only in preference keys** (`model`, `advisorModel`, `theme`, `tui`, `agentPushNotifEnabled` in Claude's `settings.json`, `model` and `model_reasoning_effort` in Codex's `config.toml`), as happens when you run `/model` or `/config` in another session. Such a change is marked `prefs_only: true`. Any other key (hooks, permissions, env, statusLine, MCP servers, `model_provider`), a mode change or a file that doesn't parse keeps it critical.
+
 ## [0.2.0] - 2026-11-16
 
 Mostly the security event log and what a SIEM (such as [SIB](https://github.com/matijazezelj/sib)) needs to use it safely.

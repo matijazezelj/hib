@@ -531,7 +531,7 @@ const FIXED: Record<string, Severity> = {
 /** Fixed per type; the three types with a decision are a warning when it went against the request. */
 export function severityOf(event: string, f: Record<string, unknown>): Severity {
   if (event === "guard.decision") return f.action === "rejected" || f.action === "timeout" ? "warning" : "info";
-  if (event === "home.changed") return Array.isArray(f.changes) && f.changes.every((c: any) => c?.approved === true) ? "warning" : "critical";
+  if (event === "home.changed") return Array.isArray(f.changes) && f.changes.every((c: any) => c?.approved === true || c?.prefs_only === true) ? "warning" : "critical";
   if (event === "tool.permission" || event === "sandbox.network") return f.decision === "deny" ? "warning" : "info";
   return FIXED[event] ?? "info";
 }
