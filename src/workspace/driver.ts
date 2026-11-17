@@ -38,6 +38,7 @@ export type AgentEvent =
   | { type: "tool_call"; call: ToolCall }
   | { type: "tool_result"; id: string; ok: boolean; output?: string }
   | { type: "permission"; id: string; call: ToolCall; ruleKey: string; input?: unknown } // driver waits for answer()
+  | { type: "output"; id: string; callId: string; text: string } // a command's raw output: the driver waits for answerOutput() with what the model may see
   | { type: "usage"; in: number; out: number }
   | { type: "quota"; window: string; usedPct: number; resetsAt?: number }
   | { type: "rate_limited"; message: string; resetsAt?: number }
@@ -58,6 +59,7 @@ export interface StartOptions {
   denyReads?: string[]; // absolute paths the CLI's own file tools may never read (they run outside the sandbox)
   session?: string; // hib's session id: set as HIB_SESSION on the CLI, so every process it starts can be traced to it
   scope?: { tool: ScopeTool; unit: string }; // start the CLI in this systemd user scope ([events] session_scope)
+  captureDir?: string; // sensitive sessions: commands write their output here, and the model sees it only through answerOutput()
 }
 
 /** What the agent's commands (and every process they start) may not touch, whatever is approved. */
@@ -80,6 +82,8 @@ export interface AgentDriver {
   /** Runs one user turn; yields until turn_done. Permission events block the CLI until answer(). */
   turn(text: string): AsyncIterable<AgentEvent>;
   answer(permissionId: string, decision: Decision): void;
+  /** What the model sees of a command's output (only drivers started with captureDir emit "output" events). */
+  answerOutput?(id: string, text: string): void;
   interrupt(): Promise<void>;
   close(): Promise<void>;
   readonly alive: boolean;

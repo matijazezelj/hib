@@ -1,6 +1,7 @@
 # Design: MCP results and command output in sensitive folders
 
-Status: proposal, not implemented. Written 2026-10-20 after an end-to-end SIEM test.
+Status: (b) command output is implemented (2026-11-17), through a hook rather than the FIFOs recommended below; see
+"(b) as built". (a) the MCP proxy is still a proposal. Written 2026-10-20 after an end-to-end SIEM test.
 
 In a sensitive folder, hib guards what the agent reads through Read (a pseudonymised copy) and what you type. Two
 channels still go out unguarded or can't be used at all:
@@ -79,3 +80,33 @@ Details to settle when building it:
 
 Option 4 is worth re-checking against each Claude Code release. If hooks can replace Bash output, they'd be a simpler
 carrier for the same daemon-side guard, with no changes to the sandbox.
+
+## (b) as built (2026-11-17)
+
+Option 4 was re-checked against Claude Code 2.1.326 and holds: a PostToolUse hook can replace a built-in tool's output
+(`hookSpecificOutput.updatedToolOutput`, documented for Bash), and a host can register hooks over the stream-json control
+channel (`initialize` with `hooks`; the CLI calls back with `hook_callback`; the reply reports `hooks_applied`). So the
+guard runs in the daemon with the session vault, and nothing in the sandbox can reach it. The hook alone fails open,
+though: a failing command goes to PostToolUseFailure, which can't rewrite; a hook that times out or returns a shape the
+CLI rejects passes the original on; a command killed with its shell never reaches the hook. So it's combined with the
+capture idea from option 3:
+- Every allowed Bash call is rewritten (`wrapCommand`) to `( eval '<cmd>' ) > <capture>/<tool_use_id> 2>&1`, then
+  `printf '[exit %s]'`. As one quoted string, a `)` in the command can't close the subshell and print past the redirect. The tool's own output is only the exit status, and the subshell keeps `exit 3` from failing the
+  tool. Whatever the hook does or doesn't do, the model and Claude's transcript never get the raw text.
+- hib creates the capture file before the command runs (`makeCapture`, O_EXCL) and pins its device and inode. The hook
+  reads only that file (no symlinks, a regular file with one link owned by the user, capped, cut at a line break), so a
+  data file renamed onto the path is refused. It guards it with
+  the session's vault (`guardOutput`: the standard guard, name detection, `Vault.knownFindings` for values already
+  tokenized) and returns it as `stdout`.
+- The capture folder is the only extra path the sandbox may write (`filesystem.allowWrite`). Read rules deny it to the
+  file tools; a command reading it prints into its own capture file, so that comes back guarded too. `Monitor` is denied
+  and `run_in_background` forced off; a command that outlives its timeout keeps its capture file.
+- Without `hooks_applied: true` the session doesn't start.
+- Checked live on Linux: plain, failing (exit 3), killed (`kill -9 $$`), `)`-escape and subagent commands, and Read/Grep
+  of a file left in the capture folder; the marker never reached the model or the transcript. macOS is unchecked.
+- Commands no longer share a shell: `cd` and exports don't carry over (the agent is told, in the sensitive-folder note). `test/manual/output-guard-probe.ts` repeats this for each Claude Code release, since the control
+  channel isn't a documented interface.
+
+Not covered: a command that writes to its parent shell's own output (`/proc/$PPID/fd/1`) puts text in the tool result;
+the hook guards that too, but if that command also kills its shell, it goes out unguarded. That takes a command written
+to get around the guard, not an accident.

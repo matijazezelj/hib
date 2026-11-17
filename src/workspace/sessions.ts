@@ -11,7 +11,7 @@ import { insideRoot, realTarget } from "./fs";
 import { changes as protectedChanges, revert as revertProtected, snapshot as protectedSnapshot } from "./protect";
 import { detect, type Finding } from "../guard/detectors";
 import { onPinnedAccount, pinnedModel, SENSITIVE_NEEDS_CLAUDE, supportsSensitive } from "./registry";
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { scopeProbe, scopeUnit, type ScopeProbe } from "./scope";
 import { homeChanges, homePath, homeSnapshot, type HomeSnapshot, type HomeWatch } from "./homewatch";
@@ -36,6 +36,7 @@ export type WsEvent =
   | { type: "advice"; model: string; account: string; question: string; advice: string; ok: boolean; chars: number; guard: string }
   | { type: "sent"; account: string; model: string; text: string; handoff: boolean; progress?: boolean; chars: number }
   | { type: "pseudonymised"; file: string; columns: string[]; callId?: string; names?: string } // names: why the copy's names weren't (all) checked
+  | { type: "output_guarded"; callId: string; findings: Record<string, number>; names?: string } // a command's output in a sensitive session, as the guard changed it
   | { type: "protected_reverted"; changes: { path: string; change: string }[]; failed: string[] } // unapproved changes to git hooks/config or tool config, put back
   | { type: "home_changed"; changes: { path: string; change: string; approved: boolean; prefs_only?: true }[] } // shell startup files, user agent config etc. changed during the turn: reported, not put back
   | AgentEvent
@@ -206,6 +207,20 @@ const PROGRESS_FILE = "PROGRESS.md";
 const PROGRESS_LIMIT = 20_000;
 
 /** Restores tokens inside tool inputs so the CLI writes real values, never placeholders. */
+/** Where a sensitive session's commands write their output for hib to guard: private to this user, one folder per session. */
+/**
+ * Where a sensitive session's commands write their output for hib to guard: private to this user, one folder per session.
+ * Resolved, since the sandbox's write rule and the shell's redirect must name the same path (macOS's temp folder is
+ * behind a symlink).
+ */
+function captureFolder(base: string, id: string): string {
+  mkdirSync(base, { recursive: true, mode: 0o700 });
+  chmodSync(base, 0o700);
+  const dir = join(base, id);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return realpathSync(dir);
+}
+
 function restoreDeep(v: unknown, vault: Vault): unknown {
   if (typeof v === "string") return vault.restore(v);
   if (Array.isArray(v)) return v.map((x) => restoreDeep(x, vault));
@@ -247,6 +262,7 @@ export class WorkspaceSessions {
 
   /** The home folder whose startup files and agent config each turn watches (tests point it elsewhere). */
   homeDir = homedir();
+  captureRoot = join(tmpdir(), `hib-out-${process.getuid?.() ?? "u"}`); // capture folders for sensitive sessions' commands
   scopeProbe: () => ScopeProbe = scopeProbe; // replaced in tests
 
   /** What the home watch covers: the home folder, plus every account's Claude config dir and Codex home. */
@@ -300,6 +316,8 @@ export class WorkspaceSessions {
     // Written first: on daemon exit closeAll doesn't wait for the close.
     this.events.emit("session.end", this.evCtx(l.id, l.root, l.candidate), { agent: l.candidate.provider, sensitive: l.askReads });
     await l.driver.close();
+    // A killed command never reaches the hook, so its capture file is still there: none outlive the CLI.
+    if (l.askReads) rmSync(join(this.captureRoot, l.id), { recursive: true, force: true });
   }
 
   onChange(fn: () => void) {
@@ -469,7 +487,10 @@ export class WorkspaceSessions {
     // Not the scripted agent: it starts no process.
     const probe = this.cfg.events.sessionScope && c.provider !== "script" ? this.scopeProbe() : undefined;
     const scope = probe && "tool" in probe ? { tool: probe.tool, unit: scopeUnit(id) } : undefined;
-    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools, session: id, scope });
+    // Sensitive sessions: commands print into a capture folder of hib's, and the agent sees their output only after the
+    // guard (guardOutput). Drivers that can do it: Claude (sensitive sessions refuse Codex).
+    const captureDir = askReads && typeof driver.answerOutput === "function" ? captureFolder(this.captureRoot, id) : undefined;
+    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools, session: id, scope, captureDir });
     const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox, approvedProtected: new Set(), approvedHome: new Set() };
     this.live.set(id, l);
     this.events.emit("session.start", this.evCtx(id, root, c), { agent: c.provider, sensitive: askReads, ...(scope ? { scope: scope.unit } : {}) });
@@ -700,6 +721,22 @@ export class WorkspaceSessions {
             yield ev;
             break;
           }
+          case "output": {
+            // The agent waits on this: whatever happens, it gets an answer, and never the raw text.
+            let shown = "[hib withheld this output: the guard failed]";
+            try {
+              const g = await this.guardOutput(l, e.text);
+              shown = g.text;
+              if (Object.keys(g.findings).length || g.names) {
+                const ev = { type: "output_guarded" as const, callId: e.callId, findings: g.findings, ...(g.names ? { names: g.names } : {}) };
+                this.record(sid, ev);
+                yield ev;
+              }
+            } finally {
+              l.driver.answerOutput?.(e.id, shown);
+            }
+            break;
+          }
           case "permission": {
             const call = restoreCall(e.call, vault);
             if (e.call.outbound) call.outbound = webOutbound(e.call.outbound);
@@ -906,6 +943,22 @@ export class WorkspaceSessions {
    * out). Off or unavailable, the copy goes without it and `note` says so for the timeline: the copy still went out on
    * your approval, but you should know its names weren't checked. Not cached: a copy is read once and can be large.
    */
+  /**
+   * A command's output in a sensitive session, as the agent may see it: the guard at the level a Read copy gets, name
+   * detection within its budget, and every value the session's vault already holds, so a name tokenised from a Read
+   * copy comes back as the same token. Paths stay, as in prompts: the agent needs them to work.
+   */
+  private async guardOutput(l: Live, text: string): Promise<{ text: string; findings: Record<string, number>; names?: string }> {
+    if (!text.trim()) return { text, findings: {} };
+    const ner = await this.nameCheck(text);
+    const extra = [...(ner.findings ?? []), ...l.vault.knownFindings(text)];
+    const r = l.vault.obfuscate(text, { level: "standard", terms: this.cfg.guard.terms, identities: [], patterns: this.cfg.guard.patterns, keepPaths: true, extra });
+    const findings: Record<string, number> = {};
+    for (const f of r.findings) findings[f.category] = (findings[f.category] ?? 0) + 1;
+    // With name detection off, every command would carry the same note; the Read copies already say it.
+    return { text: r.text, findings, ...(ner.note && this.cfg.guard.ner ? { names: ner.note } : {}) };
+  }
+
   private async nameCheck(text: string, cells?: [number, number][]): Promise<{ findings?: Finding[]; note?: string }> {
     if (!this.cfg.guard.ner) return { note: "name detection is off: names in free text weren't checked" };
     const r = await runNer([text], this.cfg, this.engine.nerInfer ?? this.engine.nerModel.infer, cells ? new Map([[text, cells]]) : undefined);

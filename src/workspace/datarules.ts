@@ -17,7 +17,9 @@ export const DATA_RULE_NOTE =
   "This folder is marked sensitive. Read data files (CSV, TSV, JSON, logs…) only with the Read tool: you will receive a pseudonymised copy " +
   "in which people, accounts, IPs and similar values are placeholders like [HIB…-USER-3]. A JSON file that isn't a list arrives as the largest list of records inside it. Shell commands that read data files, inline scripts " +
   "(python -c, node -e, heredocs) and scripts written outside this folder are blocked. To compute something over a data file, read it with Read and reason over it, " +
-  "or write a script inside this folder that the user can review.";
+  "or write a script inside this folder that the user can review. " +
+  "Each shell command runs on its own in a subshell: cd and export don't carry over to the next command, so use absolute paths or repeat them. " +
+  "Its output reaches you after hib's guard, with the same kind of placeholders, and ends with [exit N].";
 
 /**
  * Why a command was blocked. `reason` is fixed text that never holds anything from the command; `detail` is the file

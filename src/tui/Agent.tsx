@@ -162,6 +162,9 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
         setPending((p) => p.filter((x) => x.id !== e.id));
         push({ text: `  ${e.choice === "deny" ? "✗ denied" : e.choice === "always" ? "✓ always allowed" : "✓ allowed"}`, color: e.choice === "deny" ? "red" : "green" });
         break;
+      case "output_guarded":
+        push({ text: `  ⎿ the agent got this command's output with ${Object.entries(e.findings).map(([k, v]) => `${k}×${v}`).join(" ") || "nothing"} replaced${e.names ? ` (${e.names})` : ""}`, color: e.names ? "yellow" : "gray" });
+        break;
       case "protected_reverted":
         push({ text: `hib put back ${e.changes.length} unapproved change(s) to git hooks/config or tool config: ${e.changes.map((c: any) => `${c.path} (${c.change})`).join(", ")}${e.failed.length ? `; couldn't restore ${e.failed.join(", ")}` : ""}. If you made one yourself, redo it.`, color: "red" });
         break;
