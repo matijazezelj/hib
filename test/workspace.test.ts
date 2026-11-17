@@ -190,7 +190,16 @@ test("claude: sensitive sessions start with auto-memory off (setting and env); o
 test("claude: HIB_SESSION carries the session id, and an account env can't override it", () => {
   const { claudeLaunch } = require("../src/workspace/claude-driver") as typeof import("../src/workspace/claude-driver");
   const account = { id: "claude@work", provider: "claude", name: "work", env: { HIB_SESSION: "spoofed" }, limits: {}, dirs: [] };
-  expect(claudeLaunch({ cwd: "/work", model: "sonnet", account, session: "w_abc" } as any).env.HIB_SESSION).toBe("w_abc");
+  const { env } = claudeLaunch({ cwd: "/work", model: "sonnet", account, session: "w_abc" } as any);
+  expect(env.HIB_SESSION).toBe("w_abc");
+  expect(Object.keys(env)[0]).toBe("HIB_SESSION"); // first: Falco reads only the first 4 KB of the environment
+});
+
+test("sessionFirst puts HIB_SESSION first and keeps the rest; no session leaves the env as it was", () => {
+  const { sessionFirst } = require("../src/workspace/driver") as typeof import("../src/workspace/driver");
+  expect(Object.entries(sessionFirst({ PATH: "/bin", HIB_SESSION: "old", HOME: "/h" }, "w_1"))).toEqual([["HIB_SESSION", "w_1"], ["PATH", "/bin"], ["HOME", "/h"]]);
+  const env = { PATH: "/bin" };
+  expect(sessionFirst(env)).toBe(env);
 });
 
 test("a keep-list needs the folder's own sensitive policy", async () => {

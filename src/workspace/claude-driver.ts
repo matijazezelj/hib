@@ -1,7 +1,7 @@
 import { accountEnv } from "../providers/spawn";
 import { parseClaudeLine } from "../providers/claude-cli";
 import type { AgentDriver, AgentEvent, Decision, StartOptions, ToolCall, ToolKind } from "./driver";
-import { commandRuleKey, short } from "./driver";
+import { commandRuleKey, sessionFirst, short } from "./driver";
 import { Queue } from "./queue";
 
 const SECRET_READS = ["~/.hib/**", "~/.claude/**", "~/.claude.json", "~/.claude-*/**", "~/.codex/**", "~/.ssh/**", "~/.aws/**", "~/.gnupg/**", "~/.config/gh/**"].map((p) => `Read(${p})`);
@@ -107,9 +107,8 @@ export function claudeLaunch(opts: StartOptions): { args: string[]; env: Record<
   // unguarded in every session, and the agent could write new ones. Both switches, as Claude Code checks either.
   const memory = opts.askReads ? { autoMemoryEnabled: false } : {};
   if (opts.askReads) env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
-  if (opts.session) env.HIB_SESSION = opts.session;
   args.push("--settings", JSON.stringify({ permissions, ...memory, ...(sandbox ? { sandbox } : {}) }));
-  return { args, env };
+  return { args, env: sessionFirst(env, opts.session) };
 }
 
 /**
