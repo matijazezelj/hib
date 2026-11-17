@@ -912,3 +912,35 @@ test("a sensitive session refuses to start without the OS sandbox", async () => 
   expect(r.events.some((e) => e.type === "sent")).toBe(false);
   expect(drivers.flatMap((d) => d.started)).toHaveLength(0);
 });
+
+describe("session scope ([events] session_scope)", () => {
+  const tool = { systemdRun: "/usr/bin/systemd-run", env: "/usr/bin/env", runtimeDir: "/run/user/1000" };
+  const run = async () => {
+    for await (const _ of sessions.send({ root, model: "alpha/big", text: "hi" }));
+  };
+
+  test("off by default: no scope, none on session.start", async () => {
+    sessions.scopeProbe = () => ({ tool });
+    await run();
+    expect(drivers[0]!.started[0]!.scope).toBeUndefined();
+    expect(logged("session.start")[0].scope).toBeUndefined();
+  });
+
+  test("on: a unit per CLI start, named after the session, and on session.start", async () => {
+    engine.cfg.events.sessionScope = true;
+    sessions.scopeProbe = () => ({ tool });
+    await run();
+    const s = drivers[0]!.started[0]!;
+    expect(s.scope!.tool).toEqual(tool);
+    expect(s.scope!.unit).toMatch(new RegExp(`^hib-${s.session}-[0-9a-f]{8}\\.scope$`));
+    expect(logged("session.start")[0].scope).toBe(s.scope!.unit);
+  });
+
+  test("on but unavailable: the session runs unscoped", async () => {
+    engine.cfg.events.sessionScope = true;
+    sessions.scopeProbe = () => ({ problem: "no user systemd" });
+    await run();
+    expect(drivers[0]!.started[0]!.scope).toBeUndefined();
+    expect(logged("session.start")).toHaveLength(1);
+  });
+});

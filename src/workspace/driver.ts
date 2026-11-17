@@ -1,3 +1,4 @@
+import type { ScopeTool } from "./scope";
 import type { Account } from "../config";
 
 export type ToolKind = "read" | "edit" | "command" | "search" | "web" | "other";
@@ -56,6 +57,7 @@ export interface StartOptions {
   sandbox?: Sandbox; // OS-level confinement for the agent's commands
   denyReads?: string[]; // absolute paths the CLI's own file tools may never read (they run outside the sandbox)
   session?: string; // hib's session id: set as HIB_SESSION on the CLI, so every process it starts can be traced to it
+  scope?: { tool: ScopeTool; unit: string }; // start the CLI in this systemd user scope ([events] session_scope)
 }
 
 /** What the agent's commands (and every process they start) may not touch, whatever is approved. */
