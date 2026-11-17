@@ -2,10 +2,13 @@
 
 All notable changes to hib. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change behaviour.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-17
+
+SIEM noise and session tracing, from SIB's first rules running against hib.
 
 ### Changed
-- **`home.changed` is a warning, not critical, when a CLI settings file changed only in preference keys** (`model`, `advisorModel`, `theme`, `tui`, `agentPushNotifEnabled` in Claude's `settings.json`, `model` and `model_reasoning_effort` in Codex's `config.toml`), as happens when you run `/model` or `/config` in another session. Such a change is marked `prefs_only: true`. Any other key (hooks, permissions, env, statusLine, MCP servers, `model_provider`), a mode change or a file that doesn't parse keeps it critical.
+- **`home.changed` is a warning, not critical, when a CLI settings file changed only in preference keys** (`model`, `advisorModel`, `theme`, `tui`, `agentPushNotifEnabled` in Claude's `settings.json`, `model` and `model_reasoning_effort` in Codex's `config.toml`), as happens when you run `/model` or `/config` in another session. Such a change is marked `prefs_only: true`. Any other key (hooks, permissions, env, statusLine, MCP servers, `model_provider`), a mode change or a file that doesn't parse keeps it critical. (#20)
+- **`HIB_SESSION` is passed as the first environment variable,** since Falco reads only the first 4 KB of a process's environment. Launchers (mise's wrappers) and bash can still reorder it, so treat it as best effort. Measured live, it sat at byte 1553 of 4602 in a Claude shell and 1477 of 1522 in a Codex shell, because hib passes the CLIs a minimal environment. (#22)
 
 ## [0.2.0] - 2026-11-16
 
@@ -39,4 +42,5 @@ First versioned release: the harness as built from 8 October to 15 November 2026
 - **`hib pipe`** redacts log streams before they reach an LLM. (#7)
 - **Security event log** (`~/.hib/events/events.jsonl`) for a SIEM, with a `daemon.alive` heartbeat and redaction hardened by fuzzing. (#8, #9)
 
+[0.3.0]: https://github.com/matijazezelj/hib/releases/tag/v0.3.0
 [0.2.0]: https://github.com/matijazezelj/hib/releases/tag/v0.2.0
