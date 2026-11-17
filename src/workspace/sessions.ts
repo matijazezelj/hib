@@ -36,7 +36,7 @@ export type WsEvent =
   | { type: "sent"; account: string; model: string; text: string; handoff: boolean; progress?: boolean; chars: number }
   | { type: "pseudonymised"; file: string; columns: string[]; callId?: string; names?: string } // names: why the copy's names weren't (all) checked
   | { type: "protected_reverted"; changes: { path: string; change: string }[]; failed: string[] } // unapproved changes to git hooks/config or tool config, put back
-  | { type: "home_changed"; changes: { path: string; change: string; approved: boolean }[] } // shell startup files, user agent config etc. changed during the turn: reported, not put back
+  | { type: "home_changed"; changes: { path: string; change: string; approved: boolean; prefs_only?: true }[] } // shell startup files, user agent config etc. changed during the turn: reported, not put back
   | AgentEvent
   | { type: "done" }
   | { type: "turn_end" }; // always last; clients stop following a turn here

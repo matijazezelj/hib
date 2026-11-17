@@ -22,6 +22,15 @@ export const CLAUDE_WATCH = ["settings.json", "settings.local.json", "CLAUDE.md"
 /** Watched inside each Codex home (~/.codex, and every account's CODEX_HOME). */
 export const CODEX_WATCH = ["config.toml", "AGENTS.md", "hooks"];
 
+/**
+ * Keys a CLI rewrites in its own settings when you switch model, theme and the like in any session (/model, /config,
+ * /advisor). A change to a settings file that touches only these is reported as preferences only; anything else in
+ * the file (hooks, permissions, env, statusLine, MCP servers, apiKeyHelper, sandbox, model_provider) runs code,
+ * grants access or redirects traffic, and keeps the change critical.
+ */
+export const CLAUDE_PREFS = ["model", "advisorModel", "theme", "tui", "agentPushNotifEnabled"];
+export const CODEX_PREFS = ["model", "model_reasoning_effort"];
+
 const MAX_ENTRIES = 5_000;
 const MAX_DEPTH = 4; // also what stops a symlink loop
 const MAX_FILE = 1 << 20; // larger files are compared by size and mtime
@@ -33,11 +42,40 @@ export type HomeSnapshot = Map<string, string>;
 export interface HomeChange {
   path: string; // "~/.bashrc": relative to home, so no user name
   change: "added" | "changed" | "removed";
+  prefs_only?: true; // a CLI settings file where only preference keys (CLAUDE_PREFS, CODEX_PREFS) changed
 }
 export interface HomeWatch {
   home: string;
   claudeDirs?: string[]; // absolute; ~/.claude is always included
   codexDirs?: string[]; // absolute; ~/.codex is always included
+}
+
+/** Settings files whose preference keys are told apart, by absolute path, with the keys to ignore and the parser. */
+function prefsFiles(w: HomeWatch): Map<string, { keys: string[]; parse: (s: string) => unknown }> {
+  const m = new Map<string, { keys: string[]; parse: (s: string) => unknown }>();
+  for (const d of new Set([join(w.home, ".claude"), ...(w.claudeDirs ?? [])]))
+    for (const f of ["settings.json", "settings.local.json"]) m.set(join(d, f), { keys: CLAUDE_PREFS, parse: JSON.parse });
+  for (const d of new Set([join(w.home, ".codex"), ...(w.codexDirs ?? [])])) m.set(join(d, "config.toml"), { keys: CODEX_PREFS, parse: Bun.TOML.parse });
+  return m;
+}
+
+/** JSON with sorted keys, so a rewrite that only reorders gives the same text. */
+function canonical(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
+  if (v && typeof v === "object") return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical((v as any)[k])}`).join(",")}}`;
+  return JSON.stringify(v) ?? "null";
+}
+
+/** Hash of a settings file without its preference keys; undefined if it isn't a top-level object that parses. */
+function coreHash(data: Buffer, f: { keys: string[]; parse: (s: string) => unknown }): string | undefined {
+  try {
+    const v = f.parse(data.toString("utf8"));
+    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+    const rest = Object.fromEntries(Object.entries(v).filter(([k]) => !f.keys.includes(k)));
+    return createHash("sha256").update(canonical(rest)).digest("hex");
+  } catch {
+    return undefined;
+  }
 }
 
 /** Every watched path, absolute. */
@@ -57,6 +95,7 @@ function roots(w: HomeWatch): string[] {
  */
 export function homeSnapshot(w: HomeWatch): HomeSnapshot {
   const snap: HomeSnapshot = new Map();
+  const prefs = prefsFiles(w);
   let budget = MAX_TOTAL;
   const stat = (p: string, follow: boolean): Stats | "unreadable" | undefined => {
     try {
@@ -95,7 +134,9 @@ export function homeSnapshot(w: HomeWatch): HomeSnapshot {
     try {
       const data = readFileSync(p);
       budget -= data.length;
-      snap.set(key, `file:${st.mode & 0o7777}:${createHash("sha256").update(data).digest("hex")}`);
+      const f = prefs.get(p);
+      const core = f && coreHash(data, f);
+      snap.set(key, `file:${st.mode & 0o7777}:${createHash("sha256").update(data).digest("hex")}${core ? `|core:${st.mode & 0o7777}:${core}` : ""}`);
     } catch {
       snap.set(key, `unreadable:${st.mode}:${st.mtimeMs}`);
     }
@@ -122,14 +163,16 @@ export function homeChanges(before: HomeSnapshot, w: HomeWatch): HomeChange[] {
   const after = homeSnapshot(w);
   const out: HomeChange[] = [];
   const seen = new Set<string>();
-  const add = (p: string, change: HomeChange["change"]) => {
+  const add = (p: string, change: HomeChange["change"], prefsOnly = false) => {
     const path = homePath(w, p);
-    if (!seen.has(path)) out.push({ path, change }), seen.add(path);
+    if (!seen.has(path)) out.push(prefsOnly ? { path, change, prefs_only: true } : { path, change }), seen.add(path);
   };
+  // only a hashed file has a core part; a link fingerprint holds a target anyone can choose, "|core:" included
+  const core = (f: string) => (f.startsWith("file:") ? f.split("|core:")[1] : undefined);
   for (const [p, f] of after) {
     const b = before.get(p);
     if (b === undefined) add(p, "added");
-    else if (b !== f || p === OVERFLOW) add(p, "changed");
+    else if (b !== f || p === OVERFLOW) add(p, "changed", !!core(f) && core(f) === core(b));
   }
   for (const p of before.keys()) if (!after.has(p)) add(p, "removed");
   return out;

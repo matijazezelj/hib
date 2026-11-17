@@ -39,6 +39,8 @@ describe("event lines", () => {
   test("severity is fixed per type; decisions against the request are warnings", () => {
     expect(severityOf("protected.reverted", {})).toBe("critical");
     expect(severityOf("terminal.open", {})).toBe("warning");
+    expect(severityOf("home.changed", { changes: [{ approved: false, prefs_only: true }, { approved: true }] })).toBe("warning");
+    expect(severityOf("home.changed", { changes: [{ approved: false, prefs_only: true }, { approved: false }] })).toBe("critical");
     expect(severityOf("guard.decision", { action: "redacted" })).toBe("info");
     expect(severityOf("guard.decision", { action: "timeout" })).toBe("warning");
     expect(severityOf("tool.permission", { decision: "always" })).toBe("info");
