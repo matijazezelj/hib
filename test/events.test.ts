@@ -110,7 +110,7 @@ describe("auth failures", () => {
 describe("config", () => {
   test("defaults: on, $HIB_HOME/events, 20 MB, 5 kept", () => {
     const home = tmp();
-    expect(parseConfig(Bun.TOML.parse(DEFAULT_TOML) as any, home).events).toEqual({ enabled: true, dir: join(home, "events"), maxMb: 20, keep: 5, heartbeatSec: 300, profile: "local", workspace: "path", account: "name", netHost: "full", command: "full", remote: true, keyFile: join(home, "events.key") });
+    expect(parseConfig(Bun.TOML.parse(DEFAULT_TOML) as any, home).events).toEqual({ enabled: true, dir: join(home, "events"), maxMb: 20, keep: 5, heartbeatSec: 300, profile: "local", workspace: "path", account: "name", netHost: "full", command: "full", remote: true, keyFile: join(home, "events.key"), sessionScope: false });
   });
 
   test("keys as written in config.toml", () => {

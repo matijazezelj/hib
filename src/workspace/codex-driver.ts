@@ -1,6 +1,7 @@
 import { accountEnv } from "../providers/spawn";
 import type { AgentDriver, AgentEvent, Decision, StartOptions, ToolCall } from "./driver";
 import { commandRuleKey, sessionFirst, short } from "./driver";
+import { inScope } from "./scope";
 import { Queue } from "./queue";
 
 /**
@@ -70,7 +71,8 @@ export class CodexDriver implements AgentDriver {
       const deny = opts.sandbox.denyRead.map((p) => `${JSON.stringify(p)}="deny"`).join(", ");
       args.push("-c", 'default_permissions="hib"', "-c", 'permissions.hib.extends=":workspace"', "-c", `permissions.hib.filesystem={${deny}}`);
     }
-    this.proc = Bun.spawn(args, { cwd: opts.cwd, env: sessionFirst(accountEnv(opts.account), opts.session), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const run = inScope(args, sessionFirst(accountEnv(opts.account), opts.session), opts.scope);
+    this.proc = Bun.spawn(run.argv, { cwd: opts.cwd, env: run.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     this.readLoop();
     new Response(this.proc.stderr as ReadableStream).text().catch(() => {}); // tracing logs; drained, not fatal
     await this.request("initialize", { clientInfo: { name: "hib", title: "hib", version: "0.1" }, capabilities: { experimentalApi: false, requestAttestation: false } });

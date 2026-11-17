@@ -7,6 +7,7 @@ import { Engine } from "./engine";
 import { Sealer } from "./guard/seal";
 import { applyPlugins, loadPlugins } from "./plugins";
 import { Registry } from "./providers/registry";
+import { scopeProbe } from "./workspace/scope";
 import { apiToken, startServer } from "./server";
 import { HibClient } from "./client";
 import { sandboxProblem } from "./workspace/sandbox";
@@ -36,7 +37,9 @@ export async function serve(port?: number) {
   const server = startServer(b.engine, { port: port ?? b.cfg.port, token: b.token });
   const events = b.engine.events;
   const problem = sandboxProblem();
-  events.emit("daemon.start", { mode: "daemon" }, { bind: server.hostname, port: server.port, sandbox: problem ? "unavailable" : "available", ...(b.cfg.testing.scriptDir ? { script_driver: true } : {}) });
+  const scope = b.cfg.events.sessionScope ? scopeProbe() : undefined;
+  events.emit("daemon.start", { mode: "daemon" }, { bind: server.hostname, port: server.port, sandbox: problem ? "unavailable" : "available", ...(scope ? { session_scope: "tool" in scope ? "available" : "unavailable" } : {}), ...(b.cfg.testing.scriptDir ? { script_driver: true } : {}) });
+  if (scope && "problem" in scope) events.emit("scope.unavailable", { mode: "daemon" }, { reason: scope.problem });
   if (b.cfg.testing.scriptDir) console.error(`hib: TEST MODE: the scripted agent is on ([testing] script_dir = ${b.cfg.testing.scriptDir})`);
   if (problem) events.emit("sandbox.unavailable", { mode: "daemon" }, { reason: problem });
   events.checkKey();

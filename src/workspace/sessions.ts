@@ -13,6 +13,7 @@ import { detect, type Finding } from "../guard/detectors";
 import { onPinnedAccount, pinnedModel, SENSITIVE_NEEDS_CLAUDE, supportsSensitive } from "./registry";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { scopeProbe, scopeUnit, type ScopeProbe } from "./scope";
 import { homeChanges, homePath, homeSnapshot, type HomeSnapshot, type HomeWatch } from "./homewatch";
 import { basename, sep, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { loadTable, TABLE_FILE } from "../analyze/table";
@@ -246,6 +247,7 @@ export class WorkspaceSessions {
 
   /** The home folder whose startup files and agent config each turn watches (tests point it elsewhere). */
   homeDir = homedir();
+  scopeProbe: () => ScopeProbe = scopeProbe; // replaced in tests
 
   /** What the home watch covers: the home folder, plus every account's Claude config dir and Codex home. */
   private homeWatch(): HomeWatch {
@@ -464,10 +466,13 @@ export class WorkspaceSessions {
         throw new Error(`hib won't start a sensitive session it can't fully protect: ${e.message}`);
       }
     }
-    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools, session: id });
+    // Not the scripted agent: it starts no process.
+    const probe = this.cfg.events.sessionScope && c.provider !== "script" ? this.scopeProbe() : undefined;
+    const scope = probe && "tool" in probe ? { tool: probe.tool, unit: scopeUnit(id) } : undefined;
+    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools, session: id, scope });
     const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox, approvedProtected: new Set(), approvedHome: new Set() };
     this.live.set(id, l);
-    this.events.emit("session.start", this.evCtx(id, root, c), { agent: c.provider, sensitive: askReads });
+    this.events.emit("session.start", this.evCtx(id, root, c), { agent: c.provider, sensitive: askReads, ...(scope ? { scope: scope.unit } : {}) });
     return l;
   }
 

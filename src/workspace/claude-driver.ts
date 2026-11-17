@@ -2,6 +2,7 @@ import { accountEnv } from "../providers/spawn";
 import { parseClaudeLine } from "../providers/claude-cli";
 import type { AgentDriver, AgentEvent, Decision, StartOptions, ToolCall, ToolKind } from "./driver";
 import { commandRuleKey, sessionFirst, short } from "./driver";
+import { inScope } from "./scope";
 import { Queue } from "./queue";
 
 const SECRET_READS = ["~/.hib/**", "~/.claude/**", "~/.claude.json", "~/.claude-*/**", "~/.codex/**", "~/.ssh/**", "~/.aws/**", "~/.gnupg/**", "~/.config/gh/**"].map((p) => `Read(${p})`);
@@ -130,7 +131,7 @@ export class ClaudeDriver implements AgentDriver {
 
   async start(opts: StartOptions) {
     this.cwd = opts.cwd;
-    const { args, env } = claudeLaunch(opts);
+    const { argv: args, env } = (({ args, env }) => inScope(args, env, opts.scope))(claudeLaunch(opts));
     this.proc = Bun.spawn(args, { cwd: opts.cwd, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     this.readLoop();
   }

@@ -51,6 +51,7 @@ export interface EventsConfig {
   command?: "full" | "program"; // the redacted command line, or only the program's name
   remote?: boolean; // false: auth.failure lines carry no peer address
   keyFile?: string; // the key for the hashes; it stays in hib's home, out of the events directory
+  sessionScope?: boolean; // Linux: each agent CLI in a systemd user scope named after its session, for process telemetry
 }
 
 export interface Config {
@@ -157,6 +158,8 @@ heartbeat_sec = 300             # daemon.alive every 5 minutes, so a crash shows
 # net_host = "full"             # "domain": registrable domain (Public Suffix List); url too
 # command = "full"              # "program": a best-effort program label; loses the arguments detections use
 # remote = true                 # false: no peer address on auth.failure
+# session_scope = false         # Linux: run each agent CLI in a systemd user scope (hib-<session>-<n>.scope), so
+#                               # Falco can tie its processes to the session by cgroup
 `;
 
 function expandHome(p: string): string {
@@ -253,6 +256,7 @@ export function parseConfig(raw: any, home: string): Config {
       command: oneOf("command", ev.command, ["full", "program"] as const, siem ? "program" : "full"),
       remote: typeof ev.remote === "boolean" ? ev.remote : ev.remote === undefined ? !siem : bad("remote", ev.remote, ["true", "false"]),
       keyFile: join(home, "events.key"),
+      sessionScope: typeof ev.session_scope === "boolean" ? ev.session_scope : ev.session_scope === undefined ? false : bad("session_scope", ev.session_scope, ["true", "false"]),
     },
   };
 }
