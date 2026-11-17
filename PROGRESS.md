@@ -157,7 +157,7 @@ Open findings from the 2026-10-09 audit (all low), and older ones.
   - [low] Each release bumps `package.json` (which events report as `hib_version`) and `CHANGELOG.md` by hand.
   - [low] The URL scheme is copied as typed under `net_host = "domain"`, so an unusual custom scheme name reaches the log.
   - [low] `home.changed` can't tell your edits from the agent's: changing a setting in another Claude session during a hib turn (`/model`, `/config`) rewrites `~/.claude/settings.json` and is reported as unapproved.
-  - [low] `HIB_SESSION` is lost by a process started with a cleared environment (`env -i`). Whether Claude Code's sandboxed Bash passes it through hasn't been checked on a live session.
+  - [low] `HIB_SESSION` is lost by a process started with a cleared environment (`env -i`). Checked on live sessions (2026-11-17): Claude Code's sandboxed Bash and Codex's `bash -lc` both pass it to the shell, `sh -c` children and backgrounded subshells.
   - [low] The scripted agent runs no CLI process, so it can't exercise Falco rules: it covers hib's events through to SIEM alerts only.
 - **Other**
   - [low] The sandbox check is per host, not per CLI: a kernel that blocks Claude Code's sandbox also turns off auto mode and tasks for Codex, whose sandbox may work there. `sandboxFor` could become provider-aware.
@@ -176,7 +176,7 @@ Open findings from the 2026-10-09 audit (all low), and older ones.
 1. **Measure name detection.** A labeled fixture set: synthetic names in lowercase, mixed case and other scripts, the `clients.csv` shape, and names inside free text. A test that reports precision and recall for regex + NER and fails below a threshold. Then decide on **query-aware column minimization** for `hib ask -f` / analyze: send only the columns the question needs.
 2. **Push and check CI.** Several things can't run in a sandboxed Claude session and are checked only by CI (or `bun test` on your machine): the server tests (browser sessions, forget refused), the Linux bubblewrap tests, and the macOS analysis Seatbelt profile (the "sandboxed run" tests). Confirm both jobs pass. If the macOS "sandboxed run" tests fail with EPERM on `tsconfig.json` or `package.json`, bun walked up to the repo root (now under the `/Users` deny): add literal allows for those two files in `seatbelt()`, don't re-allow the repo.
 3. **Low-severity items** above, roughly in order: gate Codex `webSearch` (verify the key first); egress log of handoff/PROGRESS content; detector gaps and speed; `frame-ancestors` via a header; pathspec literals; command-line secrets via env; plaintext at rest.
-4. **Event log follow-ups** (from SIB's v0.8.0 review): check that `HIB_SESSION` reaches commands on a live Claude and Codex session; a per-session systemd user scope as a Linux opt-in, so attribution survives `env -i`; the cross-repo acceptance test with SIB using the scripted agent.
+4. **Event log follow-ups** (from SIB's v0.8.0 review): a per-session systemd user scope as a Linux opt-in, so attribution survives `env -i`; the cross-repo acceptance test with SIB using the scripted agent.
 5. **Older items**: the empty `ls` output; background-task polish (a tasks panel with review/merge/discard in the web UI; worktrees start without `node_modules`; tasks don't include uncommitted changes, hib warns).
 6. **Review feedback, P2**: whether the router's learned scores get enough real feedback; prompt injection from repo content and tool results beyond what the sandbox and approvals cover.
 
