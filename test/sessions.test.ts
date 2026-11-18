@@ -527,6 +527,18 @@ describe("sensitive workspaces", () => {
     expect(existsSync(dir)).toBe(false); // nothing left behind once the CLI is gone
   });
 
+  test("a token first made in a later turn (command output) restores in that turn's answer", async () => {
+    sensitive();
+    const r1 = await turn("hi", undefined, undefined, "hib/auto");
+    script.current = async (_t, d, q) => {
+      q.push({ type: "output", id: "o1", callId: "toolu_1", text: "reset by petra@acme-corp.hr\n[exit 0]" });
+      const seen = await d.shown("o1");
+      q.push({ type: "text", delta: `it was ${/\[HIB[0-9a-f]{4}-EMAIL-\d+\]/.exec(seen)![0]}` });
+    };
+    const r2 = await turn("who reset it?", r1.sid, undefined, "hib/auto");
+    expect(r2.events.filter((e) => e.type === "text").map((e: any) => e.delta).join("")).toBe("it was petra@acme-corp.hr");
+  });
+
   test("no capture folder outside sensitive folders", async () => {
     await turn("hello");
     expect(drivers[0]!.started[0]!.captureDir).toBeUndefined();

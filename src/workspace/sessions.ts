@@ -540,7 +540,9 @@ export class WorkspaceSessions {
     if (!c) return yield { type: "error", message: `unknown model ${modelId}` };
     if (!(await this.engine.registry.available(c.account))) return yield { type: "error", message: `${c.id} is not logged in` };
 
-    const vault = row?.vault ? Vault.from(await this.sealer.unseal<VaultState>(row.vault)) : this.live.get(id)?.vault ?? new Vault();
+    // The running CLI's vault when there is one: Read copies and command output add tokens to it, and the turn must
+    // restore those (and never mint the same token for another value). Saved at the end of every turn.
+    const vault = this.live.get(id)?.vault ?? (row?.vault ? Vault.from(await this.sealer.unseal<VaultState>(row.vault)) : new Vault());
     const route = { ...this.cfg.routes.code, mode: "agent" as const, level: "minimal" as const };
 
     // Guard: secrets and configured terms are tokenized; the folder pre-scan runs once per session.
