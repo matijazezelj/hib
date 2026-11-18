@@ -2,6 +2,31 @@
 
 All notable changes to hib. Versions follow [semantic versioning](https://semver.org); before 1.0, a minor version can change behaviour.
 
+## [0.5.0] - 2026-11-18
+
+Guarded data for agents in sensitive work: command output, and trusted read-only MCP servers such as OIB's observability endpoint (shipped in OIB v1.3.0).
+
+### Added
+- **Trusted read-only MCP servers** (`[mcp.<name>]` in `config.toml`). hib's daemon calls the server for the agent; the agent never holds the bearer token. (#28)
+  - Each server needs `read_only = true` and a `tools = [...]` list. A tool is offered only if it's on your list and the server marks it `readOnlyHint`. The optional `server = "<name>"` offers nothing if the server introduces itself under another name.
+  - Calls run without prompts and are logged as `tool.permission` with `decided_by: "policy"` and `mcp_server`. Any other tool name is refused in the daemon. hib caps calls at 60 a minute per session and arguments at 16,000 characters.
+  - Results are guarded with the session's placeholders: JSON value by value and part by part. Values under person, login and client-address keys (including OTLP attributes) become placeholders whole, while metric, span and service names and infrastructure ids stay readable. Only text parts are passed on, cut at 60,000 characters. Placeholders in arguments are swapped back to real values before the call.
+  - `sensitive = true` also offers the server in sensitive folders. A server of the same name in your own Claude or Codex config is turned off in hib sessions.
+  - Checked live against OIB's Grafana MCP and a staged Redis outage: the agent diagnosed it through `mcp__hib__oib__*` only, with no prompts, and neither the token nor the endpoint appeared in the event log.
+- **Command output is guarded in sensitive folders.** Each command prints into a capture file of hib's. A PostToolUse hook, registered over Claude Code's control channel, gives the agent that output only after the guard. (#26)
+  - Fails closed: if a command fails, is killed or times out, or the hook doesn't answer, the agent sees only the exit status. A session doesn't start without the hook.
+  - Each command now runs in its own subshell, so `cd` and `export` don't carry over to the next one.
+  - Checked on Linux; `bun test/manual/output-guard-probe.ts` rechecks it after a Claude Code upgrade.
+- **`hib ask --workspace <dir> "prompt"`** runs one agent turn without the terminal UI, for scripts and acceptance tests such as OIB's `make ask`. (#32)
+  - `[-m model] [--session id] [--json]`.
+  - Anything that would ask you is denied and listed.
+  - Exit codes: 0 done; 3 done, but something was denied; 1 error.
+
+### Fixed
+- **Later turns restore placeholders made during them.** From a session's second turn on, a placeholder first made by a Read copy or by command output wasn't turned back into the real value in that turn's answer. Two values could also get the same placeholder. (#27)
+- **No false `protected.reverted` for an empty `.git/config.worktree`.** Claude Code's sandbox on Linux leaves one behind, and hib logged a critical revert after every turn. An empty one is now ignored; one with any content is still caught and put back. (#30)
+- **Tests delete their temporary folders.** Each run used to leave thousands behind and could use up a tmpfs `/tmp`'s inodes. (#31)
+
 ## [0.4.0] - 2026-11-17
 
 ### Added

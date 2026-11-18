@@ -9,7 +9,7 @@ _Last updated: 2026-11-18_
 
 hib is usable day to day: a local daemon, a terminal agent (`hib`), a web workspace (`hib serve`), a multi-model chat, and an
 OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (533 tests,
-2 of them Linux-only) on Ubuntu and macOS. The current release is v0.4.0; `CHANGELOG.md` lists what each version changed.
+2 of them Linux-only) on Ubuntu and macOS. The current release is v0.5.0; `CHANGELOG.md` lists what each version changed.
 
 A full security audit ran on 2026-10-09 (daemon surface, agent permissions, guard/egress, analyze/plugins/web). All of
 its high and medium findings are fixed (below), except one part noted under Known issues. The low ones are open, under
@@ -96,6 +96,7 @@ Known issues and in order under Next.
   - Encoded payloads: a base64 run glued to a path (`/tmp/<base64>`, `/upload/<base64>/raw`) is tried in pieces cut at slashes, longest first; gzip and zlib (magic bytes) are inflated with `maxOutputLength` = min(10× input, 1 MB).
   - Machine-name columns: `agent.name`, `manager.name`, `observer.name` (and `.hostname`) are hidden by name (`MACHINE_NAME`, only those leaves, so `agent.version` stays readable); `host.hostname`, `predecoder.hostname` and `device.name` already were. Values that are internal FQDNs (`.local`, `.corp`, `.internal`, `.lan`…) make a column identifying.
   - Benchmark: `siem.jsonl` has a `file.name` slug per row; with `--ner` both files are recounted after name detection on a 500-row sample (README: slug names 3/3 readable without it, 0/3 with it). It covers an allow-listed MCP proxy run by the daemon with the session vault, and guarding Bash output. The recommendation is a FIFO relay to a filter outside the sandbox, so nothing in the sandbox reaches the daemon or vault.
+- **Release 0.5.0** (2026-11-18): command-output guarding, trusted read-only MCP servers, `hib ask --workspace`, the turn-vault fix.
 - **Releases 0.3.0 and 0.4.0** (PRs #23, #25; tags `v0.3.0`, `v0.4.0`, GitHub releases, 2026-11-17). 0.3.0: the `home.changed` preferences warning and `HIB_SESSION` first. 0.4.0: session scopes. SIB was told about each.
 - **Session scopes** (PR #24; `src/workspace/scope.ts`). Linux opt-in, `[events] session_scope = true`: each CLI runs under `systemd-run --user --scope` as `hib-<session_id>-<8 hex>.scope`, named on `session.start` as `scope`, so Falco can match the session by cgroup. Checked live: shells, `sh -c`, background jobs and `env -i setsid` stayed in the scope; `systemd-run` from inside the agent sandbox failed; killing the daemon ended the CLIs. `daemon.start` carries `session_scope`; without systemd a `scope.unavailable` warning and sessions run unscoped.
 - **`HIB_SESSION` first** (PR #22). Passed as the first environment variable, since Falco reads only the first 4 KB. Measured live at byte 1553 of 4602 (Claude shell) and 1477 of 1522 (Codex shell); mise wrappers and bash still reorder it.
