@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { accountEnv } from "../providers/spawn";
 import type { AgentDriver, AgentEvent, Decision, StartOptions, ToolCall } from "./driver";
 import { commandRuleKey, sessionFirst, short } from "./driver";
@@ -65,6 +68,9 @@ export class CodexDriver implements AgentDriver {
       const env = Object.entries(opts.mcp.env).map(([n, v]) => `${n}=${JSON.stringify(v)}`).join(", ");
       args.push("-c", `${k}.command=${JSON.stringify(opts.mcp.command)}`, "-c", `${k}.args=${JSON.stringify(opts.mcp.args)}`, "-c", `${k}.env={${env}}`, "-c", `${k}.tool_timeout_sec=600`, "-c", `${k}.default_tools_approval_mode="approve"`);
     }
+    // A trusted MCP server reaches the agent only through hib's guard: the same server from the user's Codex config (or
+    // the folder's) is switched off. Only one that's defined there: Codex refuses to start on an entry with no transport.
+    for (const n of userMcpServers(opts.account.env.CODEX_HOME, opts.cwd).filter((n) => opts.hideMcp?.includes(n))) args.push("-c", `mcp_servers.${n}.enabled=false`);
     if (opts.sandbox) {
       // A permission profile on top of Codex's workspace sandbox (writes in the folder, no network) that also hides
       // hib's home and credentials from commands. Replaces the thread's sandbox mode (the two can't both be set).
@@ -260,4 +266,14 @@ export class CodexDriver implements AgentDriver {
     this.proc.kill();
     await this.proc.exited;
   }
+}
+
+/** MCP server names defined in the user's Codex config and the folder's own (.codex/config.toml). */
+export function userMcpServers(codexHome: string | undefined, cwd: string): string[] {
+  const names = new Set<string>();
+  for (const f of [join(codexHome || join(homedir(), ".codex"), "config.toml"), join(cwd, ".codex", "config.toml")])
+    try {
+      for (const n of Object.keys((Bun.TOML.parse(readFileSync(f, "utf8")) as any)?.mcp_servers ?? {})) names.add(n);
+    } catch {}
+  return [...names];
 }

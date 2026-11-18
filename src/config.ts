@@ -54,6 +54,21 @@ export interface EventsConfig {
   sessionScope?: boolean; // Linux: each agent CLI in a systemd user scope named after its session, for process telemetry
 }
 
+/**
+ * A trusted read-only MCP server ([mcp.<name>]): the daemon is its only client and hands the agent its read-only tools
+ * through hib's own MCP server, results guarded. Only entries with read_only = true are kept; others don't exist to hib.
+ */
+export interface McpUpstream {
+  name: string; // [mcp.<name>]: the tools show up as mcp__hib__<name>__<tool>
+  url: string; // streamable HTTP endpoint
+  tokenFile?: string; // a bearer token: the whole file, or one KEY=VALUE line of it (tokenKey)
+  tokenKey?: string;
+  tokenEnv?: string; // or a variable in the daemon's environment
+  sensitive: boolean; // offered in sensitive folders too
+  tools: string[]; // required: the tool names (or globs) the agent may call; readOnlyHint alone is the server's claim
+  server?: string; // the server's name as it introduces itself (serverInfo.name); a different one offers nothing
+}
+
 export interface Config {
   home: string;
   port: number;
@@ -69,6 +84,7 @@ export interface Config {
   events: EventsConfig;
   /** Acceptance tests only: the scripted agent (provider "script") and the folder its scripts are read from. */
   testing: { scriptDir?: string };
+  mcp: McpUpstream[];
 }
 
 export const DEFAULT_TOML = `# hib config. Model ids: <provider>[@account]/<model>, e.g. claude@work/sonnet
@@ -160,6 +176,17 @@ heartbeat_sec = 300             # daemon.alive every 5 minutes, so a crash shows
 # remote = true                 # false: no peer address on auth.failure
 # session_scope = false         # Linux: run each agent CLI in a systemd user scope (hib-<session>-<n>.scope), so
 #                               # Falco can tie its processes to the session by cgroup
+
+# Trusted read-only MCP servers: hib's daemon calls them for the agent and guards every result. Only tools the server
+# marks readOnlyHint are offered, without prompts. See the README, "Trusted read-only MCP servers".
+# [mcp.oib]
+# url = "http://127.0.0.1:3030/mcp"
+# token_file = "~/oib/mcp/secrets/mcp.env"     # or token_env = "VAR"; never given to the agent
+# token_key = "MCP_GRAFANA_SERVER_TOKEN"        # needed when the file has several KEY=VALUE lines
+# read_only = true                              # required: without it hib ignores the entry
+# tools = ["query_loki_logs", "search_*"]       # required: the tools the agent may call (also must be readOnlyHint)
+# server = "mcp-grafana"                        # optional: offer nothing if the server reports another name
+# sensitive = true                              # offer it in sensitive folders too (default false)
 `;
 
 function expandHome(p: string): string {
@@ -226,6 +253,7 @@ export function parseConfig(raw: any, home: string): Config {
     defaultAccount,
     accounts: scriptDir ? [...accounts, { id: "script@default", provider: "script", name: "default", env: {}, limits: {}, dirs: [] }] : accounts,
     testing: { scriptDir },
+    mcp: mcpServers(raw.mcp),
     routes: {
       chat: route(raw.routes?.chat),
       code: route(raw.routes?.code),
@@ -259,6 +287,45 @@ export function parseConfig(raw: any, home: string): Config {
       sessionScope: typeof ev.session_scope === "boolean" ? ev.session_scope : ev.session_scope === undefined ? false : bad("session_scope", ev.session_scope, ["true", "false"]),
     },
   };
+}
+
+/** [mcp.<name>] entries with read_only = true; a malformed one stops config loading. */
+function mcpServers(raw: any): McpUpstream[] {
+  const out: McpUpstream[] = [];
+  for (const [name, m] of Object.entries<any>(raw ?? {})) {
+    const fail = (why: string): never => {
+      throw new Error(`[mcp.${name}] ${why}`);
+    };
+    if (m?.read_only !== true) continue;
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(name) || name.includes("__") || name === "hib") fail("the name must be 1-32 letters, digits, - or _, without __, and not hib");
+    let url: URL;
+    try {
+      url = new URL(String(m.url ?? ""));
+    } catch {
+      return fail("url must be an http(s) URL");
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") fail("url must be an http(s) URL");
+    if (url.username || url.password) fail("put the credential in token_file or token_env, not in the url");
+    if (m.token_file !== undefined && m.token_env !== undefined) fail("use token_file or token_env, not both");
+    if (m.token_key !== undefined && m.token_file === undefined) fail("token_key needs token_file");
+    for (const k of ["token_file", "token_key", "token_env"]) if (m[k] !== undefined && (typeof m[k] !== "string" || !m[k])) fail(`${k} must be a non-empty string`);
+    if (m.sensitive !== undefined && typeof m.sensitive !== "boolean") fail("sensitive must be true or false");
+    // readOnlyHint is the server's own claim: a compromised server could mark a write tool read-only. Your list of the
+    // tools you checked is the authorisation; the hint only filters it further.
+    if (!Array.isArray(m.tools) || !m.tools.length || !m.tools.every((t: unknown) => typeof t === "string" && t)) fail('tools is required: list the tools the agent may call, like ["query_loki_logs", "search_*"] (readOnlyHint alone is the server\'s claim, not trusted)');
+    if (m.server !== undefined && (typeof m.server !== "string" || !m.server)) fail("server must be the name the server reports (serverInfo.name)");
+    out.push({
+      name,
+      url: url.href,
+      ...(m.token_file ? { tokenFile: expandHome(m.token_file) } : {}),
+      ...(m.token_key ? { tokenKey: m.token_key } : {}),
+      ...(m.token_env ? { tokenEnv: m.token_env } : {}),
+      sensitive: m.sensitive === true,
+      tools: m.tools,
+      ...(m.server ? { server: m.server } : {}),
+    });
+  }
+  return out;
 }
 
 /** An [events] setting from its allowed values; unset gives the profile's default. */

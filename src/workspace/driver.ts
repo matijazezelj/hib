@@ -54,7 +54,8 @@ export interface StartOptions {
   resume?: string; // native session/thread id
   system?: string;
   askReads?: boolean; // sensitive workspaces: file reads need approval too
-  mcp?: McpServer; // hib's own tools (the advisor), launched by the CLI
+  mcp?: McpServer; // hib's own tools (the advisor, trusted MCP servers' read-only tools), launched by the CLI
+  hideMcp?: string[]; // trusted MCP servers' names: a server of the same name in the user's CLI config is switched off, so it can't be used unguarded
   sandbox?: Sandbox; // OS-level confinement for the agent's commands
   denyReads?: string[]; // absolute paths the CLI's own file tools may never read (they run outside the sandbox)
   session?: string; // hib's session id: set as HIB_SESSION on the CLI, so every process it starts can be traced to it

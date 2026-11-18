@@ -3,12 +3,12 @@
 Where hib stands and what to do next. Agents working here: read this first, and update it when you finish a piece of work.
 hib itself sends this file with the first message of every fresh workspace session.
 
-_Last updated: 2026-11-17_
+_Last updated: 2026-11-18_
 
 ## Where it stands
 
 hib is usable day to day: a local daemon, a terminal agent (`hib`), a web workspace (`hib serve`), a multi-model chat, and an
-OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (518 tests,
+OpenAI-compatible router, all over the Claude Code and Codex subscription CLIs. CI runs typecheck and `bun test` (533 tests,
 2 of them Linux-only) on Ubuntu and macOS. The current release is v0.4.0; `CHANGELOG.md` lists what each version changed.
 
 A full security audit ran on 2026-10-09 (daemon surface, agent permissions, guard/egress, analyze/plugins/web). All of
@@ -38,7 +38,8 @@ Known issues and in order under Next.
     - Re-run `bun test/manual/sandbox-probe.ts` after a Claude Code upgrade.
   - **Read/Grep vs data files: CLI-enforced, not OS-enforced.** Claude's file tools run outside the sandbox. The pseudonymised copy depends on Claude routing every Read/Grep through hib's permission prompt (`--permission-mode manual`, `ask` rules), and on hib's path checks (symlinks by target, case-insensitive). Not host-level containment.
   - Text you edit in a guard approval gets the secret block and name detection again.
-  - **Command output is guarded** (2026-11-17). Each allowed command runs as `( cmd ) > capture 2>&1; printf '[exit N]'`, and hib's PostToolUse hook (registered over the control channel, so it runs in the daemon) gives the agent the capture file's text after the guard, name detection and the vault's known values. Fails closed: a failing, killed or unhooked command shows only its exit status. No session without `hooks_applied`. Checked live on Linux and in `test/manual/output-guard-probe.ts` (rerun after Claude Code upgrades; unchecked on macOS). On branch `feat/command-output-guard`, not yet merged or released. Commands now run in their own subshell (no `cd`/`export` carry-over); placeholders in commands still aren't restored, and names pass raw without name detection. Design and limits in `docs/design-sensitive-mcp-and-commands.md`, "(b) as built".
+  - **Trusted read-only MCP servers** (2026-11-18, branch `feat/mcp-proxy`; for OIB's Grafana MCP). `[mcp.<name>]` in config.toml with `read_only = true`. The daemon is the MCP client (streamable HTTP, bearer token from a file or env var, never given to the agent); the CLI gets `hib-mcp.ts` with a per-session key (`POST /ws/mcp`). Only `readOnlyHint` tools, narrowed by `tools` globs; no prompts, `tool.permission` with `decided_by: "policy"` and `mcp_server`; other names refused in the daemon. Results guarded per JSON value and per part with the session vault (person keys and OTLP person attributes tokenised whole; metric, span and service names readable), text only, 60k cap before name detection; arguments restored. `sensitive = true` offers it in sensitive folders. The CLI's own same-named server is denied (Claude) or disabled (Codex, if defined). Also fixed: later turns now use the live session's vault, so tokens minted mid-turn by Read copies, command output and MCP restore in the answer. Design notes in `docs/design-sensitive-mcp-and-commands.md`, "(a) as built".
+  - **Command output is guarded** (2026-11-17). Each allowed command runs as `( cmd ) > capture 2>&1; printf '[exit N]'`, and hib's PostToolUse hook (registered over the control channel, so it runs in the daemon) gives the agent the capture file's text after the guard, name detection and the vault's known values. Fails closed: a failing, killed or unhooked command shows only its exit status. No session without `hooks_applied`. Checked live on Linux and in `test/manual/output-guard-probe.ts` (rerun after Claude Code upgrades; unchecked on macOS). Merged (PR #26), not yet released. Commands now run in their own subshell (no `cd`/`export` carry-over); placeholders in commands still aren't restored, and names pass raw without name detection. Design and limits in `docs/design-sensitive-mcp-and-commands.md`, "(b) as built".
   - Checked live: with a data file in the Claude sandbox's `denyRead`, Read still reaches hib and the redirect to the pseudonymised copy works (the sandbox doesn't apply to Claude's file tools).
   - When a policy is inherited (a parent of a sensitive folder, or a subfolder), the terminal banner and the web pill name the folder it comes from (`/ws/tree` returns `policyFrom`).
   - The policy covers the whole tree (`Workspaces.effectivePolicy`): every folder inside a sensitive one, and any folder that contains one. A folder spanning two sensitive folders pinned to different accounts is refused. Used by sessions, the terminal, `/ws/tree`, tasks.
@@ -174,8 +175,8 @@ Open findings from the 2026-10-09 audit (all low), and older ones.
   - The advisor needs a logged-in account of the other provider; without one `/advisor` switches itself off.
 
 ## Next
-0. **Sensitive SecOps gaps** (from a real investigation; in priority order). The design for the MCP proxy is in `docs/design-sensitive-mcp-and-commands.md`:
-   - **MCP proxy.** A sensitive session can't use MCP servers (`--strict-mcp-config`), and outside one their results aren't guarded. The daemon would run an allow-list of servers behind a `hib-mcp` shim with a per-session key (like the advisor). It would restore tokens in arguments and pseudonymise results like a Read copy.
+0. **Sensitive SecOps gaps** (from a real investigation; in priority order):
+   - **Trusted MCP follow-ups:** stdio servers (the daemon would start them, ideally under the analyze sandbox profile); OIB's live test of the Redis incident through hib (PR for `feat/mcp-proxy`).
    - Names that appear only in free text in a Read copy need name detection, which the copy doesn't run (`allowDecision` is synchronous; `nerScan` with the cell spans from `pseudonymizeWithSpans` would slot in once it isn't).
 1. **Measure name detection.** A labeled fixture set: synthetic names in lowercase, mixed case and other scripts, the `clients.csv` shape, and names inside free text. A test that reports precision and recall for regex + NER and fails below a threshold. Then decide on **query-aware column minimization** for `hib ask -f` / analyze: send only the columns the question needs.
 2. **Push and check CI.** Several things can't run in a sandboxed Claude session and are checked only by CI (or `bun test` on your machine): the server tests (browser sessions, forget refused), the Linux bubblewrap tests, and the macOS analysis Seatbelt profile (the "sandboxed run" tests). Confirm both jobs pass. If the macOS "sandboxed run" tests fail with EPERM on `tsconfig.json` or `package.json`, bun walked up to the repo root (now under the `/Users` deny): add literal allows for those two files in `seatbelt()`, don't re-allow the repo.

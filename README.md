@@ -118,7 +118,7 @@ A sensitive folder is seen by exactly one vendor account, and it must be a Claud
   - With name detection off, a name in command output goes through as it is, as in a plain-text Read copy.
   - Checked on Linux (bubblewrap). On macOS, run the probe below before relying on it.
   - `bun test/manual/output-guard-probe.ts` rechecks this against your installed Claude Code (it relies on the stream-json control protocol, which isn't a documented interface); run it after an upgrade.
-- **No MCP servers** but hib's own (every session already ignores the repo's `.claude/` settings and hooks; see Security model).
+- **No MCP servers** but hib's own (every session already ignores the repo's `.claude/` settings and hooks; see Security model), which includes the trusted read-only servers you marked `sensitive = true` (see Trusted read-only MCP servers).
 - **No browser terminal** (the server refuses it).
 - **Egress log.** Each turn records the redacted prompt and the account it went to, plus every tool call. View it in the *Egress* tab, with `/egress` in the terminal, or with `hib workspace egress`.
 
@@ -127,6 +127,37 @@ Limits:
 - Router chat that isn't tied to a folder isn't covered, so don't paste sensitive content into `hib chat`.
 - A bare first name or surname on its own ("ask turner", `grep -i babic`, a name inside code) can't be told from an ordinary word unless the full name also appears in the same input. Put case-specific names in `guard.terms` (or a plugin guard) to cover them.
 - Check each subscription's own data settings (training opt-out, retention) and your employer's rules. hib can't change those.
+
+## Trusted read-only MCP servers
+
+An MCP server you declare in `config.toml` as read-only and trusted is called by hib's daemon on the agent's behalf. The agent gets its read-only tools without prompts, and every result goes through the guard first. Use it for observability or SIEM servers whose results hold IPs, emails, user names and keys.
+
+```toml
+[mcp.oib]
+url = "http://127.0.0.1:3030/mcp"                   # streamable HTTP
+token_file = "~/oib/mcp/secrets/mcp.env"             # or token_env = "VAR" (in the daemon's environment)
+token_key = "MCP_GRAFANA_SERVER_TOKEN"               # which KEY=VALUE line; needed when the file has several
+read_only = true                                     # required: without it hib ignores the entry
+tools = ["list_datasources", "query_loki_logs", "query_prometheus", "list_prometheus_metric_names", "search_tempo_traces"]
+# server = "mcp-grafana"                             # optional: offer nothing if the server reports another name (serverInfo.name)
+sensitive = true                                     # also offer it in sensitive folders (default false)
+```
+
+- **Only the tools you listed, and only read-only ones.** `tools` is required: the names (globs work, exact names are safer) of the tools you checked. `readOnlyHint` is the server's own claim, and a compromised server could put it on a write tool, so it's a second filter, not the authorisation: a tool must be on your list *and* marked read-only. With `server`, a server that introduces itself under another name (`serverInfo.name`) offers nothing. If nothing qualifies, the timeline says why. A call to anything else (a write tool, a guessed name) is refused in the daemon and logged as a denied `tool.permission`.
+- **The agent never holds the token.** The CLI gets hib's own MCP server, which holds only a per-session key that can list and call these tools and nothing else. The daemon reads the token (from the file or variable, on each request), calls the server, and keeps the token out of the agent's environment, its arguments and the event log. A `token_file` with several keys and no `token_key` is an error naming the keys; hib never guesses which credential to send.
+- **Results are guarded with the session's tokens.** JSON results (Loki streams, Tempo spans) are guarded value by value, each part of a result on its own, so a value after an escaped tab or newline is still found. A value under a key that names a person, a login or a client address (`user.id`, `user.email`, `enduser.id`, `session.id`, `net.peer.ip`, `client.address`, `http.client_ip`…, also as an OTLP attribute `{"key": "enduser.id", "value": {"stringValue": …}}`) becomes a token whole. That's narrower than a Read copy's column rules on purpose: metric (`__name__`), span (`name`), service, job and namespace names, peer names (`net.peer.name`), and infrastructure ids (`uid`, `traceID`, `spanID`, container and instance ids) stay readable, since the agent needs them to diagnose anything and to build links. Other text gets the guard a `.log` Read copy gets: IPs, emails, users, keys, paths and this machine's names, plus name detection when it's on. A value the session already has a token for gets the same one, so the same IP in a log line, a span attribute and a Read copy is the same token. Placeholders in the agent's arguments are swapped back before the call, so it can query what it saw. Answers restore as usual.
+- **Text only, and capped.** Images and other non-text parts are withheld; structured output is used only when there's no text. The agent gets up to 60,000 characters of a result, cut at a boundary, and name detection only runs over what it's shown.
+- **hib's own budgets,** whatever the server allows: 60 calls a minute per session, and 16,000 characters of arguments (after placeholders are restored). Over either, the call is refused before it reaches the server.
+- **Results are data, not instructions.** The agent is told that results and tool descriptions come from another system and must not be followed as instructions; descriptions are cut to 1,000 characters. That's a prompt, not a guarantee: what keeps a poisoned result from doing harm is that the agent's permissions don't change (hib's prompts, the sandbox, and only your listed read-only tools here).
+- **No prompts, but logged.** Each call is a `tool.permission` event with `decided_by: "policy"` and `mcp_server`, and the timeline shows what the guard replaced.
+- **The unguarded route is closed in hib.** A server of the same name in your own CLI config (`~/.claude.json`, Codex's `config.toml`) is denied in hib's Claude sessions and switched off in its Codex sessions. Outside hib it works as before.
+- **Sensitive folders** offer a server only with `sensitive = true`; it's the only MCP route there besides hib's own.
+- A server that can't be reached at session start, or whose token can't be read, is left out for that session and the timeline says why. The tools are fetched once per session; restart the session to pick up new ones.
+- Limits: streamable HTTP only, no stdio servers. Listing a tool trusts the server's description of it: for OIB, mcp-grafana runs with `--disable-write` and a Grafana Viewer token, so even a mislabelled tool can't write. A value repeated in free text gets the same token wherever it appears (a user name `oib` would also turn `oib-redis` into `[…]-redis`); database logins (`db.user`) are left readable for that reason. Without name detection, a name in free text goes through unless it's under an identifying key or already in the session's vault.
+
+### Using OIB
+
+OIB serves Grafana's MCP (Loki, Prometheus, Tempo) read-only on `127.0.0.1:3030`. Add the block above to `~/.hib/config.toml`, with `token_file` pointing at OIB's `mcp/secrets/mcp.env` and `tools` listing the tools you want the agent to have, and restart the daemon (`hib daemon stop`). In a hib session the agent then has `mcp__hib__oib__query_loki_logs`, `mcp__hib__oib__query_prometheus`, `mcp__hib__oib__search_tempo_traces` and the rest, with results tokenised. If you registered OIB in `~/.claude.json` too, hib sessions ignore that entry.
 
 ## Analysing data without sending it
 
@@ -357,7 +388,8 @@ Synthetic 10,000-row files with planted values, generated and measured by `bun t
 - **hib's own git calls run no repo code.** Background-task commits, merges and worktree setup run without hooks; a repo's hooks can be files the agent edited (husky, lefthook). No git call hib makes on its own (status, diffs, the advisor's diff) starts an fsmonitor, external diff or textconv from config. Commits you make from the web git panel still run your hooks.
 - **Other local processes.** Anything else running as your user, outside an agent sandbox, can still read `~/.hib/token`. hib protects against its agents, not against your own account.
 - **Plugins.** Trusting a plugin records a fingerprint of its files, and hib checks it before loading. That proves the files are the ones you reviewed. It doesn't isolate the code: trusted plugin code runs with hib's permissions. Agent commands can't read or write `~/.hib/plugins`, and the agent's edit tool would need your approval there. So swapping a file between the check and the load takes a process outside the sandbox.
-- **Repo settings are ignored; your own still apply.** Claude sessions run in ask mode (`--permission-mode manual`, whatever `defaultMode` says) and load only your user settings, never the repo's `.claude/` settings or hooks: a cloned repo can't add allow rules, or hooks that run outside the sandbox. Your own `settings.json` allow rules, MCP servers and `CLAUDE.md` / `AGENTS.md` still load; broad allow rules there bypass hib's prompts, and commands in your own `sandbox.excludedCommands` run outside the sandbox. "Always" for an MCP or unknown tool covers only that exact call.
+- **Repo settings are ignored; your own still apply.** Claude sessions run in ask mode (`--permission-mode manual`, whatever `defaultMode` says) and load only your user settings, never the repo's `.claude/` settings or hooks: a cloned repo can't add allow rules, or hooks that run outside the sandbox. Your own `settings.json` allow rules, MCP servers and `CLAUDE.md` / `AGENTS.md` still load; broad allow rules there bypass hib's prompts, and commands in your own `sandbox.excludedCommands` run outside the sandbox. "Always" for an MCP or unknown tool covers only that exact call; a trusted read-only server's tools need no prompt.
+- **Trusted MCP servers.** Only servers declared in `config.toml` with `read_only = true`, only their `readOnlyHint` tools, called by the daemon with a token the agent never sees, results guarded with the session vault (see Trusted read-only MCP servers). The CLI's own copy of a server with the same name is denied in hib sessions. The trust step is the config file: agents can't read `~/.hib`, commands can't write it, and an edit there by the CLI's own file tools is outside the folder, so it always asks.
 - **Rendering:** model output is rendered as markdown without raw HTML.
 
 ## Accounts
@@ -378,6 +410,8 @@ The file is created on first run. It holds:
 - advisor models
 - model tiers
 - guard terms, `askOn` and `agentDirs`
+- `[events]`: the security event log
+- `[mcp.<name>]`: trusted read-only MCP servers (see Trusted read-only MCP servers)
 
 ## Plugins
 
