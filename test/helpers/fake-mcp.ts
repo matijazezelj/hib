@@ -45,7 +45,10 @@ export function fakeMcp(token = "tok-SECRET-0123456789"): FakeMcp {
       if (m.method === "tools/list") return ok({ tools });
       if (m.method === "tools/call") {
         f.calls.push({ name: m.params.name, args: m.params.arguments });
-        if (m.params.name === "read_logs") return ok({ content: [{ type: "text", text: JSON.stringify(f.reply(m.params.arguments)) }] }, true);
+        if (m.params.name === "read_logs") {
+          const out = f.reply(m.params.arguments);
+          return ok({ content: [{ type: "text", text: typeof out === "string" ? out : JSON.stringify(out) }] }, true);
+        }
         if (m.params.name === "get_panel_image") return ok({ content: [{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }, { type: "text", text: "panel for 10.9.8.7" }] }, true);
         if (m.params.name === "big_logs") return ok({ content: [{ type: "text", text: Array.from({ length: 5000 }, (_, i) => `line ${i} from 10.0.${i % 250}.1 ok`).join("\n") }] }, true);
         return ok({ content: [{ type: "text", text: "deleted" }] }, true);

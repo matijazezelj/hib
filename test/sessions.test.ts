@@ -528,6 +528,18 @@ describe("sensitive workspaces", () => {
     expect(existsSync(dir)).toBe(false); // nothing left behind once the CLI is gone
   });
 
+  test("a token first made in a later turn (command output) restores in that turn's answer", async () => {
+    sensitive();
+    const r1 = await turn("hi", undefined, undefined, "hib/auto");
+    script.current = async (_t, d, q) => {
+      q.push({ type: "output", id: "o1", callId: "toolu_1", text: "reset by petra@acme-corp.hr\n[exit 0]" });
+      const seen = await d.shown("o1");
+      q.push({ type: "text", delta: `it was ${/\[HIB[0-9a-f]{4}-EMAIL-\d+\]/.exec(seen)![0]}` });
+    };
+    const r2 = await turn("who reset it?", r1.sid, undefined, "hib/auto");
+    expect(r2.events.filter((e) => e.type === "text").map((e: any) => e.delta).join("")).toBe("it was petra@acme-corp.hr");
+  });
+
   test("no capture folder outside sensitive folders", async () => {
     await turn("hello");
     expect(drivers[0]!.started[0]!.captureDir).toBeUndefined();
@@ -1078,6 +1090,26 @@ describe("trusted read-only MCP servers", () => {
     ]);
     const log = readFileSync(engine.events.file, "utf8");
     for (const s of [f.token, "QUERYSECRET", "10.1.2.3", "ivana@acme-corp.hr", "petra", "marko"]) expect(log).not.toContain(s);
+  });
+
+  test("observability keys: person keys and OTLP attributes tokenised whole, metric, span and service names readable; each part guarded", async () => {
+    f.reply = () => ({
+      metric: { __name__: "redis_up", instance: "redis:6379", job: "oib" },
+      span: { name: "GET /cart", "service.name": "shop", attributes: [{ key: "enduser.id", value: { stringValue: "marko" } }, { key: "db.system", value: { stringValue: "redis" } }] },
+    });
+    const r = await mcpTurn([{ name: "oib__read_logs", arguments: {} }, { name: "oib__get_panel_image" }]);
+    const shown = r.results[0]!;
+    for (const s of ['"__name__":"redis_up"', '"name":"GET /cart"', '"service.name":"shop"', '"stringValue":"redis"']) expect(shown).toContain(s);
+    expect(shown).not.toContain("marko");
+    expect(shown).toMatch(/"stringValue":"\[HIB[0-9a-f]{4}-ENDUSER-ID-1\]"/);
+    // An image part next to text: the text part is still guarded on its own.
+    expect(r.results[1]).toContain("[hib withheld a part of this result (image)");
+    expect(r.results[1]).not.toContain("10.9.8.7");
+    // A short plain-text result whose tokens are shorter than its values isn't reported as cut.
+    f.reply = () => "reset by petra@acme-corp.hr";
+    const t = await mcpTurn([{ name: "oib__read_logs", arguments: {} }], () => "", r.sid);
+    expect(t.results[0]).not.toContain("cut");
+    expect(t.events.find((e) => e.type === "mcp_guarded")).not.toHaveProperty("cut");
   });
 
   test("non-text parts are withheld, large results cut before they're shown, and a server error comes back guarded", async () => {

@@ -96,6 +96,8 @@ export interface CallResult {
  * the server forgets the session. Errors name the server and the HTTP status, never the URL (its query string could
  * carry a credential) or the token.
  */
+const MAX_REPLY = 8_000_000; // characters of one reply; anything larger is refused, not parsed
+
 export class McpClient {
   private sid?: string;
   private ready?: Promise<void>;
@@ -124,6 +126,7 @@ export class McpClient {
     if (id === undefined || r.status === 202) return { status: r.status };
     const text = await r.text();
     if (!r.ok) return { status: r.status };
+    if (text.length > MAX_REPLY) throw new Error(`replied with more than ${MAX_REPLY / 1_000_000} MB`);
     const msgs: any[] = [];
     if ((r.headers.get("content-type") ?? "").includes("text/event-stream")) {
       for (const ev of text.split(/\r?\n\r?\n/)) {
@@ -177,8 +180,11 @@ export class McpClient {
   }
 }
 
-/** A result's text for the guard: text parts as they are, anything else named and withheld. */
-export function resultText(r: CallResult): string {
+/**
+ * A result's parts for the guard, each on its own (a JSON part is guarded value by value): text parts as they are,
+ * anything else named and withheld. Structured output only when there's no text.
+ */
+export function resultParts(r: CallResult): string[] {
   const parts: string[] = [];
   for (const c of Array.isArray(r?.content) ? r.content : []) {
     if (c?.type === "text" && typeof c.text === "string") parts.push(c.text);
@@ -186,8 +192,10 @@ export function resultText(r: CallResult): string {
   }
   // Structured output only when there's no text: servers send the same data both ways, and both would go through the guard.
   if (!parts.length && r?.structuredContent !== undefined) parts.push(JSON.stringify(r.structuredContent));
-  return parts.join("\n");
+  return parts;
 }
+
+export const resultText = (r: CallResult) => resultParts(r).join("\n");
 
 /**
  * Cut to `max` characters at a boundary a value is unlikely to span (a newline, space or comma), so a cut never leaves

@@ -16,12 +16,12 @@ import { homedir, tmpdir } from "node:os";
 import { scopeProbe, scopeUnit, type ScopeProbe } from "./scope";
 import { homeChanges, homePath, homeSnapshot, type HomeSnapshot, type HomeWatch } from "./homewatch";
 import { basename, sep, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
-import { identifyingName, isFreeText, loadTable, TABLE_FILE } from "../analyze/table";
+import { isFreeText, loadTable, TABLE_FILE } from "../analyze/table";
 import { categoryFor, columnsToHide, pseudonymizeWithSpans, tokenFor } from "../analyze/pseudo";
 import { DATA_RULE_NOTE, dataBlockEventReason, rawDataCommand } from "./datarules";
 import { readdirSync, statSync } from "node:fs";
 import type { McpUpstream } from "../config";
-import { cutResult, exposedName, McpClient, readOnlyTools, resultText, type UpstreamTool } from "./mcp-upstream";
+import { cutResult, exposedName, McpClient, readOnlyTools, resultParts, type UpstreamTool } from "./mcp-upstream";
 
 export type DriverFactory = (provider: string) => AgentDriver | null;
 
@@ -200,6 +200,25 @@ const MCP_NOTE = (names: string[]) =>
   `Tools named mcp__hib__<server>__<tool> are read-only tools of ${names.join(", ")}, called for you by hib. Their results come ` +
   "through hib's guard, with the same kind of placeholders as the rest of this session; a placeholder you pass in an argument " +
   "is swapped back to the real value before the call. Results over 60,000 characters are cut: narrow the query instead.";
+
+/**
+ * Keys whose value names a person in observability data (log labels, span attributes): the value becomes a token whole,
+ * like a hidden column's cell. Deliberately narrower than the Read copies' column rules, which would also hide metric
+ * (`__name__`), span (`name`), service and namespace names the agent needs to diagnose anything; IPs, emails, keys and
+ * known values inside those are still caught by the guard.
+ */
+const PERSON_KEY = /(^|[._-])(user|username|user[._-]?(name|id|email|login)|uid|login|e-?mail|email[._-]?address|enduser[._-]?id|customer[._-]?(id|name|email)|account[._-]?(id|name)|phone|phone[._-]?number|full[._-]?name|first[._-]?name|last[._-]?name|surname|client[._-]?ip|src[._-]?ip|source[._-]?ip|remote[._-]?addr(ess)?|peer[._-]?ip)$/i;
+
+/**
+ * The key a child value is judged under: its own, except in an OTLP attribute ({"key": "enduser.id", "value":
+ * {"stringValue": "…"}}), where the value and its typed wrapper count as the attribute's key.
+ */
+function attrKey(obj: object, k: string, parent: string): string {
+  const o = obj as Record<string, unknown>;
+  if (k === "value" && typeof o.key === "string") return o.key;
+  if (/^(string|int|bool|double|bytes|array|kvlist)Value$/.test(k)) return parent;
+  return k;
+}
 
 /** A session's trusted MCP servers: the tools offered and the key hib's MCP server uses for them. */
 interface McpState {
@@ -1135,21 +1154,31 @@ export class WorkspaceSessions {
     }
     this.events.emit("tool.permission", ctx, { tool: `mcp__hib__${name}`, mcp_server: server, decision: "allow", decided_by: "policy" });
     const args = restoreDeep(params?.arguments ?? {}, st.vault);
-    let raw: string, isError = false;
+    let parts: string[], isError = false;
     try {
       const r = await t.client.callTool(t.tool.name, args);
-      raw = resultText(r);
+      parts = resultParts(r);
       isError = !!r?.isError;
     } catch (e: any) {
-      raw = `${server} failed: ${String(e?.message ?? e)}`;
+      parts = [`${server} failed: ${String(e?.message ?? e)}`];
       isError = true;
     }
-    const g = await this.guardMcpResult(st.vault, raw);
+    const findings: Record<string, number> = {};
+    const shown: string[] = [];
+    let partCut = false, names: string | undefined;
+    for (const p of parts) {
+      const g = await this.guardMcpResult(st.vault, p);
+      for (const [k, v] of Object.entries(g.findings)) findings[k] = (findings[k] ?? 0) + v;
+      shown.push(g.text);
+      partCut ||= g.cut;
+      names ??= g.names;
+    }
     // Cut after the guard (JSON) or before it (text, already within MCP_SHOWN): either way, what's cut was never shown.
-    const cut = cutResult(g.text, MCP_SHOWN);
-    const over = cut.cut || g.total > g.text.length;
-    const text = over ? `${cut.text}\n[hib cut this result here: ${g.total} characters in all. Narrow the query.]` : g.text;
-    const ev = { type: "mcp_guarded" as const, server, tool: t.tool.name, findings: g.findings, ...(g.names ? { names: g.names } : {}), ...(over ? { cut: g.total } : {}), ...(isError ? { error: true } : {}) };
+    const total = parts.reduce((n, p) => n + p.length, 0);
+    const cut = cutResult(shown.join("\n"), MCP_SHOWN);
+    const over = cut.cut || partCut;
+    const text = over ? `${cut.text}\n[hib cut this result here: ${total} characters in all. Narrow the query.]` : cut.text;
+    const ev = { type: "mcp_guarded" as const, server, tool: t.tool.name, findings, ...(names ? { names } : {}), ...(over ? { cut: total } : {}), ...(isError ? { error: true } : {}) };
     this.record(sessionId, ev);
     this.emit(sessionId, ev);
     return { content: [{ type: "text", text }], isError };
@@ -1163,7 +1192,7 @@ export class WorkspaceSessions {
    * agent's workspace). Every value the vault already holds gets its token, so tokens match across calls and files.
    * Name detection runs only over the first MCP_SHOWN characters of values: the rest is cut from what the agent sees.
    */
-  private async guardMcpResult(vault: Vault, raw: string): Promise<{ text: string; total: number; findings: Record<string, number>; names?: string }> {
+  private async guardMcpResult(vault: Vault, raw: string): Promise<{ text: string; cut: boolean; findings: Record<string, number>; names?: string }> {
     const findings: Record<string, number> = {};
     const count = (cat: string) => (findings[cat] = (findings[cat] ?? 0) + 1);
     const opts = { level: "standard" as const, terms: this.cfg.guard.terms, identities: machineTerms(), patterns: this.cfg.guard.patterns, keepPaths: false };
@@ -1179,35 +1208,36 @@ export class WorkspaceSessions {
     if (doc === undefined || typeof doc !== "object" || doc === null) {
       const cut = cutResult(raw, MCP_SHOWN); // cut first: name detection only over what the agent is shown
       const ner = await this.nameCheck(cut.text);
-      return { text: guard(cut.text, ner.findings), total: raw.length, findings, ...(ner.note && this.cfg.guard.ner ? { names: ner.note } : {}) };
+      return { text: guard(cut.text, ner.findings), cut: cut.cut, findings, ...(ner.note && this.cfg.guard.ner ? { names: ner.note } : {}) };
     }
-    // Values under identifying keys become tokens whole; the free text left goes to name detection, within the budget.
+    // Values under a key naming a person become tokens whole; the free text left goes to name detection, within the budget.
+    const whole = (key: string, v: string) => !!key && PERSON_KEY.test(key) && !isFreeText(v) && !!v.trim();
     const leaves: string[] = [];
     let budget = MCP_SHOWN;
     const collect = (v: unknown, key: string) => {
       if (typeof v === "string") {
-        if (budget > 0 && !(key && identifyingName(key, "string") && !isFreeText(v)) && /\p{L}{3}/u.test(v)) leaves.push(v);
+        if (budget > 0 && !whole(key, v) && /\p{L}{3}/u.test(v)) leaves.push(v);
         budget -= v.length;
       } else if (Array.isArray(v)) v.forEach((x) => collect(x, key));
-      else if (v && typeof v === "object") for (const [k, x] of Object.entries(v)) collect(x, k);
+      else if (v && typeof v === "object") for (const [k, x] of Object.entries(v)) collect(x, attrKey(v, k, key));
     };
     collect(doc, "");
     const ner = this.cfg.guard.ner && leaves.length ? await runNer(leaves, this.cfg, this.engine.nerInfer ?? this.engine.nerModel.infer) : undefined;
     const walk = (v: unknown, key: string): unknown => {
       if (typeof v === "string") {
-        if (key && identifyingName(key, "string") && !isFreeText(v) && v.trim()) {
+        if (whole(key, v)) {
           count(categoryFor(key));
           return tokenFor(vault, key, v);
         }
         return guard(v, ner?.byText.get(v));
       }
       if (Array.isArray(v)) return v.map((x) => walk(x, key));
-      if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [guard(k), walk(x, k)]));
+      if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [guard(k), walk(x, attrKey(v, k, key))]));
       return v;
     };
     const text = JSON.stringify(walk(doc, ""));
     const note = !this.cfg.guard.ner ? undefined : ner?.error ? `${ner.error}: names in free text weren't checked` : ner?.partial?.size ? "name detection ran out of budget: the values it didn't reach were tokenised whole" : undefined;
-    return { text, total: text.length, findings, ...(note ? { names: note } : {}) };
+    return { text, cut: false, findings, ...(note ? { names: note } : {}) };
   }
 
   /**

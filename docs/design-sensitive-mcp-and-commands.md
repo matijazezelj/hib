@@ -61,8 +61,10 @@ from the proposal above:
 - **The shim** is `hib-mcp.ts` (the advisor's server, generalised): `HIB_MCP_KEY` lets it call `POST /ws/mcp`
   (`tools/list`, `tools/call`) for its session only. The token is read by the daemon; the shim, the CLI's environment
   and arguments and the event log never see it.
-- **Results** are guarded value by value when they're JSON (decoded, so escapes don't hide a value; a value under an
-  identifying key becomes a token whole, by the Read copies' column-name rules), otherwise like a `.log` Read copy.
+- **Results** are guarded part by part, value by value when a part is JSON (decoded, so escapes don't hide a value; a
+  value under a key naming a person, or an OTLP attribute with such a key, becomes a token whole), otherwise like a
+  `.log` Read copy. The Read copies' column rules aren't used for keys: they'd hide `__name__`, span `name`,
+  `namespace` and `rootServiceName`, which the agent needs to diagnose anything.
   Paths and machine names are guarded (`keepPaths` off). Known vault values get their tokens. The agent gets 60,000
   characters at most; name detection only covers that. The table path (`loadTable`/`columnsToHide`) isn't used: it
   would turn Loki streams into CSV and needs records of one shape.
