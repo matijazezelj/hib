@@ -1112,6 +1112,23 @@ describe("trusted read-only MCP servers", () => {
     expect(t.events.find((e) => e.type === "mcp_guarded")).not.toHaveProperty("cut");
   });
 
+  test("OIB's real keys: person, login and client-address keys become tokens; infrastructure ids, peer names and URLs stay readable", async () => {
+    const readable = {
+      compose_service: "demo-app", container_name: "oib-demo-app", detected_level: "error", "net.peer.name": "oib-redis", "net.peer.port": "6379",
+      "db.system": "redis", "http.route": "/health", rootServiceName: "demo-app", __name__: "up", instance: "http://oib-grafana:3000/api/health",
+      traceID: "4bf92f3577b34da6a3ce929d0e0e4736", spanID: "00f067aa0ba902b7", uid: "P8E80F9AEF21F6940", datasourceUid: "loki",
+      container_id: "a3f1c9e2b7d4a3f1c9e2b7d4a3f1c9e2b7d4a3f1c9e2b7d4a3f1c9e2b7d4a3f1", "service.instance.id": "0f8fad5b-d9cb-469f-a165-70867728950e",
+      "http.user_agent": "curl/8.23.0", line: "redis error: dial tcp: lookup oib-redis:6379: no such host",
+    };
+    const secret = { "db.user": "oib", "user.id": "u-4411", "user.email": "ana@acme-corp.hr", "session.id": "sess-77a", "net.peer.ip": "10.4.4.4", "client.address": "10.5.5.5", "http.client_ip": "10.6.6.6" };
+    f.reply = () => ({ attrs: { ...readable, ...secret } });
+    const r = await mcpTurn([{ name: "oib__read_logs", arguments: {} }]);
+    const shown = JSON.parse(r.results[0]!).attrs;
+    for (const [k, v] of Object.entries(readable)) expect([k, shown[k]]).toEqual([k, v]);
+    for (const [k, v] of Object.entries(secret)) expect([k, shown[k]]).not.toEqual([k, v]);
+    expect(Object.keys(r.events.find((e) => e.type === "mcp_guarded")!.findings ?? {})).not.toContain("UID");
+  });
+
   test("non-text parts are withheld, large results cut before they're shown, and a server error comes back guarded", async () => {
     f.reply = () => ({ x: 1 });
     const r = await mcpTurn([{ name: "oib__get_panel_image" }, { name: "oib__big_logs" }]);

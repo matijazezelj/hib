@@ -202,12 +202,14 @@ const MCP_NOTE = (names: string[]) =>
   "is swapped back to the real value before the call. Results over 60,000 characters are cut: narrow the query instead.";
 
 /**
- * Keys whose value names a person in observability data (log labels, span attributes): the value becomes a token whole,
- * like a hidden column's cell. Deliberately narrower than the Read copies' column rules, which would also hide metric
- * (`__name__`), span (`name`), service and namespace names the agent needs to diagnose anything; IPs, emails, keys and
- * known values inside those are still caught by the guard.
+ * Keys whose value names a person, a login or a client address in observability data (log labels, span attributes:
+ * user.id, db.user, session.id, net.peer.ip, client.address, http.client_ip): the value becomes a token whole, like a
+ * hidden column's cell. Deliberately narrower than the Read copies' column rules, which would also hide metric
+ * (`__name__`), span (`name`), service and namespace names the agent needs to diagnose anything. Infrastructure ids
+ * (uid, traceID, spanID, container ids) and peer names (net.peer.name: oib-redis) stay readable; IPs, emails, keys and
+ * known values inside any value are still caught by the guard.
  */
-const PERSON_KEY = /(^|[._-])(user|username|user[._-]?(name|id|email|login)|uid|login|e-?mail|email[._-]?address|enduser[._-]?id|customer[._-]?(id|name|email)|account[._-]?(id|name)|phone|phone[._-]?number|full[._-]?name|first[._-]?name|last[._-]?name|surname|client[._-]?ip|src[._-]?ip|source[._-]?ip|remote[._-]?addr(ess)?|peer[._-]?ip)$/i;
+const PERSON_KEY = /(^|[._-])(user|username|user[._-]?(name|id|email|login)|login|e-?mail|email[._-]?address|enduser[._-]?id|session[._-]?id|customer[._-]?(id|name|email)|account[._-]?(id|name)|phone|phone[._-]?number|full[._-]?name|first[._-]?name|last[._-]?name|surname|(client|src|source|peer|remote)[._-]?(ip|addr|address))$/i;
 
 /**
  * The key a child value is judged under: its own, except in an OTLP attribute ({"key": "enduser.id", "value":
