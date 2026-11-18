@@ -33,6 +33,11 @@ const HELP = `hib — harness in a box
   hib geo setup                     offline gazetteer for hib analyze (GeoNames cities/countries, ~3 MB download)
   hib egress [last|id] [--here]     what router requests (ask, chat, analyze, API) sent, and to whom
   hib ask "prompt" [-m model] one-shot answer on stdout
+  hib ask --workspace <dir> "prompt" [-m model] [--session id] [--json]
+                              one unattended agent turn in a folder (its permissions, data rules and
+                              trusted MCP servers); anything that would ask you is denied. Answer on
+                              stdout, session id on stderr (or all as JSON). Exit 0 done, 3 done but
+                              something was denied, 1 error
   hib ask -f data.csv "question" [--hide col,col] [--keep col,col]
                               attach a table pseudonymised by column (identifying columns become
                               stable tokens; the answer comes back with real values)
@@ -75,6 +80,9 @@ const { values, positionals } = parseArgs({
     format: { type: "string" },
     "on-error": { type: "string" },
     help: { type: "boolean", short: "h" },
+    workspace: { type: "string", short: "w" },
+    session: { type: "string" },
+    json: { type: "boolean" },
   },
 });
 const [cmd, ...rest] = positionals;
@@ -207,6 +215,36 @@ async function main() {
       const { connect } = await import("./boot");
       const prompt = rest.join(" ") || (await Bun.stdin.text());
       const { client } = await connect();
+      if (values.workspace !== undefined) {
+        const { askWorkspace, exitCode } = await import("./askws");
+        if (values.file) throw new Error("--workspace and -f don't go together: the agent reads files in the folder itself");
+        let r;
+        try {
+          r = await askWorkspace(client, {
+            root: (await import("node:path")).resolve(String(values.workspace) || "."),
+            text: prompt,
+            model: values.model as string | undefined,
+            sessionId: values.session as string | undefined,
+            onEvent: (e) => {
+              if (values.json) return;
+              if (e.type === "ws_session") console.error(`[session ${e.id} · ${e.model}]`);
+              if (e.type === "permission") console.error(`[denied, would have asked: ${e.call?.title ?? e.call?.name}]`);
+              if (e.type === "mcp_guarded") console.error(`[${e.server}: ${e.tool}, guard replaced ${Object.entries(e.findings).map(([k, v]) => `${k}×${v}`).join(" ") || "nothing"}]`);
+              if (e.type === "mcp_note") console.error(`[${e.server}: ${e.text}]`);
+              if (e.type === "error") console.error(`error: ${e.message}`);
+            },
+          });
+        } catch (e: any) {
+          if (values.json) console.log(JSON.stringify({ sessionId: null, answer: "", denied: [], errors: [String(e?.message ?? e)], exit: 1 }));
+          else console.error(`error: ${e?.message ?? e}`);
+          process.exitCode = 1;
+          return;
+        }
+        if (values.json) console.log(JSON.stringify({ ...r, exit: exitCode(r) }));
+        else process.stdout.write(r.answer + "\n");
+        process.exitCode = exitCode(r);
+        return;
+      }
       let failed = false;
       let revising = false;
       const tty = !!process.stdout.isTTY;
