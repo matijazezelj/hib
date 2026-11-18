@@ -34,6 +34,7 @@ hib task "…"         # hand a task to a background agent in its own git worktr
 hib tasks            # check on background tasks; review, merge or discard one
 hib chat             # multi-model router chat in the terminal
 hib ask "…"          # one-shot answer on stdout
+hib ask --workspace . "…" --json   # one unattended agent turn here (prompts denied; exit 3 if any were)
 hib daemon status    # or: stop
 ```
 
