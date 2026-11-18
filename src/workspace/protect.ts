@@ -82,7 +82,12 @@ export function snapshot(root: string): Snapshot {
   }
   for (const g of dirs) {
     walk(join(g, "hooks"));
-    for (const f of ["config", "config.worktree"]) walk(join(g, f));
+    walk(join(g, "config"));
+    // Claude Code's Linux sandbox leaves an empty config.worktree behind (a mount point for a path it keeps commands
+    // from writing). Empty, it changes nothing for git, so it counts as absent; any content is compared as usual.
+    const wt = join(g, "config.worktree");
+    const st = lstatSync(wt, { throwIfNoEntry: false });
+    if (!(st?.isFile() && st.size === 0)) walk(wt);
   }
   return snap;
 }
