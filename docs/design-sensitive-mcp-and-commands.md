@@ -55,8 +55,10 @@ from the proposal above:
 - **Declared in `~/.hib/config.toml`** (`[mcp.<name>]`: url, token_file + token_key or token_env, `read_only = true`,
   `sensitive`, optional `tools` globs), not a per-folder allow-list. Only streamable HTTP; the daemon doesn't start
   server processes, so it runs no third-party code.
-- **No prompts.** A tool is offered only if the config says `read_only = true`, the server marks it `readOnlyHint`, and
-  it matches `tools`. Those calls are allowed by policy (`tool.permission`, `decided_by: "policy"`, `mcp_server`);
+- **No prompts.** A tool is offered only if the config says `read_only = true`, lists it in `tools` (required: the
+  authorisation, since `readOnlyHint` is the server's own claim), and the server marks it `readOnlyHint`; with
+  `server`, only if the server reports that name. hib's own budgets: 60 calls a minute per session, 16,000 characters
+  of arguments. Those calls are allowed by policy (`tool.permission`, `decided_by: "policy"`, `mcp_server`);
   anything else is refused in the daemon, whatever the CLI allowed. The proposal approved each call.
 - **The shim** is `hib-mcp.ts` (the advisor's server, generalised): `HIB_MCP_KEY` lets it call `POST /ws/mcp`
   (`tools/list`, `tools/call`) for its session only. The token is read by the daemon; the shim, the CLI's environment

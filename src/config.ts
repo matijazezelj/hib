@@ -65,7 +65,8 @@ export interface McpUpstream {
   tokenKey?: string;
   tokenEnv?: string; // or a variable in the daemon's environment
   sensitive: boolean; // offered in sensitive folders too
-  tools: string[]; // optional globs that narrow the read-only tools further
+  tools: string[]; // required: the tool names (or globs) the agent may call; readOnlyHint alone is the server's claim
+  server?: string; // the server's name as it introduces itself (serverInfo.name); a different one offers nothing
 }
 
 export interface Config {
@@ -183,8 +184,9 @@ heartbeat_sec = 300             # daemon.alive every 5 minutes, so a crash shows
 # token_file = "~/oib/mcp/secrets/mcp.env"     # or token_env = "VAR"; never given to the agent
 # token_key = "MCP_GRAFANA_SERVER_TOKEN"        # needed when the file has several KEY=VALUE lines
 # read_only = true                              # required: without it hib ignores the entry
+# tools = ["query_loki_logs", "search_*"]       # required: the tools the agent may call (also must be readOnlyHint)
+# server = "mcp-grafana"                        # optional: offer nothing if the server reports another name
 # sensitive = true                              # offer it in sensitive folders too (default false)
-# tools = ["query_*", "search_*"]               # optional: narrows the read-only tools further
 `;
 
 function expandHome(p: string): string {
@@ -308,7 +310,10 @@ function mcpServers(raw: any): McpUpstream[] {
     if (m.token_key !== undefined && m.token_file === undefined) fail("token_key needs token_file");
     for (const k of ["token_file", "token_key", "token_env"]) if (m[k] !== undefined && (typeof m[k] !== "string" || !m[k])) fail(`${k} must be a non-empty string`);
     if (m.sensitive !== undefined && typeof m.sensitive !== "boolean") fail("sensitive must be true or false");
-    if (m.tools !== undefined && (!Array.isArray(m.tools) || !m.tools.every((t: unknown) => typeof t === "string" && t))) fail('tools must be a list of names or globs, like ["query_*"]');
+    // readOnlyHint is the server's own claim: a compromised server could mark a write tool read-only. Your list of the
+    // tools you checked is the authorisation; the hint only filters it further.
+    if (!Array.isArray(m.tools) || !m.tools.length || !m.tools.every((t: unknown) => typeof t === "string" && t)) fail('tools is required: list the tools the agent may call, like ["query_loki_logs", "search_*"] (readOnlyHint alone is the server\'s claim, not trusted)');
+    if (m.server !== undefined && (typeof m.server !== "string" || !m.server)) fail("server must be the name the server reports (serverInfo.name)");
     out.push({
       name,
       url: url.href,
@@ -316,7 +321,8 @@ function mcpServers(raw: any): McpUpstream[] {
       ...(m.token_key ? { tokenKey: m.token_key } : {}),
       ...(m.token_env ? { tokenEnv: m.token_env } : {}),
       sensitive: m.sensitive === true,
-      tools: m.tools ?? [],
+      tools: m.tools,
+      ...(m.server ? { server: m.server } : {}),
     });
   }
   return out;

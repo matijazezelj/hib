@@ -9,21 +9,24 @@ import { cutResult, McpClient, readOnlyTools, readToken, resultText } from "../s
 import { fakeMcp, type FakeMcp } from "./helpers/fake-mcp";
 
 const dir = () => mkdtempSync(join(tmpdir(), "hib-mcpu-"));
-const up = (o: Partial<McpUpstream> = {}): McpUpstream => ({ name: "oib", url: "http://127.0.0.1:1/mcp", sensitive: false, tools: [], ...o });
+const up = (o: Partial<McpUpstream> = {}): McpUpstream => ({ name: "oib", url: "http://127.0.0.1:1/mcp", sensitive: false, tools: ["*"], ...o });
 
 describe("[mcp.<name>] config", () => {
   const parse = (mcp: unknown) => parseConfig({ mcp } as any, dir()).mcp;
   test("only read_only = true entries exist to hib; the rest is checked strictly", () => {
-    expect(parse({ oib: { url: "http://127.0.0.1:3030/mcp", token_file: "~/x.env", token_key: "K", read_only: true, sensitive: true, tools: ["query_*"] } })).toEqual([
-      { name: "oib", url: "http://127.0.0.1:3030/mcp", tokenFile: expect.stringMatching(/\/x\.env$/), tokenKey: "K", sensitive: true, tools: ["query_*"] },
+    expect(parse({ oib: { url: "http://127.0.0.1:3030/mcp", token_file: "~/x.env", token_key: "K", read_only: true, sensitive: true, tools: ["query_*"], server: "mcp-grafana" } })).toEqual([
+      { name: "oib", url: "http://127.0.0.1:3030/mcp", tokenFile: expect.stringMatching(/\/x\.env$/), tokenKey: "K", sensitive: true, tools: ["query_*"], server: "mcp-grafana" },
     ]);
+    // readOnlyHint is the server's claim: your list of tools is required.
+    expect(() => parse({ a: { url: "http://x/mcp", read_only: true } })).toThrow("tools is required");
+    expect(() => parse({ a: { url: "http://x/mcp", read_only: true, tools: [] } })).toThrow("tools is required");
     expect(parse({ rw: { url: "http://x/mcp" }, rw2: { url: "http://x/mcp", read_only: false } })).toEqual([]);
-    expect(() => parse({ a: { url: "ftp://x", read_only: true } })).toThrow("[mcp.a] url");
-    expect(() => parse({ a: { url: "http://u:p@x/mcp", read_only: true } })).toThrow("not in the url");
-    expect(() => parse({ hib: { url: "http://x/mcp", read_only: true } })).toThrow("not hib");
-    expect(() => parse({ "a__b": { url: "http://x/mcp", read_only: true } })).toThrow("without __");
-    expect(() => parse({ a: { url: "http://x/mcp", read_only: true, token_file: "f", token_env: "E" } })).toThrow("not both");
-    expect(() => parse({ a: { url: "http://x/mcp", read_only: true, sensitive: "yes" } })).toThrow("sensitive");
+    expect(() => parse({ a: { url: "ftp://x", read_only: true, tools: ["*"] } })).toThrow("[mcp.a] url");
+    expect(() => parse({ a: { url: "http://u:p@x/mcp", read_only: true, tools: ["*"] } })).toThrow("not in the url");
+    expect(() => parse({ hib: { url: "http://x/mcp", read_only: true, tools: ["*"] } })).toThrow("not hib");
+    expect(() => parse({ "a__b": { url: "http://x/mcp", read_only: true, tools: ["*"] } })).toThrow("without __");
+    expect(() => parse({ a: { url: "http://x/mcp", read_only: true, tools: ["*"], token_file: "f", token_env: "E" } })).toThrow("not both");
+    expect(() => parse({ a: { url: "http://x/mcp", read_only: true, tools: ["*"], sensitive: "yes" } })).toThrow("sensitive");
     expect(parseConfig({} as any, dir()).mcp).toEqual([]);
   });
 });
@@ -66,6 +69,8 @@ describe("which tools", () => {
   ];
   test("only readOnlyHint tools, narrowed by the globs, never widened", () => {
     expect(readOnlyTools(up(), tools).tools.map((t) => t.name)).toEqual(["query_logs", "search_traces"]);
+    expect(readOnlyTools(up({ tools: ["search_traces"] }), tools).tools.map((t) => t.name)).toEqual(["search_traces"]); // a read-only tool you didn't list isn't offered
+    expect(readOnlyTools(up({ tools: [] }), tools).tools).toEqual([]); // no list, nothing
     expect(readOnlyTools(up({ tools: ["query_*", "update_*", "no_*"] }), tools).tools.map((t) => t.name)).toEqual(["query_logs"]);
     expect(readOnlyTools(up(), tools).note).toContain("2 of its 5 tools aren't marked read-only");
     const none = readOnlyTools(up(), [{ name: "w" }, { name: "x", annotations: {} }]);

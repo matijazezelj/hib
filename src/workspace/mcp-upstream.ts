@@ -73,9 +73,9 @@ function glob(g: string): RegExp {
  * by the config's globs, with names both CLIs accept. `note` says why some or all were left out.
  */
 export function readOnlyTools(u: McpUpstream, tools: UpstreamTool[]): { tools: UpstreamTool[]; note?: string } {
-  const globs = u.tools.map(glob);
+  const globs = u.tools.map(glob); // never empty from config; empty would allow nothing
   const ro = tools.filter((t) => t?.annotations?.readOnlyHint === true);
-  const picked = ro.filter((t) => !globs.length || globs.some((g) => g.test(t.name)));
+  const picked = ro.filter((t) => globs.some((g) => g.test(t.name)));
   const ok = picked.filter((t) => NAME_OK.test(t.name) && `mcp__hib__${exposedName(u.name, t.name)}`.length <= 64);
   const notes: string[] = [];
   if (!ro.length) notes.push(`none of its ${tools.length} tools is marked read-only (readOnlyHint), so none is offered`);
@@ -100,6 +100,7 @@ const MAX_REPLY = 8_000_000; // characters of one reply; anything larger is refu
 
 export class McpClient {
   private sid?: string;
+  serverName?: string; // serverInfo.name from initialize
   private ready?: Promise<void>;
   private nextId = 1;
 
@@ -154,7 +155,8 @@ export class McpClient {
 
   init(): Promise<void> {
     this.ready ??= (async () => {
-      await this.rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "hib", version: "1" } }, 5_000);
+      const r = await this.rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "hib", version: "1" } }, 5_000);
+      this.serverName = typeof r?.serverInfo?.name === "string" ? r.serverInfo.name : undefined;
       await this.post({ jsonrpc: "2.0", method: "notifications/initialized" }, 5_000);
     })().catch((e) => {
       this.ready = undefined;
