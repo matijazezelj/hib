@@ -295,6 +295,22 @@ export function startServer(engine: Engine, opts: { port: number; token: string;
           }
         },
       },
+      // Called by hib's MCP server inside an agent CLI for a trusted MCP server's tools: its per-session key can do nothing else.
+      "/ws/mcp": {
+        POST: async (req, server) => {
+          if (!hosts.has(req.headers.get("host") ?? "") || req.headers.get("origin")) {
+            refused(hosts.has(req.headers.get("host") ?? "") ? "origin" : "host", req, server);
+            return json({ error: { message: "unauthorized" } }, 401);
+          }
+          const b: any = await req.json();
+          try {
+            return json({ result: await sessions.mcpCall(String(b.sessionId ?? ""), req.headers.get("x-hib-mcp") ?? "", String(b.method ?? ""), b.params) });
+          } catch (e: any) {
+            if (e?.message === "unauthorized") refused("token", req, server);
+            return json({ error: { message: String(e?.message ?? e) } }, e?.message === "unauthorized" ? 401 : 400);
+          }
+        },
+      },
       "/ws/interrupt": {
         POST: ws(async (root, req) => {
           const id = ((await req.json()) as any).sessionId;

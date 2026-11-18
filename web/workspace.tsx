@@ -72,6 +72,10 @@ function fold(items: Item[], e: any): Item[] {
       return [...items, { kind: "note", tone: e.changes.some((c: any) => !c.approved && !c.prefs_only) ? "bad" : "warn", text: `${e.changes.some((c: any) => !c.approved && !c.prefs_only) ? "files outside this folder changed during the turn" : "approved or preference-only changes outside this folder"}: ${e.changes.map((c: any) => `${c.path} (${c.change}${c.approved ? ", approved" : c.prefs_only ? ", preferences only" : ""})`).join(", ")}. hib doesn't put these back: check them if you didn't make the change.` }];
     case "output_guarded":
       return [...items, { kind: "note", tone: e.names ? "warn" : undefined, text: `the agent got this command's output with ${Object.entries(e.findings).map(([k, v]) => `${k}×${v}`).join(" ") || "nothing"} replaced${e.names ? ` (${e.names})` : ""}` }];
+    case "mcp_guarded":
+      return [...items, { kind: "note", tone: e.names ? "warn" : undefined, text: `${e.server}: the agent got ${e.tool}'s ${e.error ? "error" : "result"} with ${Object.entries(e.findings).map(([k, v]) => `${k}×${v}`).join(" ") || "nothing"} replaced${e.cut ? ` (cut from ${e.cut} characters)` : ""}${e.names ? ` (${e.names})` : ""}` }];
+    case "mcp_note":
+      return [...items, { kind: "note", tone: "warn", text: `${e.server} (trusted MCP server): ${e.text}` }];
     case "pseudonymised": {
       const i = items.findIndex((x) => x.kind === "tool" && x.call.id === e.callId);
       const at = i >= 0 ? i : items.map((x) => (x.kind === "tool" && x.call.kind === "read" ? "r" : "")).lastIndexOf("r");

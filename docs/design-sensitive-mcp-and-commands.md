@@ -1,7 +1,7 @@
 # Design: MCP results and command output in sensitive folders
 
 Status: (b) command output is implemented (2026-11-17), through a hook rather than the FIFOs recommended below; see
-"(b) as built". (a) the MCP proxy is still a proposal. Written 2026-10-20 after an end-to-end SIEM test.
+"(b) as built". (a) is implemented (2026-11-18) for streamable-HTTP servers declared in config.toml; see "(a) as built". Written 2026-10-20 after an end-to-end SIEM test.
 
 In a sensitive folder, hib guards what the agent reads through Read (a pseudonymised copy) and what you type. Two
 channels still go out unguarded or can't be used at all:
@@ -47,6 +47,31 @@ reaches the daemon with a per-session key (`HIB_ADVISOR_KEY`) that can do one th
 - Results that aren't JSON or text (images, resources) are refused at first, not passed through.
 - Restoring arguments means the model can make the server look up any value it has a token for. That's the point, and
   each call is approved.
+
+## (a) as built (2026-11-18)
+
+Built for OIB's read-only Grafana MCP (mcp-grafana, `--disable-write`, streamable HTTP with a bearer token). Differences
+from the proposal above:
+- **Declared in `~/.hib/config.toml`** (`[mcp.<name>]`: url, token_file + token_key or token_env, `read_only = true`,
+  `sensitive`, optional `tools` globs), not a per-folder allow-list. Only streamable HTTP; the daemon doesn't start
+  server processes, so it runs no third-party code.
+- **No prompts.** A tool is offered only if the config says `read_only = true`, the server marks it `readOnlyHint`, and
+  it matches `tools`. Those calls are allowed by policy (`tool.permission`, `decided_by: "policy"`, `mcp_server`);
+  anything else is refused in the daemon, whatever the CLI allowed. The proposal approved each call.
+- **The shim** is `hib-mcp.ts` (the advisor's server, generalised): `HIB_MCP_KEY` lets it call `POST /ws/mcp`
+  (`tools/list`, `tools/call`) for its session only. The token is read by the daemon; the shim, the CLI's environment
+  and arguments and the event log never see it.
+- **Results** are guarded value by value when they're JSON (decoded, so escapes don't hide a value; a value under an
+  identifying key becomes a token whole, by the Read copies' column-name rules), otherwise like a `.log` Read copy.
+  Paths and machine names are guarded (`keepPaths` off). Known vault values get their tokens. The agent gets 60,000
+  characters at most; name detection only covers that. The table path (`loadTable`/`columnsToHide`) isn't used: it
+  would turn Loki streams into CSV and needs records of one shape.
+- **The CLI's own server of the same name** is denied (Claude: `mcp__<name>` deny rule) or switched off (Codex:
+  `mcp_servers.<name>.enabled=false`, only when its config defines it, since Codex refuses an entry with no transport).
+- Fixed along the way: from the second turn on, a turn used a vault freshly loaded from the database while Read copies,
+  command output and MCP results added tokens to the live session's vault, so a token first minted in a later turn
+  didn't restore in the answer (and the two could mint the same token for different values). The turn now uses the
+  live vault.
 
 ## (b) Guarding Bash output in sensitive sessions
 

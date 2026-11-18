@@ -100,6 +100,8 @@ export function claudeLaunch(opts: StartOptions): { args: string[]; env: Record<
     args.push("--mcp-config", JSON.stringify({ mcpServers: { [name]: { type: "stdio", ...server } } }));
     permissions.allow = [`mcp__${name}`]; // hib's own tool: no prompt
   }
+  // A trusted MCP server reaches the agent only through hib's guard: the same server from the user's own config is denied.
+  for (const n of opts.hideMcp ?? []) permissions.deny!.push(`mcp__${n}`);
   // Claude Code's Bash sandbox (Seatbelt on macOS, bubblewrap on Linux) confines every command and whatever it starts:
   // writes stay in the folder, the network is closed, and the denied paths can't be read. Approval still goes through hib
   // (autoAllowBashIfSandboxed off), and a command can't ask to leave the sandbox (allowUnsandboxedCommands off).

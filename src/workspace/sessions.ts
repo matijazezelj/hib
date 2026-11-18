@@ -1,7 +1,7 @@
 import type { Config } from "../config";
 import type { Engine } from "../engine";
 import type { Context } from "../events";
-import { inspect, obfuscateText, runNer, StreamRestorer, tokenNote, Vault } from "../guard";
+import { inspect, machineTerms, obfuscateText, runNer, StreamRestorer, tokenNote, Vault } from "../guard";
 import type { VaultState } from "../guard/vault";
 import type { Sealer } from "../guard/seal";
 import { resolveCandidate, type Candidate } from "../router/route";
@@ -16,10 +16,12 @@ import { homedir, tmpdir } from "node:os";
 import { scopeProbe, scopeUnit, type ScopeProbe } from "./scope";
 import { homeChanges, homePath, homeSnapshot, type HomeSnapshot, type HomeWatch } from "./homewatch";
 import { basename, sep, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
-import { loadTable, TABLE_FILE } from "../analyze/table";
-import { columnsToHide, pseudonymizeWithSpans } from "../analyze/pseudo";
+import { identifyingName, isFreeText, loadTable, TABLE_FILE } from "../analyze/table";
+import { categoryFor, columnsToHide, pseudonymizeWithSpans, tokenFor } from "../analyze/pseudo";
 import { DATA_RULE_NOTE, dataBlockEventReason, rawDataCommand } from "./datarules";
 import { readdirSync, statSync } from "node:fs";
+import type { McpUpstream } from "../config";
+import { cutResult, exposedName, McpClient, readOnlyTools, resultText, type UpstreamTool } from "./mcp-upstream";
 
 export type DriverFactory = (provider: string) => AgentDriver | null;
 
@@ -37,6 +39,8 @@ export type WsEvent =
   | { type: "sent"; account: string; model: string; text: string; handoff: boolean; progress?: boolean; chars: number }
   | { type: "pseudonymised"; file: string; columns: string[]; callId?: string; names?: string } // names: why the copy's names weren't (all) checked
   | { type: "output_guarded"; callId: string; findings: Record<string, number>; names?: string } // a command's output in a sensitive session, as the guard changed it
+  | { type: "mcp_guarded"; server: string; tool: string; findings: Record<string, number>; names?: string; cut?: number; error?: boolean } // a trusted MCP server's result, as the agent got it
+  | { type: "mcp_note"; server: string; text: string } // a trusted MCP server offered fewer tools than it has, or none
   | { type: "protected_reverted"; changes: { path: string; change: string }[]; failed: string[] } // unapproved changes to git hooks/config or tool config, put back
   | { type: "home_changed"; changes: { path: string; change: string; approved: boolean; prefs_only?: true }[] } // shell startup files, user agent config etc. changed during the turn: reported, not put back
   | AgentEvent
@@ -190,7 +194,21 @@ export function protectedPath(root: string, p: string): boolean {
 const ASK_EVEN_IN_AUTO =
   /\.hib\b|hib_token|\/hib\/session|localhost:\d|127\.0\.0\.1|\.ssh\b|\.aws\b|\.gnupg\b|\.config\/gh\b|\.claude|\.codex\b|(^|[\s;&|(`$])(sudo|su|doas|curl|wget|ssh|scp|sftp|rsync|nc|ncat|netcat|telnet|ftp|socat)\b|\bgit\s+(push|reset\s+--hard|clean|filter-branch|remote\s+(add|set-url))\b|\b(npm|bun|pnpm|yarn|cargo|twine|gem|poetry|uv|flit|hatch)\b[^\n]*\b(publish|upload|push)\b|\bgh\s+(pr|release|repo|api|gist|issue)\b|\brm\s+(-\w+\s+)*-\w*[rR]|\/dev\/(tcp|udp)\//;
 
-const ADVISOR_SCRIPT = new URL("./advisor-mcp.ts", import.meta.url).pathname;
+const HIB_MCP_SCRIPT = new URL("./hib-mcp.ts", import.meta.url).pathname;
+const MCP_SHOWN = 60_000; // characters of a trusted MCP server's result the agent gets; the rest is cut, before name detection
+const MCP_NOTE = (names: string[]) =>
+  `Tools named mcp__hib__<server>__<tool> are read-only tools of ${names.join(", ")}, called for you by hib. Their results come ` +
+  "through hib's guard, with the same kind of placeholders as the rest of this session; a placeholder you pass in an argument " +
+  "is swapped back to the real value before the call. Results over 60,000 characters are cut: narrow the query instead.";
+
+/** A session's trusted MCP servers: the tools offered and the key hib's MCP server uses for them. */
+interface McpState {
+  key: string;
+  root: string;
+  candidate: Candidate;
+  vault: Vault;
+  tools: Map<string, { server: McpUpstream; tool: UpstreamTool; client: McpClient }>; // by exposed name (<server>__<tool>)
+}
 const ADVISOR_NOTE =
   "You have an `advisor` tool (from hib) backed by a model from a different AI provider. Call it before substantive work, " +
   "when stuck, and before you declare the task done. It sees the task, a summary of this session and the current diff.";
@@ -249,6 +267,7 @@ export class WorkspaceSessions {
   private auto = new Set<string>(); // sessions in auto mode; in memory only, so a restarted daemon is back to manual
   private advisorOn = new Set<string>(); // same for the advisor tool
   private notes = new Map<string, string>(); // extra system prompt per session (background tasks), in memory too
+  private mcp = new Map<string, McpState>(); // per session; set before its CLI starts, which asks for tools right away
   private hubs = new Map<string, Hub>();
   private listeners = new Set<() => void>();
 
@@ -313,6 +332,7 @@ export class WorkspaceSessions {
 
   /** Stops a session's CLI and records the end of that agent session. */
   private async endLive(l: Live) {
+    this.mcp.delete(l.id);
     // Written first: on daemon exit closeAll doesn't wait for the close.
     this.events.emit("session.end", this.evCtx(l.id, l.root, l.candidate), { agent: l.candidate.provider, sensitive: l.askReads });
     await l.driver.close();
@@ -468,8 +488,6 @@ export class WorkspaceSessions {
     // Sensitive folders: the agent learns the data rule up front, so it reaches for Read instead of `head`/`cat`.
     // The advisor tool exists only when switched on, outside sensitive folders, and with another provider to ask.
     const advisorKey = !askReads && this.advisorOn.has(id) && this.engine.router.advisorFor(c, root) ? crypto.randomUUID() : undefined;
-    const sys = [system, this.notes.get(id), askReads ? DATA_RULE_NOTE : "", advisorKey ? ADVISOR_NOTE : ""].filter(Boolean).join("\n\n") || undefined;
-    const mcp = advisorKey ? { name: "hib", command: process.execPath, args: [ADVISOR_SCRIPT], env: { HIB_URL: this.daemonUrl, HIB_ADVISOR_KEY: advisorKey, HIB_SESSION: id } } : undefined;
     const base = this.sandbox(this.cfg);
     // Sensitive folders: commands can't read data files (enforced by the OS sandbox). Claude's Read tool runs outside it,
     // so it's hib's permission handling, not the sandbox, that gives Read a pseudonymised copy.
@@ -484,13 +502,27 @@ export class WorkspaceSessions {
         throw new Error(`hib won't start a sensitive session it can't fully protect: ${e.message}`);
       }
     }
+    // Trusted read-only MCP servers: in sensitive folders only those that say so. Not for the scripted agent.
+    const servers = c.provider === "script" ? [] : this.cfg.mcp.filter((u) => !askReads || u.sensitive);
+    const mcpState = servers.length ? await this.mcpTools(id, root, c, vault, servers) : undefined;
+    const mcpKey = mcpState?.tools.size ? mcpState.key : undefined;
+    const offered = [...new Set([...(mcpState?.tools.values() ?? [])].map((t) => t.server.name))];
+    const sys = [system, this.notes.get(id), askReads ? DATA_RULE_NOTE : "", advisorKey ? ADVISOR_NOTE : "", mcpKey ? MCP_NOTE(offered) : ""].filter(Boolean).join("\n\n") || undefined;
+    const keys = { ...(advisorKey ? { HIB_ADVISOR_KEY: advisorKey } : {}), ...(mcpKey ? { HIB_MCP_KEY: mcpKey } : {}) };
+    const mcp = advisorKey || mcpKey ? { name: "hib", command: process.execPath, args: [HIB_MCP_SCRIPT], env: { HIB_URL: this.daemonUrl, ...keys, HIB_SESSION: id } } : undefined;
+    const hideMcp = this.cfg.mcp.map((u) => u.name);
     // Not the scripted agent: it starts no process.
     const probe = this.cfg.events.sessionScope && c.provider !== "script" ? this.scopeProbe() : undefined;
     const scope = probe && "tool" in probe ? { tool: probe.tool, unit: scopeUnit(id) } : undefined;
     // Sensitive sessions: commands print into a capture folder of hib's, and the agent sees their output only after the
     // guard (guardOutput). Drivers that can do it: Claude (sensitive sessions refuse Codex).
     const captureDir = askReads && typeof driver.answerOutput === "function" ? captureFolder(this.captureRoot, id) : undefined;
-    await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools, session: id, scope, captureDir });
+    try {
+      await driver.start({ cwd: root, model: c.model, account: c.account, resume, system: sys, askReads, mcp, sandbox, denyReads: secretPaths(this.cfg).tools, session: id, scope, captureDir, ...(hideMcp.length ? { hideMcp } : {}) });
+    } catch (e) {
+      this.mcp.delete(id);
+      throw e;
+    }
     const l: Live = { id, root, candidate: c, driver, nativeId: resume, vault, alwaysAllow: new Set(), pending: new Map(), askReads, advisorKey, sandboxed: !!sandbox, approvedProtected: new Set(), approvedHome: new Set() };
     this.live.set(id, l);
     this.events.emit("session.start", this.evCtx(id, root, c), { agent: c.provider, sensitive: askReads, ...(scope ? { scope: scope.unit } : {}) });
@@ -540,7 +572,9 @@ export class WorkspaceSessions {
     if (!c) return yield { type: "error", message: `unknown model ${modelId}` };
     if (!(await this.engine.registry.available(c.account))) return yield { type: "error", message: `${c.id} is not logged in` };
 
-    const vault = row?.vault ? Vault.from(await this.sealer.unseal<VaultState>(row.vault)) : this.live.get(id)?.vault ?? new Vault();
+    // The running CLI's vault when there is one: Read copies, command output and MCP results add tokens to it, and the
+    // turn must restore those (and never mint the same token for another value). Saved at the end of every turn.
+    const vault = this.live.get(id)?.vault ?? (row?.vault ? Vault.from(await this.sealer.unseal<VaultState>(row.vault)) : new Vault());
     const route = { ...this.cfg.routes.code, mode: "agent" as const, level: "minimal" as const };
 
     // Guard: secrets and configured terms are tokenized; the folder pre-scan runs once per session.
@@ -760,6 +794,11 @@ export class WorkspaceSessions {
             if (policy && tabularTarget(call, e.input, root)) call.title += " (the agent gets a pseudonymised copy)";
             else if (policy && call.name === "Grep") call.title += " (may return raw rows from data files)";
             const advisorCall = !!l.advisorKey && call.name === "mcp__hib__advisor";
+            if (call.name.startsWith("mcp__hib__") && this.mcp.get(sid)?.tools.has(call.name.slice(10))) {
+              // A trusted server's read-only tool: allowed by policy, checked and logged when the call reaches the daemon.
+              l.driver.answer(e.id, { behavior: "allow", ...(e.input !== undefined ? { updatedInput: e.input } : {}) });
+              break;
+            }
             const byRule = !advisorCall && this.autoAllowed(l, e.ruleKey, call);
             if (advisorCall || byRule || (this.auto.has(sid) && this.autoModeCovers(l, call))) {
               this.permissionEvent(l, call, "allow", advisorCall || byRule ? "policy" : "auto");
@@ -948,7 +987,7 @@ export class WorkspaceSessions {
    * detection within its budget, and every value the session's vault already holds, so a name tokenised from a Read
    * copy comes back as the same token. Paths stay, as in prompts: the agent needs them to work.
    */
-  private async guardOutput(l: Live, text: string): Promise<{ text: string; findings: Record<string, number>; names?: string }> {
+  private async guardOutput(l: { vault: Vault }, text: string): Promise<{ text: string; findings: Record<string, number>; names?: string }> {
     if (!text.trim()) return { text, findings: {} };
     const ner = await this.nameCheck(text);
     const extra = [...(ner.findings ?? []), ...l.vault.knownFindings(text)];
@@ -1035,6 +1074,140 @@ export class WorkspaceSessions {
     if (on) this.advisorOn.add(sessionId);
     else this.advisorOn.delete(sessionId);
     this.emit(sessionId, { type: "advisor_mode", on });
+  }
+
+  /**
+   * A session's trusted MCP servers, asked for their tools before the CLI starts. A server that can't be reached, has
+   * no token, or offers no read-only tool is left out, and the timeline says why; the session starts anyway.
+   */
+  private async mcpTools(id: string, root: string, c: Candidate, vault: Vault, servers: McpUpstream[]): Promise<McpState> {
+    const state: McpState = { key: crypto.randomUUID(), root, candidate: c, vault, tools: new Map() };
+    this.mcp.set(id, state);
+    await Promise.all(
+      servers.map(async (u) => {
+        const client = new McpClient(u);
+        let note: string | undefined;
+        try {
+          const r = readOnlyTools(u, await client.listTools());
+          for (const t of r.tools) state.tools.set(exposedName(u.name, t.name), { server: u, tool: t, client });
+          note = r.note;
+        } catch (e: any) {
+          note = `not available this session: ${String(e?.message ?? e).slice(0, 300)}`;
+        }
+        if (note) {
+          const ev = { type: "mcp_note" as const, server: u.name, text: note };
+          this.record(id, ev);
+          this.emit(id, ev);
+        }
+      }),
+    );
+    return state;
+  }
+
+  /**
+   * hib's MCP server asking for a session's trusted tools (`tools/list`) or calling one (`tools/call`). Authorised by the
+   * session's key. Only a tool offered at start runs; placeholders in its arguments are restored, and its result goes
+   * back through the guard with the session's vault, so a value gets the same token in a log line, a span attribute and
+   * a Read copy. Results are text only, cut to MCP_SHOWN before name detection.
+   */
+  async mcpCall(sessionId: string, key: string, method: string, params: any): Promise<unknown> {
+    const st = this.mcp.get(sessionId);
+    if (!st || key.length !== st.key.length || !crypto.timingSafeEqual(Buffer.from(key), Buffer.from(st.key))) throw new Error("unauthorized");
+    if (method === "tools/list")
+      return {
+        tools: [...st.tools].map(([name, t]) => ({
+          name,
+          description: `[${t.server.name}, read-only, results guarded by hib] ${t.tool.description ?? ""}`.trim(),
+          inputSchema: t.tool.inputSchema ?? { type: "object" },
+          annotations: { readOnlyHint: true },
+        })),
+      };
+    if (method !== "tools/call") throw new Error(`method not supported: ${method}`);
+    const name = String(params?.name ?? "");
+    const t = st.tools.get(name);
+    const ctx = this.evCtx(sessionId, st.root, st.candidate);
+    // The name came from the model: only a configured server's name goes into the event as it is.
+    const server = t?.server.name ?? this.cfg.mcp.find((u) => name.startsWith(`${u.name}__`))?.name ?? "[unknown]";
+    if (!t) {
+      // Not a tool hib offered (a write tool, a guessed name): refused here, whatever the CLI allowed.
+      this.events.emit("tool.permission", ctx, { tool: `mcp__hib__${name}`.slice(0, 120), mcp_server: server, decision: "deny", decided_by: "policy" });
+      return { content: [{ type: "text", text: `hib refused ${name}: it isn't one of the read-only tools offered this session.` }], isError: true };
+    }
+    this.events.emit("tool.permission", ctx, { tool: `mcp__hib__${name}`, mcp_server: server, decision: "allow", decided_by: "policy" });
+    const args = restoreDeep(params?.arguments ?? {}, st.vault);
+    let raw: string, isError = false;
+    try {
+      const r = await t.client.callTool(t.tool.name, args);
+      raw = resultText(r);
+      isError = !!r?.isError;
+    } catch (e: any) {
+      raw = `${server} failed: ${String(e?.message ?? e)}`;
+      isError = true;
+    }
+    const g = await this.guardMcpResult(st.vault, raw);
+    // Cut after the guard (JSON) or before it (text, already within MCP_SHOWN): either way, what's cut was never shown.
+    const cut = cutResult(g.text, MCP_SHOWN);
+    const over = cut.cut || g.total > g.text.length;
+    const text = over ? `${cut.text}\n[hib cut this result here: ${g.total} characters in all. Narrow the query.]` : g.text;
+    const ev = { type: "mcp_guarded" as const, server, tool: t.tool.name, findings: g.findings, ...(g.names ? { names: g.names } : {}), ...(over ? { cut: g.total } : {}), ...(isError ? { error: true } : {}) };
+    this.record(sessionId, ev);
+    this.emit(sessionId, ev);
+    return { content: [{ type: "text", text }], isError };
+  }
+
+  /**
+   * A trusted MCP server's result as the agent may see it. JSON (Loki streams, Tempo spans) is guarded value by value,
+   * decoded, so a value after an escaped tab or newline is still found, and a value under an identifying key ("user",
+   * "email", "host.name": the Read copies' column rules) becomes a token whole, as a hidden column's cell does. Other
+   * text gets the guard as a .log Read copy does. Paths and this machine's names are guarded too (remote data, not the
+   * agent's workspace). Every value the vault already holds gets its token, so tokens match across calls and files.
+   * Name detection runs only over the first MCP_SHOWN characters of values: the rest is cut from what the agent sees.
+   */
+  private async guardMcpResult(vault: Vault, raw: string): Promise<{ text: string; total: number; findings: Record<string, number>; names?: string }> {
+    const findings: Record<string, number> = {};
+    const count = (cat: string) => (findings[cat] = (findings[cat] ?? 0) + 1);
+    const opts = { level: "standard" as const, terms: this.cfg.guard.terms, identities: machineTerms(), patterns: this.cfg.guard.patterns, keepPaths: false };
+    const guard = (t: string, ner: Finding[] = []) => {
+      const r = vault.obfuscate(t, { ...opts, extra: [...ner, ...vault.knownFindings(t)] });
+      r.findings.forEach((f) => count(f.category));
+      return r.text;
+    };
+    let doc: unknown;
+    try {
+      doc = JSON.parse(raw);
+    } catch {}
+    if (doc === undefined || typeof doc !== "object" || doc === null) {
+      const cut = cutResult(raw, MCP_SHOWN); // cut first: name detection only over what the agent is shown
+      const ner = await this.nameCheck(cut.text);
+      return { text: guard(cut.text, ner.findings), total: raw.length, findings, ...(ner.note && this.cfg.guard.ner ? { names: ner.note } : {}) };
+    }
+    // Values under identifying keys become tokens whole; the free text left goes to name detection, within the budget.
+    const leaves: string[] = [];
+    let budget = MCP_SHOWN;
+    const collect = (v: unknown, key: string) => {
+      if (typeof v === "string") {
+        if (budget > 0 && !(key && identifyingName(key, "string") && !isFreeText(v)) && /\p{L}{3}/u.test(v)) leaves.push(v);
+        budget -= v.length;
+      } else if (Array.isArray(v)) v.forEach((x) => collect(x, key));
+      else if (v && typeof v === "object") for (const [k, x] of Object.entries(v)) collect(x, k);
+    };
+    collect(doc, "");
+    const ner = this.cfg.guard.ner && leaves.length ? await runNer(leaves, this.cfg, this.engine.nerInfer ?? this.engine.nerModel.infer) : undefined;
+    const walk = (v: unknown, key: string): unknown => {
+      if (typeof v === "string") {
+        if (key && identifyingName(key, "string") && !isFreeText(v) && v.trim()) {
+          count(categoryFor(key));
+          return tokenFor(vault, key, v);
+        }
+        return guard(v, ner?.byText.get(v));
+      }
+      if (Array.isArray(v)) return v.map((x) => walk(x, key));
+      if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [guard(k), walk(x, k)]));
+      return v;
+    };
+    const text = JSON.stringify(walk(doc, ""));
+    const note = !this.cfg.guard.ner ? undefined : ner?.error ? `${ner.error}: names in free text weren't checked` : ner?.partial?.size ? "name detection ran out of budget: the values it didn't reach were tokenised whole" : undefined;
+    return { text, total: text.length, findings, ...(note ? { names: note } : {}) };
   }
 
   /**

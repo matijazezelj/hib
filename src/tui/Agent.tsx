@@ -165,6 +165,12 @@ function App({ client, root, url, initial, initialModel }: { client: HibClient; 
       case "output_guarded":
         push({ text: `  ⎿ the agent got this command's output with ${Object.entries(e.findings).map(([k, v]) => `${k}×${v}`).join(" ") || "nothing"} replaced${e.names ? ` (${e.names})` : ""}`, color: e.names ? "yellow" : "gray" });
         break;
+      case "mcp_guarded":
+        push({ text: `  ⎿ ${e.server}: the agent got ${e.tool}'s ${e.error ? "error" : "result"} with ${Object.entries(e.findings).map(([k, v]) => `${k}×${v}`).join(" ") || "nothing"} replaced${e.cut ? ` (cut from ${e.cut} characters)` : ""}${e.names ? ` (${e.names})` : ""}`, color: e.names ? "yellow" : "gray" });
+        break;
+      case "mcp_note":
+        push({ text: `${e.server} (trusted MCP server): ${e.text}`, color: "yellow" });
+        break;
       case "protected_reverted":
         push({ text: `hib put back ${e.changes.length} unapproved change(s) to git hooks/config or tool config: ${e.changes.map((c: any) => `${c.path} (${c.change})`).join(", ")}${e.failed.length ? `; couldn't restore ${e.failed.join(", ")}` : ""}. If you made one yourself, redo it.`, color: "red" });
         break;
