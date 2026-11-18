@@ -61,6 +61,16 @@ describe("protected files are checked by content after each turn", () => {
     expect(changes(before, root)).toEqual([]);
   });
 
+  test("an empty .git/config.worktree (Claude Code's sandbox leaves one) is no change; one with content is", () => {
+    const before = snapshot(root);
+    writeFileSync(join(root, ".git/config.worktree"), "");
+    expect(changes(before, root)).toEqual([]);
+    writeFileSync(join(root, ".git/config.worktree"), "[core]\n\thooksPath = /tmp/evil\n");
+    expect(changes(before, root)).toEqual([{ path: join(root, ".git/config.worktree"), change: "added" }]);
+    expect(revert(before, changes(before, root))).toEqual([]);
+    expect(existsSync(join(root, ".git/config.worktree"))).toBe(false);
+  });
+
   test("a hooks directory swapped for a symlink is restored as a real directory", () => {
     const before = snapshot(root);
     mkdirSync(join(outside, "hooks"));
